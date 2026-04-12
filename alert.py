@@ -2,8 +2,8 @@ import requests
 import sys
 
 SYMBOL = "BTCUSD"
-UPPER_ALERT = 95000
-LOWER_ALERT = 80000
+UPPER_ALERT = 75000
+LOWER_ALERT = 65000
 
 def get_price() -> float:
     url = "https://api.coingecko.com/api/v3/simple/price"

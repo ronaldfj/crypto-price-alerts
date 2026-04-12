@@ -1,20 +1,30 @@
 import requests
 import sys
 
-SYMBOL = "BTCUSDT"
+SYMBOL = "BTCUSD"
 UPPER_ALERT = 95000
 LOWER_ALERT = 80000
 
-def get_price(symbol: str) -> float:
-    url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
-    response = requests.get(url, timeout=10)
+def get_price() -> float:
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    params = {
+        "ids": "bitcoin",
+        "vs_currencies": "usd"
+    }
+
+    response = requests.get(url, params=params, timeout=10)
     response.raise_for_status()
+
     data = response.json()
-    return float(data["price"])
+
+    if "bitcoin" not in data or "usd" not in data["bitcoin"]:
+        raise ValueError(f"Respuesta inesperada de la API: {data}")
+
+    return float(data["bitcoin"]["usd"])
 
 def main():
     try:
-        price = get_price(SYMBOL)
+        price = get_price()
         print(f"Precio actual de {SYMBOL}: {price}")
 
         if price >= UPPER_ALERT:

@@ -1,4 +1,5 @@
 import requests
+import sys
 
 SYMBOL = "BTCUSDT"
 UPPER_ALERT = 95000
@@ -12,17 +13,20 @@ def get_price(symbol: str) -> float:
     return float(data["price"])
 
 def main():
-    price = get_price(SYMBOL)
-    print(f"Precio actual de {SYMBOL}: {price}")
+    try:
+        price = get_price(SYMBOL)
+        print(f"Precio actual de {SYMBOL}: {price}")
 
-    if price >= UPPER_ALERT:
-        print(f"ALERTA: {SYMBOL} subió por encima de {UPPER_ALERT}")
+        if price >= UPPER_ALERT:
+            print(f"ALERTA: {SYMBOL} subió por encima de {UPPER_ALERT}")
+        elif price <= LOWER_ALERT:
+            print(f"ALERTA: {SYMBOL} bajó por debajo de {LOWER_ALERT}")
+        else:
+            print("Sin alerta.")
 
-    elif price <= LOWER_ALERT:
-        print(f"ALERTA: {SYMBOL} bajó por debajo de {LOWER_ALERT}")
-
-    else:
-        print("Sin alerta.")
+    except Exception as e:
+        print(f"Error ejecutando alerta: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

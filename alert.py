@@ -1,31 +1,12 @@
 import os
 import sys
 import time
+import json
 import requests
 import pandas as pd
 import numpy as np
-import json
 from pathlib import Path
 
-ALERT_COOLDOWN_HOURS = 24
-STATE_FILE = "alert_state.json"
-
-def already_alerted(symbol: str) -> bool:
-    if not Path(STATE_FILE).exists():
-        return False
-    state = json.loads(Path(STATE_FILE).read_text())
-    last = state.get(symbol)
-    if not last:
-        return False
-    return (time.time() - last) < ALERT_COOLDOWN_HOURS * 3600
-
-def mark_alerted(symbol: str):
-    state = {}
-    if Path(STATE_FILE).exists():
-        state = json.loads(Path(STATE_FILE).read_text())
-    state[symbol] = time.time()
-    Path(STATE_FILE).write_text(json.dumps(state))
-    
 VS_CURRENCY = "usd"
 
 ASSETS = [
@@ -44,6 +25,31 @@ MIN_RR = 2.0
 DAYS_FOR_DAILY = 300
 DAYS_FOR_4H = 100
 
+ALERT_COOLDOWN_HOURS = 24
+STATE_FILE = "alert_state.json"
+
+
+# ── Deduplicación ──────────────────────────────────────────────────────────────
+
+def already_alerted(symbol: str) -> bool:
+    if not Path(STATE_FILE).exists():
+        return False
+    state = json.loads(Path(STATE_FILE).read_text())
+    last = state.get(symbol)
+    if not last:
+        return False
+    return (time.time() - last) < ALERT_COOLDOWN_HOURS * 3600
+
+
+def mark_alerted(symbol: str):
+    state = {}
+    if Path(STATE_FILE).exists():
+        state = json.loads(Path(STATE_FILE).read_text())
+    state[symbol] = time.time()
+    Path(STATE_FILE).write_text(json.dumps(state))
+
+
+# ── CoinGecko ──────────────────────────────────────────────────────────────────
 
 def cg_get(url: str, params: dict) -> dict:
     if not COINGECKO_API_KEY:
@@ -95,6 +101,8 @@ def build_ohlcv_from_series(df_raw: pd.DataFrame, rule: str) -> pd.DataFrame:
 
     return out
 
+
+# ── Indicadores ────────────────────────────────────────────────────────────────
 
 def ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False).mean()
@@ -176,6 +184,8 @@ def supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0) -> p
 
     return out
 
+
+# ── Señales ────────────────────────────────────────────────────────────────────
 
 def is_hammer(candle: pd.Series) -> bool:
     body = abs(candle["close"] - candle["open"])
@@ -265,6 +275,8 @@ def calc_rr(df_4h: pd.DataFrame) -> float:
     return float(reward / risk)
 
 
+# ── Telegram ───────────────────────────────────────────────────────────────────
+
 def send_telegram_message(message: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         raise ValueError("Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID")
@@ -279,8 +291,11 @@ def send_telegram_message(message: str) -> None:
     response.raise_for_status()
 
 
+# ── Evaluación ─────────────────────────────────────────────────────────────────
+
 def evaluate_asset(coin_id: str, symbol: str) -> dict:
     df_raw_daily = get_market_chart_days(coin_id, VS_CURRENCY, DAYS_FOR_DAILY)
+    time.sleep(2)
     df_raw_4h = get_market_chart_days(coin_id, VS_CURRENCY, DAYS_FOR_4H, interval="hourly")
 
     df_4h = build_ohlcv_from_series(df_raw_4h, "4h")
@@ -351,6 +366,8 @@ def evaluate_asset(coin_id: str, symbol: str) -> dict:
     }
 
 
+# ── Main ───────────────────────────────────────────────────────────────────────
+
 def main():
     try:
         print("COINGECKO_API_KEY cargada:", bool(COINGECKO_API_KEY))
@@ -388,27 +405,32 @@ def main():
                 print(f"Error evaluando activo: {asset_error}")
                 print("")
 
-        
-    if alerts_found:
-    for result in alerts_found:
-        if already_alerted(result['symbol']):
-            print(f"Alerta suprimida para {result['symbol']} (ya alertado en las últimas {ALERT_COOLDOWN_HOURS}h)")
-            continue
-        message = (
-            f"🚦 ALERTA V2 {result['symbol']}\n"
-            f"Score: {result['score']:.1f}/8.5\n"
-            f"R:R: {result['rr']:.2f}\n"
-            f"RSI 4H: {result['rsi_4h']:.2f}\n"
-            f"Actividad relativa: {result['activity_ratio']:.2f}x\n"
-            f"Detalles:\n- " + "\n- ".join(result["reasons"])
-        )
-        send_telegram_message(message)
-        mark_alerted(result['symbol'])
-        print(f"Alerta enviada para {result['symbol']}")
+            time.sleep(3)
+
+        if alerts_found:
+            for result in alerts_found:
+                if already_alerted(result["symbol"]):
+                    print(f"Alerta suprimida para {result['symbol']} (ya alertado en las últimas {ALERT_COOLDOWN_HOURS}h)")
+                    continue
+
+                message = (
+                    f"🚦 ALERTA V2 {result['symbol']}\n"
+                    f"Score: {result['score']:.1f}/8.5\n"
+                    f"R:R: {result['rr']:.2f}\n"
+                    f"RSI 4H: {result['rsi_4h']:.2f}\n"
+                    f"Actividad relativa: {result['activity_ratio']:.2f}x\n"
+                    f"Detalles:\n- " + "\n- ".join(result["reasons"])
+                )
+                send_telegram_message(message)
+                mark_alerted(result["symbol"])
+                print(f"Alerta enviada para {result['symbol']}")
+        else:
+            print("Sin alertas en ningún activo.")
 
     except Exception as e:
         print(f"Error general V2 CoinGecko multi-activo: {e}")
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

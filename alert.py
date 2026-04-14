@@ -315,7 +315,8 @@ def main():
         for r in reasons:
             print("-", r)
 
-        if score >= MIN_SCORE and rr >= MIN_RR:
+#        if score >= MIN_SCORE and rr >= MIN_RR:
+        if True:
             message = (
                 f"🚦 ALERTA V2 {SYMBOL}\n"
                 f"Score: {score:.1f}/8.5\n"

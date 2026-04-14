@@ -244,11 +244,10 @@ def main():
     try:
         df_raw = get_market_chart_range(COIN_ID, VS_CURRENCY, days_back=180)
 
-        # 4H, Diario y Semanal
-        df_4h = build_ohlcv_from_series(df_raw, "4H")
-        df_d = build_ohlcv_from_series(df_raw, "1D")
-        df_w = build_ohlcv_from_series(df_raw, "1W-MON")
-
+        # 4H, Diario y Semanal  
+        df_4h = build_ohlcv_from_series(df_raw, "4h")
+        df_d = build_ohlcv_from_series(df_raw, "1d")
+        df_w = build_ohlcv_from_series(df_raw, "W-MON")
         # Indicadores
         df_4h = supertrend(df_4h)
         df_d = supertrend(df_d)

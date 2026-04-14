@@ -11,22 +11,21 @@ ASSETS = [
     {"coin_id": "bitcoin", "symbol": "BTCUSD"},
     {"coin_id": "ethereum", "symbol": "ETHUSD"},
     {"coin_id": "solana", "symbol": "SOLUSD"},
-    {"coin_id": "ripple", "symbol": "XRPUSD"},
-    {"coin_id": "cardano", "symbol": "ADAUSD"},
 ]
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY")
 
 MIN_SCORE = 6.0
 MIN_RR = 2.0
 DAYS_BACK = 400
 
 
-# -----------------------------
-# CoinGecko
-# -----------------------------
 def get_market_chart_range(coin_id: str, vs_currency: str, days_back: int = 400) -> pd.DataFrame:
+    if not COINGECKO_API_KEY:
+        raise ValueError("Falta COINGECKO_API_KEY en GitHub Secrets")
+
     now = int(time.time())
     start = now - days_back * 24 * 60 * 60
 
@@ -36,8 +35,11 @@ def get_market_chart_range(coin_id: str, vs_currency: str, days_back: int = 400)
         "from": start,
         "to": now
     }
+    headers = {
+        "x-cg-demo-api-key": COINGECKO_API_KEY
+    }
 
-    response = requests.get(url, params=params, timeout=20)
+    response = requests.get(url, params=params, headers=headers, timeout=20)
     response.raise_for_status()
     data = response.json()
 
@@ -59,22 +61,16 @@ def build_ohlcv_from_series(df_raw: pd.DataFrame, rule: str) -> pd.DataFrame:
     out["high"] = df["price"].resample(rule).max()
     out["low"] = df["price"].resample(rule).min()
     out["close"] = df["price"].resample(rule).last()
-
-    # Proxy de actividad; no es volumen OHLCV puro de exchange
     out["volume"] = df["volume_proxy"].resample(rule).mean()
 
     out = out.dropna().reset_index()
 
-    # Eliminar vela en formación
     if len(out) > 1:
         out = out.iloc[:-1].copy().reset_index(drop=True)
 
     return out
 
 
-# -----------------------------
-# Indicadores
-# -----------------------------
 def ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False).mean()
 
@@ -156,9 +152,6 @@ def supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0) -> p
     return out
 
 
-# -----------------------------
-# Lógica estrategia
-# -----------------------------
 def is_hammer(candle: pd.Series) -> bool:
     body = abs(candle["close"] - candle["open"])
     total_range = candle["high"] - candle["low"]
@@ -285,7 +278,6 @@ def evaluate_asset(coin_id: str, symbol: str) -> dict:
     score = 0.0
     reasons = []
 
-    # Filtro 1 — Semanal
     if bool(df_w["st_direction"].iloc[-1]):
         score += 1
         reasons.append("W: Supertrend verde (+1)")
@@ -296,7 +288,6 @@ def evaluate_asset(coin_id: str, symbol: str) -> dict:
         score += 1
         reasons.append("W: RSI14 > 50 (+1)")
 
-    # Filtro 2 — Diario
     if bool(df_d["st_direction"].iloc[-1]):
         score += 1
         reasons.append("D: Supertrend verde (+1)")
@@ -307,7 +298,6 @@ def evaluate_asset(coin_id: str, symbol: str) -> dict:
         score += 1
         reasons.append("D: RSI14 > 50 (+1)")
 
-    # Filtro 3 — 4H
     if is_hammer(df_4h.iloc[-1]) and in_key_zone_bullish(df_4h):
         score += 1
         reasons.append("4H: Martillo en zona clave (+1)")

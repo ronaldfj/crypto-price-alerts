@@ -327,6 +327,7 @@ def evaluate_asset(coin_id: str, symbol: str) -> dict:
 
 
 def main():
+    print("COINGECKO_API_KEY cargada:", bool(COINGECKO_API_KEY))
     try:
         alerts_found = []
 

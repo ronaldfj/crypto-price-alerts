@@ -5,6 +5,9 @@ on:
     - cron: "*/15 * * * *"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   run-alert:
     runs-on: ubuntu-latest
@@ -12,6 +15,8 @@ jobs:
     steps:
       - name: Descargar repositorio
         uses: actions/checkout@v5
+        with:
+          persist-credentials: true
 
       - name: Instalar Python
         uses: actions/setup-python@v6
@@ -23,9 +28,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Asegurar archivo de estado
+        run: |
+          test -f alert_state.json || echo "{}" > alert_state.json
+
       - name: Ejecutar script
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
         run: python alert.py
+
+      - name: Guardar estado de alertas
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add alert_state.json
+          git diff --cached --quiet || git commit -m "Actualizar estado de alertas"
+          git push

@@ -13,6 +13,8 @@ ASSETS = [
     {"coin_id": "bitcoin", "symbol": "BTCUSD"},
     {"coin_id": "ethereum", "symbol": "ETHUSD"},
     {"coin_id": "solana", "symbol": "SOLUSD"},
+    {"coin_id": "ripple", "symbol": "XRPUSD"},
+    {"coin_id": "binancecoin", "symbol": "BNBUSD"},
 ]
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")

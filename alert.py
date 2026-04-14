@@ -33,13 +33,11 @@ def get_market_chart_range(coin_id: str, vs_currency: str, days_back: int = 400)
     params = {
         "vs_currency": vs_currency,
         "from": start,
-        "to": now
-    }
-    headers = {
-        "x-cg-demo-api-key": COINGECKO_API_KEY
+        "to": now,
+        "x_cg_demo_api_key": COINGECKO_API_KEY
     }
 
-    response = requests.get(url, params=params, headers=headers, timeout=20)
+    response = requests.get(url, params=params, timeout=20)
     response.raise_for_status()
     data = response.json()
 
@@ -328,6 +326,13 @@ def evaluate_asset(coin_id: str, symbol: str) -> dict:
 
 def main():
     print("COINGECKO_API_KEY cargada:", bool(COINGECKO_API_KEY))
+
+test_url = "https://api.coingecko.com/api/v3/ping"
+test_params = {"x_cg_demo_api_key": COINGECKO_API_KEY}
+test_response = requests.get(test_url, params=test_params, timeout=10)
+print("Ping CoinGecko status:", test_response.status_code)
+print("Ping CoinGecko body:", test_response.text)
+
     try:
         alerts_found = []
 

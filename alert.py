@@ -4,7 +4,28 @@ import time
 import requests
 import pandas as pd
 import numpy as np
+import json
+from pathlib import Path
 
+ALERT_COOLDOWN_HOURS = 24
+STATE_FILE = "alert_state.json"
+
+def already_alerted(symbol: str) -> bool:
+    if not Path(STATE_FILE).exists():
+        return False
+    state = json.loads(Path(STATE_FILE).read_text())
+    last = state.get(symbol)
+    if not last:
+        return False
+    return (time.time() - last) < ALERT_COOLDOWN_HOURS * 3600
+
+def mark_alerted(symbol: str):
+    state = {}
+    if Path(STATE_FILE).exists():
+        state = json.loads(Path(STATE_FILE).read_text())
+    state[symbol] = time.time()
+    Path(STATE_FILE).write_text(json.dumps(state))
+    
 VS_CURRENCY = "usd"
 
 ASSETS = [
@@ -367,25 +388,27 @@ def main():
                 print(f"Error evaluando activo: {asset_error}")
                 print("")
 
-        if alerts_found:
-            for result in alerts_found:
-                message = (
-                    f"🚦 ALERTA V2 {result['symbol']}\n"
-                    f"Score: {result['score']:.1f}/8.5\n"
-                    f"R:R: {result['rr']:.2f}\n"
-                    f"RSI 4H: {result['rsi_4h']:.2f}\n"
-                    f"Actividad relativa: {result['activity_ratio']:.2f}x\n"
-                    f"Detalles:\n- " + "\n- ".join(result["reasons"])
-                )
-                send_telegram_message(message)
-                print(f"Alerta enviada para {result['symbol']}")
-        else:
-            print("Sin alertas en ningún activo.")
+        
+    if alerts_found:
+    for result in alerts_found:
+        if already_alerted(result['symbol']):
+            print(f"Alerta suprimida para {result['symbol']} (ya alertado en las últimas {ALERT_COOLDOWN_HOURS}h)")
+            continue
+        message = (
+            f"🚦 ALERTA V2 {result['symbol']}\n"
+            f"Score: {result['score']:.1f}/8.5\n"
+            f"R:R: {result['rr']:.2f}\n"
+            f"RSI 4H: {result['rsi_4h']:.2f}\n"
+            f"Actividad relativa: {result['activity_ratio']:.2f}x\n"
+            f"Detalles:\n- " + "\n- ".join(result["reasons"])
+        )
+        send_telegram_message(message)
+        mark_alerted(result['symbol'])
+        print(f"Alerta enviada para {result['symbol']}")
 
     except Exception as e:
         print(f"Error general V2 CoinGecko multi-activo: {e}")
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()

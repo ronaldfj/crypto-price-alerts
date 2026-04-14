@@ -31,10 +31,20 @@ STATE_FILE = "alert_state.json"
 
 # ── Deduplicación ──────────────────────────────────────────────────────────────
 
+def load_state() -> dict:
+    try:
+        if not Path(STATE_FILE).exists():
+            return {}
+        content = Path(STATE_FILE).read_text().strip()
+        if not content:
+            return {}
+        return json.loads(content)
+    except Exception:
+        return {}
+
+
 def already_alerted(symbol: str) -> bool:
-    if not Path(STATE_FILE).exists():
-        return False
-    state = json.loads(Path(STATE_FILE).read_text())
+    state = load_state()
     last = state.get(symbol)
     if not last:
         return False
@@ -42,12 +52,9 @@ def already_alerted(symbol: str) -> bool:
 
 
 def mark_alerted(symbol: str):
-    state = {}
-    if Path(STATE_FILE).exists():
-        state = json.loads(Path(STATE_FILE).read_text())
+    state = load_state()
     state[symbol] = time.time()
     Path(STATE_FILE).write_text(json.dumps(state))
-
 
 # ── CoinGecko ──────────────────────────────────────────────────────────────────
 

@@ -11,8 +11,6 @@ ASSETS = [
     {"coin_id": "bitcoin", "symbol": "BTCUSD"},
     {"coin_id": "ethereum", "symbol": "ETHUSD"},
     {"coin_id": "solana", "symbol": "SOLUSD"},
-    {"coin_id": "ripple", "symbol": "XRPUSD"},
-    {"coin_id": "cardano", "symbol": "ADAUSD"},
 ]
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -20,12 +18,13 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 MIN_SCORE = 6.0
 MIN_RR = 2.0
+DAYS_BACK = 400
 
 
 # -----------------------------
 # CoinGecko
 # -----------------------------
-def get_market_chart_range(coin_id: str, vs_currency: str, days_back: int = 180) -> pd.DataFrame:
+def get_market_chart_range(coin_id: str, vs_currency: str, days_back: int = 400) -> pd.DataFrame:
     now = int(time.time())
     start = now - days_back * 24 * 60 * 60
 
@@ -59,12 +58,12 @@ def build_ohlcv_from_series(df_raw: pd.DataFrame, rule: str) -> pd.DataFrame:
     out["low"] = df["price"].resample(rule).min()
     out["close"] = df["price"].resample(rule).last()
 
-    # Proxy de actividad, no volumen OHLCV puro de exchange
+    # Proxy de actividad; no es volumen OHLCV puro de exchange
     out["volume"] = df["volume_proxy"].resample(rule).mean()
 
     out = out.dropna().reset_index()
 
-    # elimina vela en formación
+    # Eliminar vela en formación
     if len(out) > 1:
         out = out.iloc[:-1].copy().reset_index(drop=True)
 
@@ -175,8 +174,15 @@ def is_hammer(candle: pd.Series) -> bool:
 
 
 def in_key_zone_bullish(df: pd.DataFrame, threshold: float = 0.01, lookback: int = 20) -> bool:
+    if len(df) < lookback:
+        return False
+
     recent_low = df["low"].iloc[-lookback:].min()
     close = df["close"].iloc[-1]
+
+    if close == 0:
+        return False
+
     distance = abs(close - recent_low) / close
     return distance <= threshold
 
@@ -205,6 +211,9 @@ def bullish_rsi_divergence(df: pd.DataFrame, pivot_window: int = 3, lookback: in
         left = data.loc[i - pivot_window:i - 1, "low"]
         right = data.loc[i + 1:i + pivot_window, "low"]
 
+        if len(left) == 0 or len(right) == 0:
+            continue
+
         if current_low < left.min() and current_low < right.min():
             pivot_lows.append(i)
 
@@ -220,6 +229,9 @@ def bullish_rsi_divergence(df: pd.DataFrame, pivot_window: int = 3, lookback: in
 
 
 def calc_rr(df_4h: pd.DataFrame) -> float:
+    if len(df_4h) < 20:
+        return 0.0
+
     entry = df_4h["close"].iloc[-1]
     stop = df_4h["low"].iloc[-1]
     target = df_4h["high"].iloc[-20:].max()
@@ -248,15 +260,17 @@ def send_telegram_message(message: str) -> None:
 
 
 def evaluate_asset(coin_id: str, symbol: str) -> dict:
-    df_raw = get_market_chart_range(coin_id, VS_CURRENCY, days_back=180)
+    df_raw = get_market_chart_range(coin_id, VS_CURRENCY, days_back=DAYS_BACK)
 
     df_4h = build_ohlcv_from_series(df_raw, "4h")
-    df_d = build_ohlcv_from_series(df_raw, "1d")
+    df_d = build_ohlcv_from_series(df_raw, "1D")
     df_w = build_ohlcv_from_series(df_raw, "W-MON")
 
-    # validación mínima
     if len(df_4h) < 60 or len(df_d) < 60 or len(df_w) < 30:
-        raise ValueError(f"No hay suficientes datos para {symbol}")
+        raise ValueError(
+            f"No hay suficientes datos para {symbol}. "
+            f"4H={len(df_4h)}, D={len(df_d)}, W={len(df_w)}"
+        )
 
     df_4h = supertrend(df_4h)
     df_d = supertrend(df_d)
@@ -325,24 +339,30 @@ def main():
         alerts_found = []
 
         for asset in ASSETS:
-            result = evaluate_asset(asset["coin_id"], asset["symbol"])
+            try:
+                result = evaluate_asset(asset["coin_id"], asset["symbol"])
 
-            print(f"=== {result['symbol']} ===")
-            print(f"Score total: {result['score']:.1f}/8.5")
-            print(f"R:R estimado: {result['rr']:.2f}")
-            print(f"RSI 4H: {result['rsi_4h']:.2f}")
-            print(f"Actividad relativa: {result['activity_ratio']:.2f}x")
-            print("Razones:")
-            if result["reasons"]:
-                for r in result["reasons"]:
-                    print("-", r)
-            else:
-                print("- Sin condiciones cumplidas")
+                print(f"=== {result['symbol']} ===")
+                print(f"Score total: {result['score']:.1f}/8.5")
+                print(f"R:R estimado: {result['rr']:.2f}")
+                print(f"RSI 4H: {result['rsi_4h']:.2f}")
+                print(f"Actividad relativa: {result['activity_ratio']:.2f}x")
+                print("Razones:")
+                if result["reasons"]:
+                    for r in result["reasons"]:
+                        print("-", r)
+                else:
+                    print("- Sin condiciones cumplidas")
 
-            if result["alert"]:
-                alerts_found.append(result)
+                if result["alert"]:
+                    alerts_found.append(result)
 
-            print("")
+                print("")
+
+            except Exception as asset_error:
+                print(f"=== {asset['symbol']} ===")
+                print(f"Error evaluando activo: {asset_error}")
+                print("")
 
         if alerts_found:
             for result in alerts_found:
@@ -360,7 +380,7 @@ def main():
             print("Sin alertas en ningún activo.")
 
     except Exception as e:
-        print(f"Error V2 CoinGecko multi-activo: {e}")
+        print(f"Error general V2 CoinGecko multi-activo: {e}")
         sys.exit(1)
 
 

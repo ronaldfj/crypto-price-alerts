@@ -7,21 +7,22 @@ import numpy as np
 import pandas as pd
 import requests
 
-# ── Configuración ──────────────────────────────────────────────────────────────
+# ── Configuración de Expertos ──────────────────────────────────────────────────
 VS_CURRENCY = "usd"
-TOP_N = 25  
+SCAN_LIMIT = 50          # Escaneamos más para filtrar calidad
+MIN_VOLUME = 10_000_000  # $10M mínimo para asegurar liquidez en Binance
+MIN_SCORE = 5.0          # Filtro estricto de alta probabilidad
+MIN_RR = 2.0             # Solo trades donde la ganancia dobla el riesgo
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY")
 
 ALERT_COOLDOWN_HOURS = 12
 STATE_FILE = "alert_state.json"
-MIN_SCORE = 5.0  
-MIN_RR = 2.0     
-
 EXCLUDE_LIST = ['usdt', 'usdc', 'usds', 'dai', 'usde', 'pyusd', 'fdusd', 'tusd', 'wbtc', 'weth']
 
-# ── Manejo de Estado (Para no repetir alertas) ─────────────────────────────────
+# ── Sistema de Alertas y Estado ────────────────────────────────────────────────
 def load_state() -> dict:
     try:
         if not Path(STATE_FILE).exists(): return {}
@@ -36,110 +37,81 @@ def mark_alerted(symbol: str):
 def already_alerted(symbol: str) -> bool:
     state = load_state()
     last = state.get(symbol)
-    if not last: return False
-    return (time.time() - last) < ALERT_COOLDOWN_HOURS * 3600
+    return (time.time() - last) < ALERT_COOLDOWN_HOURS * 3600 if last else False
 
-# ── Telegram ───────────────────────────────────────────────────────────────────
-def send_telegram_message(message: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Error: Faltan credenciales de Telegram")
-        return
+def send_telegram(msg: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
-        requests.post(url, json=payload, timeout=15).raise_for_status()
-    except Exception as e:
-        print(f"Error enviando a Telegram: {e}")
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=15)
+    except Exception as e: print(f"Error Telegram: {e}")
 
-# ── Lógica Técnica ─────────────────────────────────────────────────────────────
+# ── Motor de Análisis Técnico ─────────────────────────────────────────────────
 def add_indicators(df):
+    # Tendencia
     df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
     df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
-    
+    # Momento (RSI)
     delta = df["close"].diff()
     gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
     loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
     df["rsi14"] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
-    
-    # ADX y ATR simplificados para estabilidad
+    # Fuerza (ADX) y Volatilidad (ATR)
     df["tr"] = df["close"].diff().abs()
     df["atr"] = df["tr"].rolling(14).mean()
-    plus_dm = df["close"].diff().clip(lower=0)
-    minus_dm = (-df["close"].diff()).clip(lower=0)
-    df["adx"] = ( (plus_dm - minus_dm).abs() / (plus_dm + minus_dm + 1e-9) ) * 100
+    p_dm = df["close"].diff().clip(lower=0)
+    m_dm = (-df["close"].diff()).clip(lower=0)
+    df["adx"] = ((p_dm - m_dm).abs() / (p_dm + m_dm + 1e-9)) * 100
     df["adx"] = df["adx"].rolling(14).mean()
     return df
 
-def get_filtered_top_assets():
-    """Obtiene el top pero ignora stablecoins y activos con poco volumen."""
+def get_market_data():
     url = "https://api.coingecko.com/api/v3/coins/markets"
-    MIN_VOLUME_THRESHOLD = 10_000_000  # $10 millones mínimo
-    
-    params = {
-        "vs_currency": VS_CURRENCY,
-        "order": "market_cap_desc",
-        "per_page": 50, # Pedimos más para tener de dónde filtrar
-        "x_cg_demo_api_key": COINGECKO_API_KEY
-    }
-    res = requests.get(url, params=params, timeout=15)
-    data = res.json()
-    
-    valid_assets = []
-    for item in data:
-        symbol = item['symbol'].lower()
-        volume = item.get('total_volume', 0)
-        
-        # Filtro: No estable, No envuelta (Wrapped), y Volumen suficiente
-        if symbol not in EXCLUDE_LIST and volume >= MIN_VOLUME_THRESHOLD:
-            valid_assets.append((item['id'], item['symbol'].upper()))
-            
-    return valid_assets[:20] # Retornamos los 20 mejores que cumplen todo
+    params = {"vs_currency": VS_CURRENCY, "order": "market_cap_desc", "per_page": SCAN_LIMIT, "x_cg_demo_api_key": COINGECKO_API_KEY}
+    res = requests.get(url, params=params, timeout=15).json()
+    return [(c['id'], c['symbol'].upper()) for c in res if c['symbol'].lower() not in EXCLUDE_LIST and c.get('total_volume', 0) >= MIN_VOLUME][:20]
 
-def evaluate_asset(coin_id, symbol):
+def evaluate(coin_id, symbol):
     url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
     params = {"vs_currency": VS_CURRENCY, "days": "90", "x_cg_demo_api_key": COINGECKO_API_KEY}
     data = requests.get(url, params=params, timeout=15).json()
+    df = add_indicators(pd.DataFrame(data["prices"], columns=["ts", "close"]))
     
-    df = pd.DataFrame(data["prices"], columns=["ts", "close"])
-    df = add_indicators(df)
     last, prev = df.iloc[-1], df.iloc[-2]
-    
     score, reasons = 0, []
+
     if last["close"] > last["ema200"]: score += 1.5; reasons.append("Tendencia Institucional (EMA200)")
-    if last["adx"] > 22: score += 1.5; reasons.append(f"Fuerza ADX ({last['adx']:.1f})")
-    if 45 < last["rsi14"] < 65 and last["rsi14"] > prev["rsi14"]: score += 1; reasons.append("Momento RSI")
+    if last["adx"] > 22: score += 1.5; reasons.append(f"Fuerza de Tendencia (ADX: {last['adx']:.1f})")
+    if 45 < last["rsi14"] < 65 and last["rsi14"] > prev["rsi14"]: score += 1; reasons.append("Impulso RSI")
     if last["close"] > last["ema20"] and prev["close"] <= prev["ema20"]: score += 1; reasons.append("Cruce EMA20")
 
     stop = last["close"] - (last["atr"] * 2.5)
-    tp = last["close"] + (last["atr"] * 5)
-    rr = (tp - last["close"]) / (last["close"] - stop) if (last["close"] - stop) != 0 else 0
+    tp = last["close"] + (last["atr"] * 5.5) # R:R optimizado
+    rr = (tp - last["close"]) / (last["close"] - stop)
 
-    return {"symbol": symbol, "score": score, "rr": rr, "price": last["close"], "stop": stop, "tp": tp, 
-            "alert": score >= MIN_SCORE and rr >= MIN_RR, "reasons": reasons}
+    return {"symbol": symbol, "score": score, "rr": rr, "price": last["close"], "stop": stop, "tp": tp, "alert": score >= MIN_SCORE and rr >= MIN_RR, "reasons": reasons}
 
-# ── Ejecución Principal ────────────────────────────────────────────────────────
+# ── Main ───────────────────────────────────────────────────────────────────────
 def main():
-    print("Iniciando Escaneo con Alertas de Telegram...")
+    print("Iniciando Sistema de Trading Automático...")
     try:
-        assets = get_filtered_top_assets()
-        for coin_id, symbol in assets:
+        for coin_id, symbol in get_market_data():
             if already_alerted(symbol): continue
-            
             try:
-                res = evaluate_asset(coin_id, symbol)
+                res = evaluate(coin_id, symbol)
                 if res["alert"]:
-                    msg = (f"🚀 *ALERTA DE TRADING: {res['symbol']}*\n\n"
+                    msg = (f"🚀 *ALERTA COMPRA: {res['symbol']}*\n\n"
                            f"💰 *Precio:* {res['price']:.4f}\n"
                            f"📊 *Score:* {res['score']}\n"
                            f"⚖️ *R:R:* {res['rr']:.2f}\n\n"
-                           f"🎯 *TP:* {res['tp']:.4f}\n"
-                           f"🛑 *SL:* {res['stop']:.4f}\n\n"
-                           f"📝 *Razones:* {', '.join(res['reasons'])}")
-                    send_telegram_message(msg)
+                           f"🎯 *TARGET (TP):* {res['tp']:.4f}\n"
+                           f"🛑 *STOP (SL):* {res['stop']:.4f}\n\n"
+                           f"📝 *Análisis:* {', '.join(res['reasons'])}")
+                    send_telegram(msg)
                     mark_alerted(symbol)
-                    print(f"Alerta enviada para {symbol}")
-                time.sleep(2.2)
-            except Exception as e: print(f"Error en {symbol}: {e}")
+                    print(f"Alerta enviada: {symbol}")
+                time.sleep(2.2) # Respetar API gratuita
+            except Exception as e: print(f"Error {symbol}: {e}")
     except Exception as e: print(f"Error General: {e}")
 
 if __name__ == "__main__":

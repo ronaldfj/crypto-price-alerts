@@ -2,10 +2,11 @@ import os
 import sys
 import time
 import json
-import requests
-import pandas as pd
-import numpy as np
 from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import requests
 
 VS_CURRENCY = "usd"
 
@@ -21,17 +22,17 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY")
 
-MIN_SCORE = 6.0
-MIN_RR = 2.0
+ALERT_COOLDOWN_HOURS = 24
+STATE_FILE = "alert_state.json"
 
 DAYS_FOR_DAILY = 300
 DAYS_FOR_4H = 100
 
-ALERT_COOLDOWN_HOURS = 24
-STATE_FILE = "alert_state.json"
+MIN_SCORE = 4.5
+MIN_RR = 1.8
 
 
-# ── Deduplicación ──────────────────────────────────────────────────────────────
+# ── Estado ─────────────────────────────────────────────────────────────────────
 
 def load_state() -> dict:
     try:
@@ -57,6 +58,7 @@ def mark_alerted(symbol: str):
     state = load_state()
     state[symbol] = time.time()
     Path(STATE_FILE).write_text(json.dumps(state))
+
 
 # ── CoinGecko ──────────────────────────────────────────────────────────────────
 
@@ -89,7 +91,6 @@ def get_market_chart_days(coin_id: str, vs_currency: str, days: int, interval: s
     df = prices.merge(volumes, on="timestamp", how="inner")
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     df = df.sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
-
     return df
 
 
@@ -126,162 +127,56 @@ def rsi(series: pd.Series, length: int = 14) -> pd.Series:
     avg_loss = loss.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
 
     rs = avg_gain / avg_loss.replace(0, np.nan)
-    result = 100 - (100 / (1 + rs))
-    return result.fillna(50)
+    out = 100 - (100 / (1 + rs))
+    return out.fillna(50)
 
 
-def atr(df: pd.DataFrame, length: int = 10) -> pd.Series:
+def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
     high_low = df["high"] - df["low"]
     high_close = (df["high"] - df["close"].shift()).abs()
     low_close = (df["low"] - df["close"].shift()).abs()
-
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     return tr.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
 
 
-def supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0) -> pd.DataFrame:
-    out = df.copy()
-    out["atr"] = atr(out, period)
-
-    hl2 = (out["high"] + out["low"]) / 2
-    out["upperband"] = hl2 + multiplier * out["atr"]
-    out["lowerband"] = hl2 - multiplier * out["atr"]
-
-    out["final_upperband"] = np.nan
-    out["final_lowerband"] = np.nan
-    out["supertrend"] = np.nan
-    out["st_direction"] = True
-
-    for i in range(len(out)):
-        if i == 0:
-            out.loc[i, "final_upperband"] = out.loc[i, "upperband"]
-            out.loc[i, "final_lowerband"] = out.loc[i, "lowerband"]
-            out.loc[i, "supertrend"] = out.loc[i, "lowerband"]
-            out.loc[i, "st_direction"] = True
-            continue
-
-        prev_fub = out.loc[i - 1, "final_upperband"]
-        prev_flb = out.loc[i - 1, "final_lowerband"]
-        prev_close = out.loc[i - 1, "close"]
-
-        if out.loc[i, "upperband"] < prev_fub or prev_close > prev_fub:
-            out.loc[i, "final_upperband"] = out.loc[i, "upperband"]
-        else:
-            out.loc[i, "final_upperband"] = prev_fub
-
-        if out.loc[i, "lowerband"] > prev_flb or prev_close < prev_flb:
-            out.loc[i, "final_lowerband"] = out.loc[i, "lowerband"]
-        else:
-            out.loc[i, "final_lowerband"] = prev_flb
-
-        prev_st = out.loc[i - 1, "supertrend"]
-
-        if prev_st == prev_fub:
-            if out.loc[i, "close"] <= out.loc[i, "final_upperband"]:
-                out.loc[i, "supertrend"] = out.loc[i, "final_upperband"]
-                out.loc[i, "st_direction"] = False
-            else:
-                out.loc[i, "supertrend"] = out.loc[i, "final_lowerband"]
-                out.loc[i, "st_direction"] = True
-        else:
-            if out.loc[i, "close"] >= out.loc[i, "final_lowerband"]:
-                out.loc[i, "supertrend"] = out.loc[i, "final_lowerband"]
-                out.loc[i, "st_direction"] = True
-            else:
-                out.loc[i, "supertrend"] = out.loc[i, "final_upperband"]
-                out.loc[i, "st_direction"] = False
-
-    return out
-
-
-# ── Señales ────────────────────────────────────────────────────────────────────
-
-def is_hammer(candle: pd.Series) -> bool:
-    body = abs(candle["close"] - candle["open"])
-    total_range = candle["high"] - candle["low"]
-    lower_shadow = min(candle["open"], candle["close"]) - candle["low"]
-    upper_shadow = candle["high"] - max(candle["open"], candle["close"])
-
-    if total_range == 0:
-        return False
-
-    return (
-        lower_shadow >= body * 2
-        and upper_shadow <= max(body, 1e-9)
-        and body / total_range <= 0.4
-    )
-
-
-def in_key_zone_bullish(df: pd.DataFrame, threshold: float = 0.01, lookback: int = 20) -> bool:
-    if len(df) < lookback:
-        return False
-
-    recent_low = df["low"].iloc[-lookback:].min()
-    close = df["close"].iloc[-1]
-
-    if close == 0:
-        return False
-
-    distance = abs(close - recent_low) / close
-    return distance <= threshold
-
+# ── Utilidades de señal ────────────────────────────────────────────────────────
 
 def relative_activity(df: pd.DataFrame, lookback: int = 20) -> float:
     if len(df) < lookback + 1:
         return 0.0
-
     last_val = df["volume"].iloc[-1]
     avg_val = df["volume"].iloc[-(lookback + 1):-1].mean()
-
     if avg_val == 0 or pd.isna(avg_val):
         return 0.0
-
     return float(last_val / avg_val)
 
 
-def bullish_rsi_divergence(df: pd.DataFrame, pivot_window: int = 3, lookback: int = 60) -> bool:
-    data = df.copy().tail(lookback).reset_index(drop=True)
-    data["rsi"] = rsi(data["close"], 14)
-
-    pivot_lows = []
-
-    for i in range(pivot_window, len(data) - pivot_window):
-        current_low = data.loc[i, "low"]
-        left = data.loc[i - pivot_window:i - 1, "low"]
-        right = data.loc[i + 1:i + pivot_window, "low"]
-
-        if len(left) == 0 or len(right) == 0:
-            continue
-
-        if current_low < left.min() and current_low < right.min():
-            pivot_lows.append(i)
-
-    if len(pivot_lows) < 2:
+def near_moving_average(price: float, ma_value: float, pct: float = 0.015) -> bool:
+    if ma_value == 0 or pd.isna(ma_value):
         return False
-
-    i1, i2 = pivot_lows[-2], pivot_lows[-1]
-
-    price_lower_low = data.loc[i2, "low"] < data.loc[i1, "low"]
-    rsi_higher_low = data.loc[i2, "rsi"] > data.loc[i1, "rsi"]
-
-    return bool(price_lower_low and rsi_higher_low)
+    return abs(price - ma_value) / ma_value <= pct
 
 
-def calc_rr(df_4h: pd.DataFrame) -> float:
-    if len(df_4h) < 20:
-        return 0.0
+def calc_rr(df_4h: pd.DataFrame) -> tuple[float, float, float, float]:
+    if len(df_4h) < 30:
+        return 0.0, 0.0, 0.0, 0.0
 
     entry = df_4h["close"].iloc[-1]
-    stop = df_4h["low"].iloc[-1]
-    target = df_4h["high"].iloc[-20:].max()
+    atr_4h = df_4h["atr14"].iloc[-1]
+
+    recent_low = df_4h["low"].iloc[-3:].min()
+    ema50 = df_4h["ema50"].iloc[-1]
+
+    atr_stop = ema50 - 0.5 * atr_4h
+    stop = min(recent_low, atr_stop)
 
     risk = entry - stop
-    reward = target - entry
-
     if risk <= 0:
-        return 0.0
+        return entry, stop, 0.0, 0.0
 
-    return float(reward / risk)
+    target = entry + 1.8 * risk
+    rr = (target - entry) / risk
+    return entry, stop, target, float(rr)
 
 
 # ── Telegram ───────────────────────────────────────────────────────────────────
@@ -300,77 +195,89 @@ def send_telegram_message(message: str) -> None:
     response.raise_for_status()
 
 
-# ── Evaluación ─────────────────────────────────────────────────────────────────
+# ── Evaluación V3 ──────────────────────────────────────────────────────────────
 
 def evaluate_asset(coin_id: str, symbol: str) -> dict:
     df_raw_daily = get_market_chart_days(coin_id, VS_CURRENCY, DAYS_FOR_DAILY)
-    time.sleep(2)
+    time.sleep(1.5)
     df_raw_4h = get_market_chart_days(coin_id, VS_CURRENCY, DAYS_FOR_4H, interval="hourly")
 
-    df_4h = build_ohlcv_from_series(df_raw_4h, "4h")
     df_d = build_ohlcv_from_series(df_raw_daily, "1D")
     df_w = build_ohlcv_from_series(df_raw_daily, "W-MON")
+    df_4h = build_ohlcv_from_series(df_raw_4h, "4h")
 
-    if len(df_4h) < 60 or len(df_d) < 60 or len(df_w) < 30:
+    if len(df_d) < 80 or len(df_w) < 20 or len(df_4h) < 80:
         raise ValueError(
             f"No hay suficientes datos para {symbol}. 4H={len(df_4h)}, D={len(df_d)}, W={len(df_w)}"
         )
 
-    df_4h = supertrend(df_4h)
-    df_d = supertrend(df_d)
-    df_w = supertrend(df_w)
-
-    for df in [df_4h, df_d, df_w]:
-        df["ema21"] = ema(df["close"], 21)
+    for df in [df_d, df_w, df_4h]:
+        df["ema20"] = ema(df["close"], 20)
+        df["ema50"] = ema(df["close"], 50)
         df["rsi14"] = rsi(df["close"], 14)
+
+    df_4h["atr14"] = atr(df_4h, 14)
 
     score = 0.0
     reasons = []
 
-    if bool(df_w["st_direction"].iloc[-1]):
+    # 1) Régimen diario (máx 3)
+    if df_d["close"].iloc[-1] > df_d["ema50"].iloc[-1]:
         score += 1
-        reasons.append("W: Supertrend verde (+1)")
-    if df_w["close"].iloc[-1] > df_w["ema21"].iloc[-1]:
+        reasons.append("D: Precio > EMA50 (+1)")
+    if df_d["ema20"].iloc[-1] > df_d["ema50"].iloc[-1]:
         score += 1
-        reasons.append("W: Precio > EMA21 (+1)")
-    if df_w["rsi14"].iloc[-1] > 50:
+        reasons.append("D: EMA20 > EMA50 (+1)")
+    if df_d["rsi14"].iloc[-1] > 52:
         score += 1
-        reasons.append("W: RSI14 > 50 (+1)")
+        reasons.append("D: RSI14 > 52 (+1)")
 
-    if bool(df_d["st_direction"].iloc[-1]):
+    # 2) Contexto semanal suave (máx 1)
+    if df_w["close"].iloc[-1] > df_w["ema20"].iloc[-1]:
         score += 1
-        reasons.append("D: Supertrend verde (+1)")
-    if bullish_rsi_divergence(df_d):
-        score += 1
-        reasons.append("D: Divergencia alcista RSI (+1)")
-    if df_d["rsi14"].iloc[-1] > 50:
-        score += 1
-        reasons.append("D: RSI14 > 50 (+1)")
+        reasons.append("W: Precio > EMA20 (+1)")
 
-    if is_hammer(df_4h.iloc[-1]) and in_key_zone_bullish(df_4h):
-        score += 1
-        reasons.append("4H: Martillo en zona clave (+1)")
-
-    activity_ratio = relative_activity(df_4h, 20)
-    if activity_ratio >= 1.5:
-        score += 0.5
-        reasons.append(f"4H: Actividad relativa {activity_ratio:.2f}x (+0.5)")
-
+    # 3) Setup 4H pullback (máx 2)
+    close_4h = df_4h["close"].iloc[-1]
+    ema20_4h = df_4h["ema20"].iloc[-1]
+    ema50_4h = df_4h["ema50"].iloc[-1]
     rsi_4h = df_4h["rsi14"].iloc[-1]
-    if rsi_4h < 30 or rsi_4h > 70:
-        score += 1
-        reasons.append(f"4H: RSI extremo {rsi_4h:.2f} (+1)")
+    prev_rsi_4h = df_4h["rsi14"].iloc[-2]
 
-    rr = calc_rr(df_4h)
+    if near_moving_average(close_4h, ema20_4h, 0.015) or near_moving_average(close_4h, ema50_4h, 0.02):
+        score += 1
+        reasons.append("4H: Pullback a EMA20/EMA50 (+1)")
+
+    if (40 <= rsi_4h <= 62) or (prev_rsi_4h < 45 <= rsi_4h):
+        score += 1
+        reasons.append("4H: RSI de recuperación (+1)")
+
+    # 4) Gatillo 4H (máx 2)
+    prev_close = df_4h["close"].iloc[-2]
+    prev_high = df_4h["high"].iloc[-2]
+    activity_ratio = relative_activity(df_4h, 20)
+
+    if close_4h > ema20_4h and close_4h > prev_close:
+        score += 1
+        reasons.append("4H: Cierre fuerte sobre EMA20 (+1)")
+
+    if close_4h > prev_high or activity_ratio >= 1.10:
+        score += 1
+        reasons.append(f"4H: Break/actividad {activity_ratio:.2f}x (+1)")
+
+    entry, stop, target, rr = calc_rr(df_4h)
 
     return {
         "coin_id": coin_id,
         "symbol": symbol,
         "score": score,
         "rr": rr,
-        "reasons": reasons,
+        "entry": entry,
+        "stop": stop,
+        "target": target,
         "activity_ratio": activity_ratio,
         "rsi_4h": rsi_4h,
+        "reasons": reasons,
         "alert": score >= MIN_SCORE and rr >= MIN_RR,
     }
 
@@ -394,8 +301,11 @@ def main():
                 result = evaluate_asset(asset["coin_id"], asset["symbol"])
 
                 print(f"=== {result['symbol']} ===")
-                print(f"Score total: {result['score']:.1f}/8.5")
+                print(f"Score total: {result['score']:.1f}")
                 print(f"R:R estimado: {result['rr']:.2f}")
+                print(f"Entry: {result['entry']:.2f}")
+                print(f"Stop: {result['stop']:.2f}")
+                print(f"Target: {result['target']:.2f}")
                 print(f"RSI 4H: {result['rsi_4h']:.2f}")
                 print(f"Actividad relativa: {result['activity_ratio']:.2f}x")
                 print("Razones:")
@@ -414,21 +324,24 @@ def main():
                 print(f"Error evaluando activo: {asset_error}")
                 print("")
 
-            time.sleep(3)
+            time.sleep(2)
 
         if alerts_found:
             for result in alerts_found:
                 if already_alerted(result["symbol"]):
-                    print(f"Alerta suprimida para {result['symbol']} (ya alertado en las últimas {ALERT_COOLDOWN_HOURS}h)")
+                    print(f"Alerta suprimida para {result['symbol']} (cooldown {ALERT_COOLDOWN_HOURS}h)")
                     continue
 
                 message = (
-                    f"🚦 ALERTA V2 {result['symbol']}\n"
-                    f"Score: {result['score']:.1f}/8.5\n"
+                    f"🚦 ALERTA V3 {result['symbol']}\n"
+                    f"Score: {result['score']:.1f}\n"
                     f"R:R: {result['rr']:.2f}\n"
+                    f"Entry: {result['entry']:.2f}\n"
+                    f"Stop: {result['stop']:.2f}\n"
+                    f"Target: {result['target']:.2f}\n"
                     f"RSI 4H: {result['rsi_4h']:.2f}\n"
-                    f"Actividad relativa: {result['activity_ratio']:.2f}x\n"
-                    f"Detalles:\n- " + "\n- ".join(result["reasons"])
+                    f"Actividad: {result['activity_ratio']:.2f}x\n"
+                    f"Checklist:\n- " + "\n- ".join(result["reasons"])
                 )
                 send_telegram_message(message)
                 mark_alerted(result["symbol"])
@@ -437,7 +350,7 @@ def main():
             print("Sin alertas en ningún activo.")
 
     except Exception as e:
-        print(f"Error general V2 CoinGecko multi-activo: {e}")
+        print(f"Error general V3: {e}")
         sys.exit(1)
 
 

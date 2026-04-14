@@ -326,7 +326,7 @@ def evaluate_asset(coin_id: str, symbol: str) -> dict:
         "reasons": reasons,
         "activity_ratio": activity_ratio,
         "rsi_4h": rsi_4h,
-        "alert": score >= MIN_SCORE and rr >= MIN_RR,
+        "alert": score >= 2 and rr >= 0.3,
     }
 
 

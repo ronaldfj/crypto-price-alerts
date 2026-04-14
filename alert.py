@@ -19,27 +19,33 @@ COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY")
 
 MIN_SCORE = 6.0
 MIN_RR = 2.0
-DAYS_BACK = 400
+
+DAYS_FOR_DAILY = 300
+DAYS_FOR_4H = 100
 
 
-def get_market_chart_range(coin_id: str, vs_currency: str, days_back: int = 400) -> pd.DataFrame:
+def cg_get(url: str, params: dict) -> dict:
     if not COINGECKO_API_KEY:
         raise ValueError("Falta COINGECKO_API_KEY en GitHub Secrets")
 
-    now = int(time.time())
-    start = now - days_back * 24 * 60 * 60
-
-    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart/range"
-    params = {
-        "vs_currency": vs_currency,
-        "from": start,
-        "to": now,
-        "x_cg_demo_api_key": COINGECKO_API_KEY,
-    }
+    params = params.copy()
+    params["x_cg_demo_api_key"] = COINGECKO_API_KEY
 
     response = requests.get(url, params=params, timeout=20)
     response.raise_for_status()
-    data = response.json()
+    return response.json()
+
+
+def get_market_chart_days(coin_id: str, vs_currency: str, days: int, interval: str | None = None) -> pd.DataFrame:
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
+    params = {
+        "vs_currency": vs_currency,
+        "days": days,
+    }
+    if interval:
+        params["interval"] = interval
+
+    data = cg_get(url, params)
 
     prices = pd.DataFrame(data["prices"], columns=["timestamp", "price"])
     volumes = pd.DataFrame(data["total_volumes"], columns=["timestamp", "volume_proxy"])
@@ -245,7 +251,7 @@ def send_telegram_message(message: str) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": message
+        "text": message,
     }
 
     response = requests.post(url, json=payload, timeout=15)
@@ -253,11 +259,12 @@ def send_telegram_message(message: str) -> None:
 
 
 def evaluate_asset(coin_id: str, symbol: str) -> dict:
-    df_raw = get_market_chart_range(coin_id, VS_CURRENCY, days_back=DAYS_BACK)
+    df_raw_daily = get_market_chart_days(coin_id, VS_CURRENCY, DAYS_FOR_DAILY)
+    df_raw_4h = get_market_chart_days(coin_id, VS_CURRENCY, DAYS_FOR_4H, interval="hourly")
 
-    df_4h = build_ohlcv_from_series(df_raw, "4h")
-    df_d = build_ohlcv_from_series(df_raw, "1D")
-    df_w = build_ohlcv_from_series(df_raw, "W-MON")
+    df_4h = build_ohlcv_from_series(df_raw_4h, "4h")
+    df_d = build_ohlcv_from_series(df_raw_daily, "1D")
+    df_w = build_ohlcv_from_series(df_raw_daily, "W-MON")
 
     if len(df_4h) < 60 or len(df_d) < 60 or len(df_w) < 30:
         raise ValueError(
@@ -350,11 +357,10 @@ def main():
                         print("-", r)
                 else:
                     print("- Sin condiciones cumplidas")
+                print("")
 
                 if result["alert"]:
                     alerts_found.append(result)
-
-                print("")
 
             except Exception as asset_error:
                 print(f"=== {asset['symbol']} ===")

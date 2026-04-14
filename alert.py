@@ -34,7 +34,7 @@ def get_market_chart_range(coin_id: str, vs_currency: str, days_back: int = 400)
         "vs_currency": vs_currency,
         "from": start,
         "to": now,
-        "x_cg_demo_api_key": COINGECKO_API_KEY
+        "x_cg_demo_api_key": COINGECKO_API_KEY,
     }
 
     response = requests.get(url, params=params, timeout=20)
@@ -261,8 +261,7 @@ def evaluate_asset(coin_id: str, symbol: str) -> dict:
 
     if len(df_4h) < 60 or len(df_d) < 60 or len(df_w) < 30:
         raise ValueError(
-            f"No hay suficientes datos para {symbol}. "
-            f"4H={len(df_4h)}, D={len(df_d)}, W={len(df_w)}"
+            f"No hay suficientes datos para {symbol}. 4H={len(df_4h)}, D={len(df_d)}, W={len(df_w)}"
         )
 
     df_4h = supertrend(df_4h)
@@ -320,20 +319,20 @@ def evaluate_asset(coin_id: str, symbol: str) -> dict:
         "reasons": reasons,
         "activity_ratio": activity_ratio,
         "rsi_4h": rsi_4h,
-        "alert": score >= MIN_SCORE and rr >= MIN_RR
+        "alert": score >= MIN_SCORE and rr >= MIN_RR,
     }
 
 
 def main():
-    print("COINGECKO_API_KEY cargada:", bool(COINGECKO_API_KEY))
-
-test_url = "https://api.coingecko.com/api/v3/ping"
-test_params = {"x_cg_demo_api_key": COINGECKO_API_KEY}
-test_response = requests.get(test_url, params=test_params, timeout=10)
-print("Ping CoinGecko status:", test_response.status_code)
-print("Ping CoinGecko body:", test_response.text)
-
     try:
+        print("COINGECKO_API_KEY cargada:", bool(COINGECKO_API_KEY))
+
+        ping_url = "https://api.coingecko.com/api/v3/ping"
+        ping_params = {"x_cg_demo_api_key": COINGECKO_API_KEY}
+        ping_response = requests.get(ping_url, params=ping_params, timeout=10)
+        print("Ping CoinGecko status:", ping_response.status_code)
+        print("Ping CoinGecko body:", ping_response.text)
+
         alerts_found = []
 
         for asset in ASSETS:

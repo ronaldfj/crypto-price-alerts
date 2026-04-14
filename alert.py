@@ -71,10 +71,29 @@ def add_indicators(df):
     return df
 
 def get_filtered_top_assets():
+    """Obtiene el top pero ignora stablecoins y activos con poco volumen."""
     url = "https://api.coingecko.com/api/v3/coins/markets"
-    params = {"vs_currency": VS_CURRENCY, "order": "market_cap_desc", "per_page": TOP_N, "x_cg_demo_api_key": COINGECKO_API_KEY}
+    MIN_VOLUME_THRESHOLD = 10_000_000  # $10 millones mínimo
+    
+    params = {
+        "vs_currency": VS_CURRENCY,
+        "order": "market_cap_desc",
+        "per_page": 50, # Pedimos más para tener de dónde filtrar
+        "x_cg_demo_api_key": COINGECKO_API_KEY
+    }
     res = requests.get(url, params=params, timeout=15)
-    return [(item['id'], item['symbol'].upper()) for item in res.json() if item['symbol'].lower() not in EXCLUDE_LIST][:20]
+    data = res.json()
+    
+    valid_assets = []
+    for item in data:
+        symbol = item['symbol'].lower()
+        volume = item.get('total_volume', 0)
+        
+        # Filtro: No estable, No envuelta (Wrapped), y Volumen suficiente
+        if symbol not in EXCLUDE_LIST and volume >= MIN_VOLUME_THRESHOLD:
+            valid_assets.append((item['id'], item['symbol'].upper()))
+            
+    return valid_assets[:20] # Retornamos los 20 mejores que cumplen todo
 
 def evaluate_asset(coin_id, symbol):
     url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"

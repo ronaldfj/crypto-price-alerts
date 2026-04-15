@@ -6,20 +6,27 @@ import pandas as pd
 import yfinance as yf
 import requests
 
-# ── Configuración Maestra (VERIFICADA PARA YAHOO FINANCE) ──────────────────
-# Se han corregido los nombres para eliminar los errores "possibly delisted"
+# ── Configuración de Activos ──────────────────────────────────────────────────
+# Lista depurada con tickers compatibles con Yahoo Finance
 CRYPTO_SYMBOLS = [
     'BTC-USD', 'ETH-USD', 'BNB-USD', 'SOL-USD', 'XRP-USD', 
-    'ADA-USD', 'AVAX-USD', 'DOT-USD', 'LINK-USD', 'MATIC-USD', # MATIC es más estable que POL en Yahoo
-    'LTC-USD', 'NEAR-USD', 'SUI1-USD', 'FET-USD', 'RENDER-USD', 
-    'TAO1-USD', 'INJ-USD', 'STX1-USD', 'PEPE1-USD', 'SHIB-USD'
+    'ADA-USD', 'AVAX-USD', 'DOT-USD', 'LINK-USD', 'POL-USD',
+    'LTC-USD', 'NEAR-USD', 'SUI-USD', 'FET-USD', 'RENDER-USD', 
+    'TAO-USD', 'INJ-USD', 'STX-USD', 'PEPE-USD', 'SHIB-USD'
 ]
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-STATE_FILE = "alert_state.json"  # <── AHORA SINCRONIZADO CON EL YAML
-MIN_SCORE = 4.5  # Bajamos un poco para captar el inicio del movimiento
-MIN_RR = 1.8
+STATE_FILE = "alert_state.json"  # Sincronizado con el flujo de GitHub Actions [cite: 1]
+MIN_SCORE = 5.0  
+MIN_RR = 2.0
+
+def send_telegram(msg):
+    if not TELEGRAM_BOT_TOKEN: return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=15)
+    except Exception as e: print(f"Error Telegram: {e}")
 
 def load_state():
     try:
@@ -34,11 +41,11 @@ def save_state(state):
 
 def evaluate_crypto(symbol):
     try:
-        # Descarga de datos
-        df = yf.Ticker(symbol).history(period="30d", interval="1h")
-        if df is None or df.empty or len(df) < 50: return None
+        # Descarga de 60 días para asegurar cálculo de EMA200
+        df = yf.Ticker(symbol).history(period="60d", interval="1h")
+        if df is None or df.empty or len(df) < 200: return None
 
-        # Indicadores técnicos
+        # Indicadores Técnicos
         df['ema20'] = df['Close'].ewm(span=20, adjust=False).mean()
         df['ema200'] = df['Close'].ewm(span=200, adjust=False).mean()
         
@@ -47,19 +54,18 @@ def evaluate_crypto(symbol):
         loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
         df['rsi'] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
         
-        df['tr'] = df['Close'].diff().abs()
-        df['atr'] = df['tr'].rolling(14).mean()
+        df['atr'] = df['Close'].diff().abs().rolling(14).mean()
 
         last, prev = df.iloc[-1], df.iloc[-2]
         score, reasons = 0, []
 
-        # Lógica de puntuación
+        # Lógica de señales
         if last['Close'] > last['ema200']: 
             score += 2.0; reasons.append("Tendencia Alcista (>EMA200)")
-        if 40 < last['rsi'] < 65 and last['rsi'] > prev['rsi']: 
+        if 45 < last['rsi'] < 65 and last['rsi'] > prev['rsi']: 
             score += 1.5; reasons.append(f"RSI Momentum ({last['rsi']:.1f})")
         if last['Close'] > last['ema20'] and prev['Close'] <= prev['ema20']:
-            score += 1.0; reasons.append("Cruce EMA20")
+            score += 1.5; reasons.append("Cruce EMA20")
 
         # Gestión de Riesgo
         atr = last['atr'] if last['atr'] > 0 else (last['Close'] * 0.02)
@@ -79,35 +85,28 @@ def main():
     now = time.time()
     print(f"🚀 Iniciando escaneo de {len(CRYPTO_SYMBOLS)} activos...")
     
-    any_new_alert = False
+    any_alert = False
     for symbol in CRYPTO_SYMBOLS:
         last_alert = state.get(symbol, 0)
-        # Cooldown de 4 horas
-        if (now - last_alert) < 14400:
-            print(f"⏳ {symbol} en cooldown.")
+        if (now - last_alert) < 14400: # Cooldown 4h
             continue
         
         res = evaluate_crypto(symbol)
         if res and res["alert"]:
-            msg = (f"✅ *ALERTA:* {res['symbol']}\n"
+            msg = (f"⚡ *ALERTA:* {res['symbol']}\n"
                    f"💰 Precio: ${res['price']:.4f}\n"
                    f"📊 Score: {res['score']}\n"
                    f"⚖️ RR: {res['rr']:.2f}\n"
                    f"🎯 TP: ${res['tp']:.4f} | 🛑 SL: ${res['stop']:.4f}\n"
                    f"📝 {', '.join(res['reasons'])}")
-            
-            # Envío a Telegram
-            if TELEGRAM_BOT_TOKEN:
-                url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-                requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
-            
+            send_telegram(msg)
             state[symbol] = now
-            any_new_alert = True
+            any_alert = True
             print(f"✅ Alerta enviada: {res['symbol']}")
         
-        time.sleep(2) # Evitar bloqueos de Yahoo
+        time.sleep(2)
 
-    if any_new_alert:
+    if any_alert:
         save_state(state)
 
 if __name__ == "__main__":

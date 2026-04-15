@@ -7,17 +7,18 @@ import yfinance as yf
 import requests
 
 # ── Configuración de Activos ──────────────────────────────────────────────────
-# Lista depurada con tickers compatibles con Yahoo Finance
+# Lista optimizada con tickers verificados para Yahoo Finance
 CRYPTO_SYMBOLS = [
     'BTC-USD', 'ETH-USD', 'BNB-USD', 'SOL-USD', 'XRP-USD', 
-    'ADA-USD', 'AVAX-USD', 'DOT-USD', 'LINK-USD', 'POL-USD',
+    'ADA-USD', 'AVAX-USD', 'DOT-USD', 'LINK-USD', 'MATIC-USD', 
     'LTC-USD', 'NEAR-USD', 'SUI-USD', 'FET-USD', 'RENDER-USD', 
-    'TAO-USD', 'INJ-USD', 'STX-USD', 'PEPE-USD', 'SHIB-USD'
+    'TAO-USD', 'INJ-USD', 'STX-USD', 'PEPE-USD', 'SHIB-USD',
+    'AAVE-USD', 'EGLD-USD'
 ]
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-STATE_FILE = "alert_state.json"  # Sincronizado con el flujo de GitHub Actions [cite: 1]
+STATE_FILE = "alert_state.json"  # Sincronizado con el flujo de GitHub
 MIN_SCORE = 5.0  
 MIN_RR = 2.0
 
@@ -41,7 +42,7 @@ def save_state(state):
 
 def evaluate_crypto(symbol):
     try:
-        # Descarga de 60 días para asegurar cálculo de EMA200
+        # Descarga de 60 días para asegurar datos de EMA200
         df = yf.Ticker(symbol).history(period="60d", interval="1h")
         if df is None or df.empty or len(df) < 200: return None
 
@@ -67,7 +68,7 @@ def evaluate_crypto(symbol):
         if last['Close'] > last['ema20'] and prev['Close'] <= prev['ema20']:
             score += 1.5; reasons.append("Cruce EMA20")
 
-        # Gestión de Riesgo
+        # Gestión de Riesgo (2.0x ATR para Stop Loss)
         atr = last['atr'] if last['atr'] > 0 else (last['Close'] * 0.02)
         stop = last['Close'] - (atr * 2.0)
         tp = last['Close'] + (atr * 4.0)
@@ -87,8 +88,10 @@ def main():
     
     any_alert = False
     for symbol in CRYPTO_SYMBOLS:
+        # Cooldown de 4 horas
         last_alert = state.get(symbol, 0)
-        if (now - last_alert) < 14400: # Cooldown 4h
+        if (now - last_alert) < 14400:
+            print(f"⏳ {symbol} en cooldown.")
             continue
         
         res = evaluate_crypto(symbol)
@@ -104,7 +107,7 @@ def main():
             any_alert = True
             print(f"✅ Alerta enviada: {res['symbol']}")
         
-        time.sleep(2)
+        time.sleep(2) # Evitar bloqueos de API
 
     if any_alert:
         save_state(state)

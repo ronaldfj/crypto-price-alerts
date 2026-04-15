@@ -7,12 +7,12 @@ import yfinance as yf
 import requests
 
 # ── Configuración de Activos (FILTRADO PARA BINANCE) ──────────────────────────
-# Solo activos con alta liquidez y tradeables en Binance
+# ── Lista Maestra de Binance (Formato compatible con Yahoo) ──────────────────
 CRYPTO_SYMBOLS = [
     'BTC-USD', 'ETH-USD', 'BNB-USD', 'SOL-USD', 'XRP-USD', 
-    'ADA-USD', 'AVAX-USD', 'DOT-USD', 'LINK-USD', 'MATIC-USD',
-    'LTC-USD', 'NEAR-USD', 'SUI-USD', 'FET-USD', 'RNDR-USD',
-    'TAO-USD', 'INJ-USD', 'STX-USD', 'PEPE-USD', 'SHIB-USD'
+    'ADA-USD', 'AVAX-USD', 'DOT-USD', 'LINK-USD', 'POL-USD',   # MATIC ahora es POL
+    'LTC-USD', 'NEAR-USD', 'SUI1-USD', 'FET-USD', 'RENDER-USD', # SUI1 y RENDER corregidos
+    'TAO1-USD', 'INJ-USD', 'STX1-USD', 'PEPE1-USD', 'SHIB-USD'  # Formatos específicos
 ]
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -46,10 +46,10 @@ def evaluate_crypto(symbol):
     ticker = yf.Ticker(symbol)
     
     try:
-        # En cripto usamos 1h para detectar movimientos más rápidos
-        df = ticker.history(period="60d", interval="1h")
+        # Reducimos a 30d para asegurar que encuentre datos frescos sin error
+        df = ticker.history(period="30d", interval="1h")
     except Exception as e:
-        print(f"❌ Error en {symbol}: {e}")
+        print(f"⚠️ Salto en {symbol}: {e}")
         return None
     
     if df is None or df.empty or len(df) < 100: 

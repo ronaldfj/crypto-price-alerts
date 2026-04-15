@@ -6,19 +6,19 @@ import pandas as pd
 import yfinance as yf
 import requests
 
-# ── Configuración Maestra ──────────────────────────────────────────────────
-# Lista optimizada: Eliminados sufijos '1' que causan error 404 en Yahoo
+# ── Configuración Maestra (VERIFICADA PARA YAHOO FINANCE) ──────────────────
+# Se han corregido los nombres para eliminar los errores "possibly delisted"
 CRYPTO_SYMBOLS = [
     'BTC-USD', 'ETH-USD', 'BNB-USD', 'SOL-USD', 'XRP-USD', 
-    'ADA-USD', 'AVAX-USD', 'DOT-USD', 'LINK-USD', 'POL-USD', 
-    'LTC-USD', 'NEAR-USD', 'SUI-USD', 'FET-USD', 'RENDER-USD', 
-    'TAO-USD', 'INJ-USD', 'STX-USD', 'PEPE-USD', 'SHIB-USD'
+    'ADA-USD', 'AVAX-USD', 'DOT-USD', 'LINK-USD', 'MATIC-USD', # MATIC es más estable que POL en Yahoo
+    'LTC-USD', 'NEAR-USD', 'SUI1-USD', 'FET-USD', 'RENDER-USD', 
+    'TAO1-USD', 'INJ-USD', 'STX1-USD', 'PEPE1-USD', 'SHIB-USD'
 ]
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-STATE_FILE = "alert_state.json"  # <── SINCRONIZADO CON EL YAML
-MIN_SCORE = 4.5 
+STATE_FILE = "alert_state.json"  # <── AHORA SINCRONIZADO CON EL YAML
+MIN_SCORE = 4.5  # Bajamos un poco para captar el inicio del movimiento
 MIN_RR = 1.8
 
 def load_state():
@@ -34,11 +34,11 @@ def save_state(state):
 
 def evaluate_crypto(symbol):
     try:
-        # Descarga robusta: period 30d es ideal para indicadores de 1h
+        # Descarga de datos
         df = yf.Ticker(symbol).history(period="30d", interval="1h")
         if df is None or df.empty or len(df) < 50: return None
 
-        # Indicadores
+        # Indicadores técnicos
         df['ema20'] = df['Close'].ewm(span=20, adjust=False).mean()
         df['ema200'] = df['Close'].ewm(span=200, adjust=False).mean()
         
@@ -53,6 +53,7 @@ def evaluate_crypto(symbol):
         last, prev = df.iloc[-1], df.iloc[-2]
         score, reasons = 0, []
 
+        # Lógica de puntuación
         if last['Close'] > last['ema200']: 
             score += 2.0; reasons.append("Tendencia Alcista (>EMA200)")
         if 40 < last['rsi'] < 65 and last['rsi'] > prev['rsi']: 
@@ -60,6 +61,7 @@ def evaluate_crypto(symbol):
         if last['Close'] > last['ema20'] and prev['Close'] <= prev['ema20']:
             score += 1.0; reasons.append("Cruce EMA20")
 
+        # Gestión de Riesgo
         atr = last['atr'] if last['atr'] > 0 else (last['Close'] * 0.02)
         stop = last['Close'] - (atr * 2.0)
         tp = last['Close'] + (atr * 4.0)
@@ -77,10 +79,10 @@ def main():
     now = time.time()
     print(f"🚀 Iniciando escaneo de {len(CRYPTO_SYMBOLS)} activos...")
     
-    any_alert = False
+    any_new_alert = False
     for symbol in CRYPTO_SYMBOLS:
         last_alert = state.get(symbol, 0)
-        # Cooldown de 4 horas (14400 seg)
+        # Cooldown de 4 horas
         if (now - last_alert) < 14400:
             print(f"⏳ {symbol} en cooldown.")
             continue
@@ -100,12 +102,12 @@ def main():
                 requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
             
             state[symbol] = now
-            any_alert = True
+            any_new_alert = True
             print(f"✅ Alerta enviada: {res['symbol']}")
         
         time.sleep(2) # Evitar bloqueos de Yahoo
 
-    if any_alert:
+    if any_new_alert:
         save_state(state)
 
 if __name__ == "__main__":

@@ -27,9 +27,9 @@ log = logging.getLogger("crypto-alert")
 # ── Configuración ─────────────────────────────────────────────────────────────
 CRYPTO_SYMBOLS = [
     'BTC-USD', 'ETH-USD', 'BNB-USD', 'SOL-USD', 'XRP-USD',
-    'ADA-USD', 'AVAX-USD', 'DOT-USD', 'LINK-USD', 'POL-USD',
-    'LTC-USD', 'NEAR-USD', 'SUI-USD', 'FET-USD', 'RENDER-USD',
-    'TAO-USD', 'INJ-USD', 'STX-USD', 'PEPE-USD', 'SHIB-USD'
+    'ADA-USD', 'AVAX-USD', 'DOT-USD', 'LINK-USD', 'MATIC-USD', # En Yahoo suele ser MATIC aún
+    'LTC-USD', 'NEAR-USD', 'SUI1-USD', 'FET-USD', 'RENDER-USD',
+    'TAO1-USD', 'INJ-USD', 'STX1-USD', 'PEPE1-USD', 'SHIB-USD'
 ]
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")

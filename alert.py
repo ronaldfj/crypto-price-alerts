@@ -20,7 +20,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CG_API_KEY = os.getenv("COINGECKO_API_KEY")
 STATE_FILE = "alert_state.json"
-MIN_SCORE = 3.0  # Ajustado para capturar las señales que vimos en tus logs
+MIN_SCORE = 3.5  # Filtro de calidad
 
 def send_telegram(msg):
     if not TELEGRAM_BOT_TOKEN: return
@@ -36,17 +36,11 @@ def load_state():
     except: return {}
 
 def get_data(cg_id):
-    # Endpoint OHLC: datos de 30 días para equilibrio entre velocidad y precisión
     url = f"https://api.coingecko.com/api/v3/coins/{cg_id}/ohlc?vs_currency=usd&days=30"
-    headers = {
-        "accept": "application/json",
-        "x-cg-demo-api-key": CG_API_KEY
-    }
+    headers = {"accept": "application/json", "x-cg-demo-api-key": CG_API_KEY}
     try:
         response = requests.get(url, headers=headers if CG_API_KEY else {"accept": "application/json"}, timeout=15)
-        if response.status_code != 200:
-            print(f"❌ Error API {cg_id}: {response.status_code}")
-            return None
+        if response.status_code != 200: return None
         return pd.DataFrame(response.json(), columns=['ts', 'Open', 'High', 'Low', 'Close'])
     except: return None
 
@@ -58,16 +52,13 @@ def evaluate(df, symbol):
         df['ema20'] = df['Close'].ewm(span=20, adjust=False).mean()
         df['ema50'] = df['Close'].ewm(span=50, adjust=False).mean()
         
-        # RSI para medir fuerza
         delta = df['Close'].diff()
         gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
         loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
         df['rsi'] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
-        
-        # ATR para Volatilidad (Stop/Target)
         df['atr'] = df['Close'].diff().abs().rolling(14).mean()
 
-        last, prev = df.iloc[-1], df.iloc[-2]
+        last = df.iloc[-1]
         score, reasons = 0, []
 
         # --- Lógica de Puntuación ---
@@ -80,17 +71,20 @@ def evaluate(df, symbol):
 
         # --- Gestión de Riesgo (TP/SL) ---
         atr_val = last['atr'] if last['atr'] > 0 else (last['Close'] * 0.02)
-        stop = last['Close'] - (atr_val * 2.0)
-        tp = last['Close'] + (atr_val * 4.4)
-        rr = (tp - last['Close']) / (last['Close'] - stop)
+        stop_price = last['Close'] - (atr_val * 2.0)
+        tp_price = last['Close'] + (atr_val * 4.4)
+        rr_ratio = (tp_price - last['Close']) / (last['Close'] - stop_price)
 
         print(f"🔍 {symbol} analizado: Score={score}")
 
+        # La clave 'stop' y 'tp' ahora coinciden con lo que pide el mensaje
         return {
             "alert": score >= MIN_SCORE,
             "price": last['Close'],
             "score": score,
-            "tp": tp, "sl": stop, "rr": rr,
+            "tp": tp_price, 
+            "stop": stop_price, 
+            "rr": rr_ratio,
             "reasons": reasons
         }
     except Exception as e:
@@ -105,7 +99,6 @@ def main():
     print(f"🚀 Iniciando escaneo de {len(CRYPTO_IDS)} activos...")
 
     for cg_id, symbol in CRYPTO_IDS.items():
-        # Cooldown de 4 horas para evitar spam
         if (now - state.get(symbol, 0)) < 14400:
             print(f"⏳ {symbol} en cooldown.")
             continue
@@ -125,12 +118,10 @@ def main():
                 state[symbol] = now
                 any_alert = True
         
-        time.sleep(1.5) # Respetar Rate Limit de CoinGecko
+        time.sleep(1.5)
 
     if any_alert:
-        try:
-            Path(STATE_FILE).write_text(json.dumps(state))
-        except: print("Error guardando el estado.")
+        Path(STATE_FILE).write_text(json.dumps(state))
     print("🏁 Fin del escaneo.")
 
 if __name__ == "__main__":

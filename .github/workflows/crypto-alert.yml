@@ -1,45 +1,35 @@
-name: Crypto Price Alert V2
+name: Crypto Alert Bot
 
 on:
   schedule:
-    - cron: "5 */4 * * *"
-  workflow_dispatch:
-
-permissions:
-  contents: write
+    - cron: '0 */4 * * *' # Cada 4 horas
+  workflow_dispatch: # Ejecución manual
 
 jobs:
   run-alert:
     runs-on: ubuntu-latest
+    # Forzamos el uso de Node24 para todas las acciones del runner
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
     steps:
-      - name: Descargar repositorio
-        uses: actions/checkout@v5
-        with:
-          persist-credentials: true
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-      - name: Instalar Python
-        uses: actions/setup-python@v6
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.10'
 
-      - name: Cache de dependencias pip
-        uses: actions/cache@v4
+      - name: Cache pip
+        uses: actions/cache@v4 # Esta versión ahora correrá sobre Node24 por el env
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
 
-      - name: Instalar dependencias
+      - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install yfinance pandas requests
-
-      - name: Asegurar archivo de estado
-        run: |
-          test -f alert_state.json || echo "{}" > alert_state.json
+          pip install pandas yfinance requests
 
       - name: Ejecutar script
         env:
@@ -48,10 +38,10 @@ jobs:
           COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
         run: python alert.py
 
-      - name: Guardar estado de alertas
+      - name: Commit and push state
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "GitHub Action"
+          git config --global user.email "action@github.com"
           git add alert_state.json
-          git diff --cached --quiet || git commit -m "Actualizar estado de alertas"
+          git commit -m "Update alert state [skip ci]" || exit 0
           git push

@@ -7,13 +7,17 @@ import requests
 
 # ── Configuración de Activos (IDs de CoinGecko) ──────────────────────────────
 CRYPTO_IDS = {
-    'bitcoin': 'BTC', 'ethereum': 'ETH', 'binancecoin': 'BNB', 
-    'solana': 'SOL', 'ripple': 'XRP', 'cardano': 'ADA', 
-    'avalanche-2': 'AVAX', 'polkadot': 'DOT', 'chainlink': 'LINK', 
-    'polygon-ecosystem-token': 'POL', 'litecoin': 'LTC', 'near': 'NEAR', 
-    'sui': 'SUI', 'fetch-ai': 'FET', 'render-token': 'RENDER', 
-    'bittensor': 'TAO', 'injective-protocol': 'INJ', 'blockstack': 'STX', 
-    'pepe': 'PEPE', 'shiba-inu': 'SHIB'
+    'bitcoin': 'BTC',
+    'ethereum': 'ETH',
+    'polkadot': 'DOT',
+    'the-open-network': 'TON',
+    'litecoin': 'LTC',
+    'ripple': 'XRP',
+    'tron': 'TRX',
+    'stellar': 'XLM',
+    'solana': 'SOL',
+    'chainlink': 'LINK',
+    'binancecoin': 'BNB'
 }
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")

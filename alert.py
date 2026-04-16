@@ -99,7 +99,7 @@ def main():
     print(f"🚀 Iniciando escaneo de {len(CRYPTO_IDS)} activos...")
 
     for cg_id, symbol in CRYPTO_IDS.items():
-        if (now - state.get(symbol, 0)) < 14400:
+        if (now - state.get(symbol, 0)) < 3600:
             print(f"⏳ {symbol} en cooldown.")
             continue
 

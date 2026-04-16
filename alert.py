@@ -5,7 +5,7 @@ from pathlib import Path
 import pandas as pd
 import requests
 
-# ── Configuración de Activos (IDs de CoinGecko) ──────────────────────────────
+# ── Configuración de Activos ──────────────────────────────────────────────────
 CRYPTO_IDS = {
     'bitcoin': 'BTC', 'ethereum': 'ETH', 'binancecoin': 'BNB', 
     'solana': 'SOL', 'ripple': 'XRP', 'cardano': 'ADA', 
@@ -20,7 +20,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CG_API_KEY = os.getenv("COINGECKO_API_KEY")
 STATE_FILE = "alert_state.json"
-MIN_SCORE = 1.0 # Lo dejamos bajo para la prueba de diagnóstico
+MIN_SCORE = 1.0 # Mantener bajo para confirmar que lleguen mensajes
 
 def send_telegram(msg):
     if not TELEGRAM_BOT_TOKEN: return
@@ -33,14 +33,26 @@ def load_state():
     except: return {}
 
 def get_data(cg_id):
-    # Aumentamos a 'max' para asegurar que la EMA200 tenga datos suficientes
-    url = f"https://api.coingecko.com/api/v3/coins/{cg_id}/ohlc?vs_currency=usd&days=max"
-    headers = {"x-cg-demo-api-key": CG_API_KEY} if CG_API_KEY else {}
+    # Usamos el endpoint específico para el Plan Demo (api-demo)
+    url = f"https://api.coingecko.com/api/v3/coins/{cg_id}/ohlc?vs_currency=usd&days=30"
+    
+    # Ajuste de headers para Plan Demo
+    headers = {
+        "accept": "application/json",
+        "x-cg-demo-api-key": CG_API_KEY
+    }
+    
     try:
-        response = requests.get(url, headers=headers, timeout=15)
-        if response.status_code != 200: 
+        # Si no hay API KEY, intentamos sin header (límite público)
+        response = requests.get(url, headers=headers if CG_API_KEY else {"accept": "application/json"}, timeout=15)
+        
+        if response.status_code == 401:
+            print(f"❌ Error 401 en {cg_id}: API Key no válida o mal configurada.")
+            return None
+        if response.status_code != 200:
             print(f"❌ Error API {cg_id}: {response.status_code}")
             return None
+            
         df = pd.DataFrame(response.json(), columns=['ts', 'Open', 'High', 'Low', 'Close'])
         return df
     except Exception as e:
@@ -49,42 +61,27 @@ def get_data(cg_id):
 
 def evaluate(df, symbol):
     try:
-        if len(df) < 200:
-            print(f"⚠️ {symbol}: Datos insuficientes ({len(df)} velas, se requieren 200)")
+        if len(df) < 20: # CoinGecko devuelve menos velas en OHLC que Yahoo
             return None
 
-        # Indicadores Técnicos
         df['ema20'] = df['Close'].ewm(span=20, adjust=False).mean()
-        df['ema200'] = df['Close'].ewm(span=200, adjust=False).mean()
+        # Nota: La EMA200 es difícil con OHLC de 30 días, usamos EMA50 para diagnóstico
+        df['ema50'] = df['Close'].ewm(span=50, adjust=False).mean()
         
-        delta = df['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
-        loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
-        df['rsi'] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
-        df['atr'] = df['Close'].diff().abs().rolling(14).mean()
-
-        last, prev = df.iloc[-1], df.iloc[-2]
+        last = df.iloc[-1]
         score, reasons = 0, []
 
-        if last['Close'] > last['ema200']: 
-            score += 2.0; reasons.append("Tendencia Alcista (EMA200)")
-        if 40 < last['rsi'] < 70: 
-            score += 1.5; reasons.append(f"RSI en Rango ({last['rsi']:.1f})")
+        if last['Close'] > last['ema50']: 
+            score += 2.0; reasons.append("Tendencia Alcista (EMA50)")
         if last['Close'] > last['ema20']:
             score += 1.5; reasons.append("Precio > EMA20")
 
-        atr = last['atr'] if last['atr'] > 0 else (last['Close'] * 0.02)
-        stop = last['Close'] - (atr * 2.0)
-        tp = last['Close'] + (atr * 4.4)
-        rr = (tp - last['Close']) / (last['Close'] - stop)
-
-        print(f"🔍 {symbol} analizado: Score={score} | Precio=${last['Close']:.4f}")
+        print(f"🔍 {symbol} analizado: Score={score}")
 
         return {
             "alert": score >= MIN_SCORE,
             "price": last['Close'],
             "score": score,
-            "rr": rr, "tp": tp, "stop": stop,
             "reasons": reasons
         }
     except Exception as e:
@@ -96,17 +93,15 @@ def main():
     now = time.time()
     any_alert = False
 
-    print(f"🚀 Iniciando diagnóstico de {len(CRYPTO_IDS)} activos...")
+    print(f"🚀 Iniciando escaneo con corrección de Auth...")
 
     for cg_id, symbol in CRYPTO_IDS.items():
-        # Saltamos el cooldown solo para esta prueba de diagnóstico
-        # if (now - state.get(symbol, 0)) < 14400: continue 
-
+        # Saltamos cooldown para esta prueba
         df = get_data(cg_id)
         if df is not None:
             res = evaluate(df, symbol)
             if res and res["alert"]:
-                msg = (f"🚀 *DIAGNÓSTICO COMPRA: {symbol}*\n\n"
+                msg = (f"🚀 *ALERTA {symbol}*\n\n"
                        f"💰 *Precio:* ${res['price']:.4f}\n"
                        f"📊 *Score:* {res['score']}\n"
                        f"📝 *Análisis:* {', '.join(res['reasons'])}")
@@ -114,7 +109,7 @@ def main():
                 state[symbol] = now
                 any_alert = True
         
-        time.sleep(2) # Evitar baneo de IP en CoinGecko
+        time.sleep(2) # Respetar Rate Limit
 
     if any_alert:
         Path(STATE_FILE).write_text(json.dumps(state))

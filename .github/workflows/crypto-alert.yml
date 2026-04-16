@@ -2,7 +2,7 @@ name: Crypto Alert Bot
 
 on:
   schedule:
-    - cron: '0 */4 * * *' # Ejecución cada 4 horas
+    - cron: '0 * * * *' # Ejecución cada 4 horas
   workflow_dispatch: # Permite ejecución manual desde la pestaña Actions
 
 jobs:

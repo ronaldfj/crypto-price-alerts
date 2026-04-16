@@ -21,7 +21,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CG_API_KEY = os.getenv("COINGECKO_API_KEY")
 STATE_FILE = "alert_state.json" # Sincronizado con .yml
-MIN_SCORE = 4.5
+MIN_SCORE = 1
 
 def send_telegram(msg):
     if not TELEGRAM_BOT_TOKEN: return

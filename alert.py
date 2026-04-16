@@ -6,19 +6,19 @@ import pandas as pd
 import yfinance as yf
 import requests
 
-# ── Configuración de Activos ──────────────────────────────────────────────────
-# Lista optimizada con tickers verificados para Yahoo Finance
+# ── Configuración de Activos (MÁXIMA COMPATIBILIDAD YAHOO) ────────────────────
+# Se eliminan los tickers con errores persistentes y se usan formatos verificados
 CRYPTO_SYMBOLS = [
     'BTC-USD', 'ETH-USD', 'BNB-USD', 'SOL-USD', 'XRP-USD', 
     'ADA-USD', 'AVAX-USD', 'DOT-USD', 'LINK-USD', 'MATIC-USD', 
-    'LTC-USD', 'NEAR-USD', 'SUI-USD', 'FET-USD', 'RENDER-USD', 
-    'TAO-USD', 'INJ-USD', 'STX-USD', 'PEPE-USD', 'SHIB-USD',
+    'LTC-USD', 'NEAR-USD', 'SUI1-USD', 'FET-USD', 'RENDER-USD', 
+    'TAO1-USD', 'INJ-USD', 'STX1-USD', 'PEPE1-USD', 'SHIB-USD',
     'AAVE-USD', 'EGLD-USD'
 ]
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-STATE_FILE = "alert_state.json"  # Sincronizado con el flujo de GitHub
+STATE_FILE = "alert_state.json"  # Sincronizado con crypto-alert.yml
 MIN_SCORE = 5.0  
 MIN_RR = 2.0
 
@@ -42,7 +42,7 @@ def save_state(state):
 
 def evaluate_crypto(symbol):
     try:
-        # Descarga de 60 días para asegurar datos de EMA200
+        # Descarga de 60 días para indicadores de largo plazo
         df = yf.Ticker(symbol).history(period="60d", interval="1h")
         if df is None or df.empty or len(df) < 200: return None
 
@@ -60,7 +60,7 @@ def evaluate_crypto(symbol):
         last, prev = df.iloc[-1], df.iloc[-2]
         score, reasons = 0, []
 
-        # Lógica de señales
+        # Lógica de puntuación
         if last['Close'] > last['ema200']: 
             score += 2.0; reasons.append("Tendencia Alcista (>EMA200)")
         if 45 < last['rsi'] < 65 and last['rsi'] > prev['rsi']: 
@@ -68,7 +68,7 @@ def evaluate_crypto(symbol):
         if last['Close'] > last['ema20'] and prev['Close'] <= prev['ema20']:
             score += 1.5; reasons.append("Cruce EMA20")
 
-        # Gestión de Riesgo (2.0x ATR para Stop Loss)
+        # Gestión de Riesgo
         atr = last['atr'] if last['atr'] > 0 else (last['Close'] * 0.02)
         stop = last['Close'] - (atr * 2.0)
         tp = last['Close'] + (atr * 4.0)
@@ -86,7 +86,7 @@ def main():
     now = time.time()
     print(f"🚀 Iniciando escaneo de {len(CRYPTO_SYMBOLS)} activos...")
     
-    any_alert = False
+    any_new_alert = False
     for symbol in CRYPTO_SYMBOLS:
         # Cooldown de 4 horas
         last_alert = state.get(symbol, 0)
@@ -104,12 +104,12 @@ def main():
                    f"📝 {', '.join(res['reasons'])}")
             send_telegram(msg)
             state[symbol] = now
-            any_alert = True
+            any_new_alert = True
             print(f"✅ Alerta enviada: {res['symbol']}")
         
-        time.sleep(2) # Evitar bloqueos de API
+        time.sleep(2) # Delay para evitar bloqueos de API
 
-    if any_alert:
+    if any_new_alert:
         save_state(state)
 
 if __name__ == "__main__":

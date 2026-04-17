@@ -1,44 +1,41 @@
-# ⚡ Crypto Sentinel Bot
+# Crypto Sentinel Bot
 
-![Python](https://img.shields.io/badge/python-3.9+-yellow.svg)
-![Market](https://img.shields.io/badge/market-crypto-orange.svg)
-![Status](https://img.shields.io/badge/status-active-brightgreen.svg)
+Bot de alertas de criptomonedas orientado a reducir ruido, evitar alertas duplicadas y mantener memoria operativa entre ejecuciones de GitHub Actions.
 
-Monitor inteligente de criptoactivos que utiliza **Análisis Técnico Institucional** para detectar oportunidades de entrada en tiempo real. Diseñado para operar en un mercado 24/7 sin interrupciones mediante GitHub Actions.
+## Qué hace esta versión
 
-## 🚀 Estrategia de Trading (Cripto)
-Debido a la volatilidad del mercado cripto, el bot utiliza filtros específicos para evitar "falsos breaks":
+- Usa **SQLite** para persistir el estado de setups enviados.
+- Construye un **setup_key** con símbolo, dirección, timeframe, régimen, bucket RSI, zona Fibonacci y bucket de precio.
+- Bloquea alertas similares durante **24 horas**.
+- Reenvía solo si hubo **invalidación** o **mejora material**.
+- Evalúa únicamente la **última vela cerrada**.
+- Migra automáticamente el cooldown antiguo desde `alert_state.json` en la primera ejecución.
 
-* **Filtro de Tendencia:** Solo opera si el precio está por encima de la **EMA 200** diaria.
-* **Confirmación de Momentum:** Utiliza **RSI** (45-65) y **ADX > 20** para asegurar que el movimiento tiene respaldo de volumen.
-* **Cruce de Medias:** Detecta el cruce de la **EMA 20** como señal de entrada rápida.
-* **Gestión de Riesgo:** Ratio R:R mínimo de 2.0 calculado dinámicamente con el **ATR** (Average True Range).
+## Secrets requeridos
 
-## 🛠️ Configuración del Sistema
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+- `COINGECKO_API_KEY` (opcional, pero recomendado)
 
-### Variables de Entorno (GitHub Secrets)
-Para que el bot funcione, debes configurar los siguientes **Secrets** en tu repositorio:
+## Variables opcionales
 
-| Secreto | Descripción |
-| :--- | :--- |
-| `TELEGRAM_BOT_TOKEN` | Token de API de tu bot de Telegram. |
-| `TELEGRAM_CHAT_ID` | ID del chat donde recibirás las alertas. |
+- `ALERT_DB_FILE` (default: `alerts_state.db`)
+- `LEGACY_STATE_FILE` (default: `alert_state.json`)
+- `COOLDOWN_HOURS` (default: `24`)
+- `MIN_SCORE` (default: `5.5`)
+- `MIN_RR` (default: `2.0`)
+- `OHLC_DAYS` (default: `90`)
 
-### 📦 Instalación Local
-```bash
-git clone [https://github.com/TU_USUARIO/TU_REPO_CRYPTO.git](https://github.com/TU_USUARIO/TU_REPO_CRYPTO.git)
-cd TU_REPO_CRYPTO
-pip install -r requirements.txt
-python alert.py
-```
-### 🤝 Contribuciones
-¡Las ideas para nuevos indicadores son bienvenidas! Para colaborar:
+## Flujo de persistencia
 
-Crea una rama (git checkout -b feature/NuevoIndicador).
+El workflow ejecuta `alert.py` y luego hace commit del archivo `alerts_state.db` de vuelta al repositorio. Eso permite que el bot conserve memoria entre corridas de GitHub Actions.
 
-Realiza tus cambios y asegúrate de que el archivo crypto_state.json esté en el .gitignore.
+## Archivos principales
 
-Envía un Pull Request.
+- `alert.py`: lógica principal
+- `.github/workflows/crypto_alerts.yml`: ejecución programada y persistencia
+- `alerts_state.db`: base SQLite generada automáticamente
 
-### ⚖️ Licencia
-Distribuido bajo la Licencia MIT. El uso de este software es para fines informativos; el trading de criptomonedas implica un alto riesgo financiero.
+## Nota sobre el archivo legacy
+
+Puedes dejar `alert_state.json` en el repo para que el bot migre el cooldown antiguo la primera vez. Después de verificar que todo funciona bien, lo puedes eliminar si ya no lo quieres conservar.

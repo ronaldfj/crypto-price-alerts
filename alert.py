@@ -10,7 +10,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import requests
 
-# ── Configuración ──────────────────────────────────────────────────────────────
 CRYPTO_IDS = {
     "bitcoin": "BTC",
     "ethereum": "ETH",
@@ -32,13 +31,15 @@ CG_API_KEY = os.getenv("COINGECKO_API_KEY", "")
 DB_FILE = os.getenv("ALERT_DB_FILE", "alerts_state.db")
 LEGACY_STATE_FILE = os.getenv("LEGACY_STATE_FILE", "alert_state.json")
 VS_CURRENCY = os.getenv("VS_CURRENCY", "usd")
-OHLC_DAYS = int(os.getenv("OHLC_DAYS", "90"))
+MARKET_CHART_DAYS = int(os.getenv("MARKET_CHART_DAYS", "90"))
+BASE_INTERVAL = os.getenv("BASE_INTERVAL", "hourly")
+TRADING_TIMEFRAME = os.getenv("TRADING_TIMEFRAME", "4h")
 COOLDOWN_HOURS = int(os.getenv("COOLDOWN_HOURS", "24"))
-MIN_SCORE = float(os.getenv("MIN_SCORE", "5.5"))
+MIN_SCORE = float(os.getenv("MIN_SCORE", "6.0"))
 MIN_RR = float(os.getenv("MIN_RR", "2.0"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
-SLEEP_BETWEEN_ASSETS = float(os.getenv("SLEEP_BETWEEN_ASSETS", "1.25"))
-FIB_LOOKBACK = int(os.getenv("FIB_LOOKBACK", "34"))
+SLEEP_BETWEEN_ASSETS = float(os.getenv("SLEEP_BETWEEN_ASSETS", "1.0"))
+FIB_LOOKBACK = int(os.getenv("FIB_LOOKBACK", "55"))
 
 SIDE_LONG = "LONG"
 ACTIVE = "ACTIVE"
@@ -61,12 +62,12 @@ def send_telegram(message: str) -> None:
     try:
         response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
         if response.status_code != 200:
-            print(f"⚠️ Telegram respondió {response.status_code}: {response.text[:250]}")
+            print(f"⚠️ Telegram respondió {response.status_code}: {response.text[:300]}")
     except Exception as exc:
         print(f"❌ Error enviando a Telegram: {exc}")
 
 
-# ── Persistencia ───────────────────────────────────────────────────────────────
+# ── Persistencia SQLite ────────────────────────────────────────────────────────
 def get_db_connection(db_file: str = DB_FILE) -> sqlite3.Connection:
     conn = sqlite3.connect(db_file)
     conn.row_factory = sqlite3.Row
@@ -166,15 +167,12 @@ def import_legacy_state_if_needed(conn: sqlite3.Connection) -> None:
         legacy_data = json.loads(legacy_path.read_text())
         imported = 0
         for symbol, raw_ts in legacy_data.items():
-            if not isinstance(symbol, str):
+            if not isinstance(symbol, str) or not isinstance(raw_ts, (int, float)):
                 continue
-            if not isinstance(raw_ts, (int, float)):
-                continue
-            ts = int(raw_ts)
             conn.execute(
                 "INSERT INTO legacy_symbol_cooldowns(symbol, sent_at) VALUES(?, ?) "
                 "ON CONFLICT(symbol) DO UPDATE SET sent_at = excluded.sent_at",
-                (symbol, ts),
+                (symbol, int(raw_ts)),
             )
             imported += 1
         conn.commit()
@@ -186,33 +184,56 @@ def import_legacy_state_if_needed(conn: sqlite3.Connection) -> None:
 
 
 # ── Datos de mercado ───────────────────────────────────────────────────────────
-def get_data(cg_id: str) -> Optional[pd.DataFrame]:
-    url = f"https://api.coingecko.com/api/v3/coins/{cg_id}/ohlc"
+def get_hourly_prices(cg_id: str) -> Optional[pd.DataFrame]:
+    url = f"https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart"
     headers = {"accept": "application/json"}
     if CG_API_KEY:
         headers["x-cg-demo-api-key"] = CG_API_KEY
 
-    params = {"vs_currency": VS_CURRENCY, "days": str(OHLC_DAYS)}
+    params = {
+        "vs_currency": VS_CURRENCY,
+        "days": str(MARKET_CHART_DAYS),
+        "interval": BASE_INTERVAL,
+        "precision": "full",
+    }
 
     try:
         response = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
         if response.status_code != 200:
-            print(f"⚠️ {cg_id}: CoinGecko respondió {response.status_code}")
+            print(f"⚠️ {cg_id}: CoinGecko respondió {response.status_code}: {response.text[:180]}")
             return None
 
         payload = response.json()
-        if not payload or len(payload) < 220:
-            print(f"⚠️ {cg_id}: datos insuficientes ({len(payload) if payload else 0} velas).")
+        prices = payload.get("prices", []) if isinstance(payload, dict) else []
+        if len(prices) < 500:
+            print(f"⚠️ {cg_id}: datos horarios insuficientes ({len(prices)} puntos).")
             return None
 
-        df = pd.DataFrame(payload, columns=["ts", "Open", "High", "Low", "Close"])
-        df[["Open", "High", "Low", "Close"]] = df[["Open", "High", "Low", "Close"]].astype(float)
+        df = pd.DataFrame(prices, columns=["ts", "price"])
+        df["price"] = pd.to_numeric(df["price"], errors="coerce")
         df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-        df = df.sort_values("ts").drop_duplicates(subset=["ts"]).reset_index(drop=True)
+        df = df.dropna().sort_values("ts").drop_duplicates(subset=["ts"]).reset_index(drop=True)
         return df
     except Exception as exc:
         print(f"❌ Error obteniendo datos para {cg_id}: {exc}")
         return None
+
+
+def build_ohlc_from_hourly(price_df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    if price_df is None or price_df.empty:
+        return None
+
+    df = price_df.copy().set_index("ts")
+    ohlc = df["price"].resample(TRADING_TIMEFRAME, label="right", closed="right").ohlc()
+    ohlc.columns = ["Open", "High", "Low", "Close"]
+    ohlc = ohlc.dropna().reset_index()
+
+    if len(ohlc) < 220:
+        print(f"⚠️ OHLC reconstruido insuficiente ({len(ohlc)} velas {TRADING_TIMEFRAME}).")
+        return None
+
+    # Solo velas cerradas: descarta la última vela del bucket actual.
+    return ohlc.iloc[:-1].reset_index(drop=True)
 
 
 # ── Indicadores ────────────────────────────────────────────────────────────────
@@ -260,145 +281,69 @@ def compute_adx(df: pd.DataFrame, period: int = 14) -> Tuple[pd.Series, pd.Serie
     return adx, plus_di, minus_di
 
 
-# ── Utilidades de setup ────────────────────────────────────────────────────────
-def infer_timeframe(df: pd.DataFrame) -> str:
-    if len(df) < 3:
-        return "unknown"
-    diffs = df["ts"].diff().dropna().dt.total_seconds()
-    median_secs = int(diffs.median())
-    if median_secs % 86400 == 0:
-        days = max(1, median_secs // 86400)
-        return f"{days}d"
-    if median_secs % 3600 == 0:
-        hours = max(1, median_secs // 3600)
-        return f"{hours}h"
-    if median_secs % 60 == 0:
-        minutes = max(1, median_secs // 60)
-        return f"{minutes}m"
-    return f"{median_secs}s"
+def fibonacci_context(df: pd.DataFrame, lookback: int = FIB_LOOKBACK) -> Dict[str, Any]:
+    recent = df.tail(lookback).copy()
+    swing_low = float(recent["Low"].min())
+    swing_high = float(recent["High"].max())
+    close = float(recent.iloc[-1]["Close"])
 
-
-def select_last_closed_index(df: pd.DataFrame) -> int:
-    if len(df) < 3:
-        return len(df) - 1
-
-    diffs = df["ts"].diff().dropna().dt.total_seconds()
-    interval_secs = float(diffs.median()) if not diffs.empty else 0.0
-    if interval_secs <= 0:
-        return len(df) - 2
-
-    last_open_ts = df.iloc[-1]["ts"].timestamp()
-    now_ts = time.time()
-    if now_ts < (last_open_ts + interval_secs):
-        return len(df) - 2
-    return len(df) - 1
-
-
-def get_regime(close: float, ema20: float, ema50: float, ema200: float) -> str:
-    if close > ema20 > ema50 > ema200:
-        return "BULL_STRONG"
-    if close > ema50 > ema200 and ema20 > ema50:
-        return "BULL_PULLBACK"
-    if close > ema200:
-        return "BULL_WEAK"
-    return "NON_BULL"
-
-
-def rsi_bucket(rsi: float) -> str:
-    low = int(max(0, min(95, math.floor(rsi / 5) * 5)))
-    high = low + 4
-    return f"{low}-{high}"
-
-
-def price_bucket(price: float, atr: float) -> str:
-    step = atr * 0.75 if atr > 0 else price * 0.01
-    if step <= 0:
-        step = max(price * 0.01, 0.0001)
-    bucket = int(round(price / step))
-    return f"P{bucket}"
-
-
-def determine_fib_context(df_closed: pd.DataFrame, idx: int, lookback: int = FIB_LOOKBACK) -> Dict[str, Any]:
-    start = max(0, idx - lookback + 1)
-    window = df_closed.iloc[start : idx + 1].copy()
-    if len(window) < max(14, lookback // 2):
-        return {
-            "fib_value": None,
-            "fib_zone": "OUTSIDE",
-            "swing_low": None,
-            "swing_high": None,
-            "range": None,
-            "zone_strength": 0,
-        }
-
-    low_idx = window["Low"].idxmin()
-    high_idx = window["High"].idxmax()
-    swing_low = float(window.loc[low_idx, "Low"])
-    swing_high = float(window.loc[high_idx, "High"])
-    current_close = float(df_closed.iloc[idx]["Close"])
-
-    if not math.isfinite(swing_low) or not math.isfinite(swing_high) or swing_high <= swing_low:
-        return {
-            "fib_value": None,
-            "fib_zone": "OUTSIDE",
-            "swing_low": None,
-            "swing_high": None,
-            "range": None,
-            "zone_strength": 0,
-        }
-
-    # Queremos una estructura alcista: primero el low y luego el high.
-    if low_idx >= high_idx:
-        return {
-            "fib_value": None,
-            "fib_zone": "OUTSIDE",
-            "swing_low": swing_low,
-            "swing_high": swing_high,
-            "range": swing_high - swing_low,
-            "zone_strength": 0,
-        }
-
-    fib_value = (swing_high - current_close) / (swing_high - swing_low)
-
-    if fib_value < 0.236:
-        fib_zone = "0.000-0.236"
-        strength = 1
-    elif fib_value < 0.382:
-        fib_zone = "0.236-0.382"
-        strength = 2
-    elif fib_value < 0.500:
-        fib_zone = "0.382-0.500"
-        strength = 3
-    elif fib_value < 0.618:
-        fib_zone = "0.500-0.618"
-        strength = 4
-    elif fib_value <= 0.786:
-        fib_zone = "0.618-0.786"
-        strength = 3
-    else:
-        fib_zone = "DEEP_OR_BROKEN"
-        strength = 0
+    amplitude = max(swing_high - swing_low, 1e-9)
+    retracement = (swing_high - close) / amplitude
+    retracement = max(0.0, min(1.0, retracement))
 
     return {
-        "fib_value": fib_value,
-        "fib_zone": fib_zone,
         "swing_low": swing_low,
         "swing_high": swing_high,
-        "range": swing_high - swing_low,
-        "zone_strength": strength,
+        "retracement": retracement,
+        "fib_382": swing_high - amplitude * 0.382,
+        "fib_500": swing_high - amplitude * 0.500,
+        "fib_618": swing_high - amplitude * 0.618,
+        "fib_786": swing_high - amplitude * 0.786,
     }
 
 
-def build_setup_key(signal: Dict[str, Any]) -> str:
+# ── Setup key / buckets ───────────────────────────────────────────────────────
+def get_regime(row: pd.Series) -> str:
+    ema20 = float(row["ema20"])
+    ema50 = float(row["ema50"])
+    ema200 = float(row["ema200"])
+    if ema20 > ema50 > ema200:
+        return "BULL_STACK"
+    if ema20 < ema50 < ema200:
+        return "BEAR_STACK"
+    return "MIXED"
+
+
+def rsi_bucket(rsi: float) -> str:
+    base = int(max(0, min(95, math.floor(rsi / 5) * 5)))
+    return f"{base:02d}-{base + 4:02d}"
+
+
+def fib_zone(retracement: float) -> str:
+    if 0.382 <= retracement < 0.500:
+        return "0.382-0.500"
+    if 0.500 <= retracement < 0.618:
+        return "0.500-0.618"
+    if 0.618 <= retracement <= 0.786:
+        return "0.618-0.786"
+    return "OUTSIDE"
+
+
+def price_bucket(price: float, atr: float) -> str:
+    step = max(atr * 0.75, price * 0.005, 1e-9)
+    return str(int(round(price / step)))
+
+
+def build_setup_key(candidate: Dict[str, Any]) -> str:
     return "|".join(
         [
-            signal["symbol"],
-            signal["side"],
-            signal["timeframe"],
-            signal["regime"],
-            signal["rsi_bucket"],
-            signal["fib_zone"],
-            signal["price_bucket"],
+            candidate["symbol"],
+            candidate["side"],
+            candidate["timeframe"],
+            candidate["regime"],
+            candidate["rsi_bucket"],
+            candidate["fib_zone"],
+            candidate["price_bucket"],
         ]
     )
 
@@ -407,375 +352,281 @@ def build_setup_hash(setup_key: str) -> str:
     return hashlib.sha256(setup_key.encode("utf-8")).hexdigest()
 
 
-def fib_zone_strength(zone: str) -> int:
-    mapping = {
-        "0.000-0.236": 1,
-        "0.236-0.382": 2,
-        "0.382-0.500": 3,
-        "0.500-0.618": 4,
-        "0.618-0.786": 3,
-        "DEEP_OR_BROKEN": 0,
-        "OUTSIDE": 0,
-    }
-    return mapping.get(zone, 0)
-
-
-def similarity_score(signal: Dict[str, Any], old: sqlite3.Row) -> float:
-    score = 0.0
-
-    if signal["regime"] == old["regime"]:
-        score += 0.30
-    if signal["rsi_bucket"] == old["rsi_bucket"]:
-        score += 0.15
-    if signal["fib_zone"] == old["fib_zone"]:
-        score += 0.15
-    if signal["price_bucket"] == old["price_bucket"]:
-        score += 0.20
-
-    price_tolerance = max(signal["atr"] * 0.75, signal["entry_price"] * 0.006)
-    if abs(signal["entry_price"] - old["entry_price"]) <= price_tolerance:
-        score += 0.10
-
-    adx_delta = abs(signal["adx"] - old["adx"])
-    if adx_delta <= 5:
-        score += 0.05
-
-    rr_delta = abs(signal["rr_ratio"] - old["rr_ratio"])
-    if rr_delta <= 0.35:
-        score += 0.05
-
-    return score
-
-
-def is_material_improvement(signal: Dict[str, Any], old: sqlite3.Row) -> bool:
-    checks = 0
-
-    if signal["score"] >= old["score"] + 1.0:
-        checks += 1
-    if signal["rr_ratio"] >= old["rr_ratio"] * 1.15:
-        checks += 1
-    if signal["adx"] >= old["adx"] + 4:
-        checks += 1
-    if fib_zone_strength(signal["fib_zone"]) > fib_zone_strength(old["fib_zone"]):
-        checks += 1
-
-    old_rsi_center = bucket_center(old["rsi_bucket"])
-    new_rsi_center = bucket_center(signal["rsi_bucket"])
-    if abs(new_rsi_center - 55) < abs(old_rsi_center - 55):
-        checks += 1
-
-    return checks >= 2
-
-
-def bucket_center(bucket: str) -> float:
-    try:
-        low_s, high_s = bucket.split("-")
-        return (float(low_s) + float(high_s)) / 2
-    except Exception:
-        return 50.0
-
-
-# ── Evaluación ─────────────────────────────────────────────────────────────────
+# ── Señal ──────────────────────────────────────────────────────────────────────
 def evaluate(df: pd.DataFrame, symbol: str, cg_id: str) -> Optional[Dict[str, Any]]:
-    try:
-        if len(df) < 220:
-            return None
-
-        df = df.copy()
-        df["ema20"] = df["Close"].ewm(span=20, adjust=False).mean()
-        df["ema50"] = df["Close"].ewm(span=50, adjust=False).mean()
-        df["ema200"] = df["Close"].ewm(span=200, adjust=False).mean()
-        df["rsi"] = compute_rsi(df["Close"], 14)
-        df["atr"] = compute_atr(df, 14)
-        df["adx"], df["plus_di"], df["minus_di"] = compute_adx(df, 14)
-
-        closed_idx = select_last_closed_index(df)
-        row = df.iloc[closed_idx]
-        timeframe = infer_timeframe(df)
-        fib = determine_fib_context(df, closed_idx, FIB_LOOKBACK)
-
-        close_price = float(row["Close"])
-        ema20 = float(row["ema20"])
-        ema50 = float(row["ema50"])
-        ema200 = float(row["ema200"])
-        rsi = float(row["rsi"])
-        atr = float(row["atr"])
-        adx = float(row["adx"])
-        plus_di = float(row["plus_di"])
-        minus_di = float(row["minus_di"])
-
-        if any(math.isnan(v) for v in [close_price, ema20, ema50, ema200, rsi, atr, adx, plus_di, minus_di]):
-            return None
-
-        regime = get_regime(close_price, ema20, ema50, ema200)
-        reasons: List[str] = []
-        score = 0.0
-
-        if close_price > ema200:
-            score += 1.5
-            reasons.append("Precio > EMA200")
-        if ema20 > ema50 > ema200:
-            score += 1.5
-            reasons.append("Estructura EMA20 > EMA50 > EMA200")
-        if close_price > ema20:
-            score += 1.0
-            reasons.append("Precio > EMA20")
-
-        ema20_prev = float(df.iloc[closed_idx - 1]["ema20"])
-        ema50_prev = float(df.iloc[closed_idx - 1]["ema50"])
-        if ema20 > ema20_prev and ema50 > ema50_prev:
-            score += 0.75
-            reasons.append("Pendiente positiva en EMA20/EMA50")
-
-        if 48 <= rsi <= 62:
-            score += 1.25
-            reasons.append(f"RSI balanceado ({rsi:.1f})")
-        elif 45 <= rsi < 48 or 62 < rsi <= 68:
-            score += 0.75
-            reasons.append(f"RSI aceptable ({rsi:.1f})")
-
-        if adx >= 20:
-            score += 1.0
-            reasons.append(f"ADX con fuerza ({adx:.1f})")
-        elif adx >= 17:
-            score += 0.5
-            reasons.append(f"ADX moderado ({adx:.1f})")
-
-        if plus_di > minus_di:
-            score += 0.5
-            reasons.append("Dominancia alcista (+DI > -DI)")
-
-        if fib["fib_zone"] in {"0.382-0.500", "0.500-0.618"}:
-            score += 1.0
-            reasons.append(f"Retroceso Fibonacci sano ({fib['fib_zone']})")
-        elif fib["fib_zone"] in {"0.236-0.382", "0.618-0.786"}:
-            score += 0.5
-            reasons.append(f"Fibonacci utilizable ({fib['fib_zone']})")
-
-        swing_low = fib["swing_low"] if fib["swing_low"] is not None else float(df.iloc[max(0, closed_idx - 20): closed_idx + 1]["Low"].min())
-        swing_high = fib["swing_high"] if fib["swing_high"] is not None else float(df.iloc[max(0, closed_idx - 20): closed_idx + 1]["High"].max())
-        swing_range = max((fib["range"] or 0.0), atr * 3)
-
-        stop_loss = min(close_price - (1.8 * atr), swing_low - (0.25 * atr))
-        if stop_loss >= close_price:
-            stop_loss = close_price - (1.8 * atr)
-        risk = close_price - stop_loss
-        if risk <= 0:
-            return None
-
-        extension_target = swing_high + (0.272 * swing_range)
-        rr_floor_target = close_price + (risk * 2.0)
-        take_profit = max(extension_target, rr_floor_target)
-        rr_ratio = (take_profit - close_price) / risk
-
-        if rr_ratio >= MIN_RR:
-            score += 0.5
-            reasons.append(f"R:R suficiente ({rr_ratio:.2f})")
-
-        side = SIDE_LONG
-        signal = {
-            "symbol": symbol,
-            "cg_id": cg_id,
-            "side": side,
-            "timeframe": timeframe,
-            "candle_ts": int(row["ts"].timestamp()),
-            "entry_price": close_price,
-            "price": close_price,
-            "stop_loss": stop_loss,
-            "take_profit": take_profit,
-            "rr_ratio": rr_ratio,
-            "score": round(score, 2),
-            "reasons": reasons,
-            "regime": regime,
-            "rsi": rsi,
-            "rsi_bucket": rsi_bucket(rsi),
-            "fib_value": fib["fib_value"],
-            "fib_zone": fib["fib_zone"],
-            "price_bucket": price_bucket(close_price, atr),
-            "atr": atr,
-            "adx": adx,
-            "ema20": ema20,
-            "ema50": ema50,
-            "ema200": ema200,
-            "plus_di": plus_di,
-            "minus_di": minus_di,
-            "swing_low": swing_low,
-            "swing_high": swing_high,
-        }
-        signal["setup_key"] = build_setup_key(signal)
-        signal["setup_hash"] = build_setup_hash(signal["setup_key"])
-
-        signal["alert"] = (
-            regime in {"BULL_STRONG", "BULL_PULLBACK"}
-            and rr_ratio >= MIN_RR
-            and score >= MIN_SCORE
-            and fib["fib_zone"] != "DEEP_OR_BROKEN"
-        )
-
-        print(
-            f"🔍 {symbol} [{timeframe}] | score={signal['score']:.2f} | "
-            f"rr={signal['rr_ratio']:.2f} | regime={regime} | fib={signal['fib_zone']}"
-        )
-        return signal
-    except Exception as exc:
-        print(f"❌ Error evaluando {symbol}: {exc}")
+    if df is None or len(df) < 220:
+        print(f"⚠️ {cg_id}: velas insuficientes tras reconstrucción ({0 if df is None else len(df)}).")
         return None
 
+    work = df.copy()
+    work["ema20"] = work["Close"].ewm(span=20, adjust=False).mean()
+    work["ema50"] = work["Close"].ewm(span=50, adjust=False).mean()
+    work["ema200"] = work["Close"].ewm(span=200, adjust=False).mean()
+    work["rsi"] = compute_rsi(work["Close"], 14)
+    work["atr"] = compute_atr(work, 14)
+    work["adx"], work["plus_di"], work["minus_di"] = compute_adx(work, 14)
+    work = work.dropna().reset_index(drop=True)
 
-# ── Lógica de deduplicación e invalidación ─────────────────────────────────────
-def get_recent_active_alerts(
-    conn: sqlite3.Connection,
-    symbol: str,
-    side: str,
-    timeframe: str,
-    cutoff_ts: int,
-) -> List[sqlite3.Row]:
-    return conn.execute(
+    if len(work) < 210:
+        print(f"⚠️ {symbol}: historial útil insuficiente tras indicadores ({len(work)} velas).")
+        return None
+
+    last = work.iloc[-1]
+    prev = work.iloc[-2]
+    fib = fibonacci_context(work, FIB_LOOKBACK)
+
+    close = float(last["Close"])
+    atr = float(last["atr"])
+    adx = float(last["adx"])
+    rsi = float(last["rsi"])
+    plus_di = float(last["plus_di"])
+    minus_di = float(last["minus_di"])
+    ema20 = float(last["ema20"])
+    ema50 = float(last["ema50"])
+    ema200 = float(last["ema200"])
+
+    if not all(math.isfinite(x) for x in [close, atr, adx, rsi, plus_di, minus_di, ema20, ema50, ema200]):
+        return None
+
+    score = 0.0
+    reasons: List[str] = []
+
+    regime = get_regime(last)
+    bullish_cross = float(prev["ema20"]) <= float(prev["ema50"]) and ema20 > ema50
+
+    if regime == "BULL_STACK":
+        score += 2.5
+        reasons.append("Régimen alcista EMA20>EMA50>EMA200")
+    if close > ema20:
+        score += 1.0
+        reasons.append("Precio sobre EMA20")
+    if close > ema50:
+        score += 1.0
+        reasons.append("Precio sobre EMA50")
+    if close > ema200:
+        score += 1.0
+        reasons.append("Precio sobre EMA200")
+    if bullish_cross:
+        score += 0.75
+        reasons.append("Cruce EMA20/EMA50 confirmado")
+    if 48 <= rsi <= 64:
+        score += 1.0
+        reasons.append(f"RSI sano ({rsi:.1f})")
+    elif 45 <= rsi <= 68:
+        score += 0.5
+        reasons.append(f"RSI aceptable ({rsi:.1f})")
+    if adx >= 22 and plus_di > minus_di:
+        score += 1.25
+        reasons.append(f"ADX con dirección ({adx:.1f})")
+    elif adx >= 18 and plus_di > minus_di:
+        score += 0.75
+        reasons.append(f"ADX emergente ({adx:.1f})")
+
+    zone = fib_zone(fib["retracement"])
+    if zone == "0.382-0.500":
+        score += 0.5
+        reasons.append("Retroceso Fib 0.382-0.500")
+    elif zone == "0.500-0.618":
+        score += 1.0
+        reasons.append("Retroceso Fib 0.500-0.618")
+    elif zone == "0.618-0.786":
+        score += 0.75
+        reasons.append("Retroceso Fib 0.618-0.786")
+
+    stop_loss = max(fib["swing_low"], close - (atr * 1.8))
+    if stop_loss >= close:
+        stop_loss = close - max(atr * 1.5, close * 0.01)
+    take_profit = close + max((close - stop_loss) * 2.4, atr * 2.8)
+    rr_ratio = (take_profit - close) / max(close - stop_loss, 1e-9)
+
+    valid = (
+        regime == "BULL_STACK"
+        and close > ema200
+        and plus_di > minus_di
+        and adx >= 18
+        and rr_ratio >= MIN_RR
+        and score >= MIN_SCORE
+        and zone != "OUTSIDE"
+    )
+
+    candidate = {
+        "symbol": symbol,
+        "cg_id": cg_id,
+        "side": SIDE_LONG,
+        "timeframe": TRADING_TIMEFRAME,
+        "regime": regime,
+        "rsi_bucket": rsi_bucket(rsi),
+        "fib_zone": zone,
+        "price_bucket": price_bucket(close, atr),
+        "candle_ts": int(pd.Timestamp(last["ts"]).timestamp()),
+        "entry_price": close,
+        "stop_loss": float(stop_loss),
+        "take_profit": float(take_profit),
+        "rr_ratio": float(rr_ratio),
+        "score": round(score, 2),
+        "adx": round(adx, 2),
+        "rsi": round(rsi, 2),
+        "atr": float(atr),
+        "reasons": reasons,
+        "bullish_cross": bullish_cross,
+        "fib_retracement": round(float(fib["retracement"]), 4),
+        "swing_low": float(fib["swing_low"]),
+        "swing_high": float(fib["swing_high"]),
+        "alert": valid,
+    }
+    candidate["setup_key"] = build_setup_key(candidate)
+    candidate["setup_hash"] = build_setup_hash(candidate["setup_key"])
+
+    print(
+        f"🔍 {symbol}: score={candidate['score']}, rr={candidate['rr_ratio']:.2f}, "
+        f"regime={candidate['regime']}, fib={candidate['fib_zone']}, alert={candidate['alert']}"
+    )
+    return candidate
+
+
+# ── Invalidación / deduplicación ───────────────────────────────────────────────
+def invalidate_old_alerts(conn: sqlite3.Connection, candidate: Dict[str, Any]) -> None:
+    rows = conn.execute(
         """
         SELECT *
         FROM alerts
         WHERE symbol = ?
           AND side = ?
           AND timeframe = ?
-          AND status = ?
-          AND sent_at >= ?
+          AND status = 'ACTIVE'
         ORDER BY sent_at DESC
         """,
-        (symbol, side, timeframe, ACTIVE, cutoff_ts),
+        (candidate["symbol"], candidate["side"], candidate["timeframe"]),
     ).fetchall()
 
-
-def get_latest_active_alert(
-    conn: sqlite3.Connection,
-    symbol: str,
-    side: str,
-    timeframe: str,
-) -> Optional[sqlite3.Row]:
-    return conn.execute(
-        """
-        SELECT *
-        FROM alerts
-        WHERE symbol = ?
-          AND side = ?
-          AND timeframe = ?
-          AND status = ?
-        ORDER BY sent_at DESC
-        LIMIT 1
-        """,
-        (symbol, side, timeframe, ACTIVE),
-    ).fetchone()
-
-
-def should_invalidate(signal: Dict[str, Any], active_alert: sqlite3.Row) -> Tuple[bool, str]:
-    if signal["entry_price"] <= active_alert["stop_loss"]:
-        return True, "Precio cerró por debajo del stop técnico"
-    if signal["ema20"] <= signal["ema50"]:
-        return True, "EMA20 perdió la ventaja sobre EMA50"
-    if signal["entry_price"] <= signal["ema50"]:
-        return True, "Precio cerró por debajo de EMA50"
-    if signal["rsi"] < 42:
-        return True, "RSI cayó por debajo del umbral de continuidad"
-    if signal["fib_zone"] == "DEEP_OR_BROKEN":
-        return True, "Retroceso Fibonacci demasiado profundo"
-    return False, ""
-
-
-def invalidate_alert(conn: sqlite3.Connection, alert_id: int, reason: str) -> None:
     now_ts = int(time.time())
-    conn.execute(
-        """
-        UPDATE alerts
-        SET status = ?, invalidated_at = ?, invalidation_reason = ?
-        WHERE id = ? AND status = ?
-        """,
-        (INVALIDATED, now_ts, reason, alert_id, ACTIVE),
-    )
+    for row in rows:
+        reason = None
+        if candidate["regime"] != "BULL_STACK":
+            reason = "Regimen perdido"
+        elif candidate["entry_price"] <= float(row["stop_loss"]):
+            reason = "Stop tecnico vulnerado"
+        elif candidate["rsi"] < 40:
+            reason = "RSI debilitado"
+        elif candidate["entry_price"] < float(row["entry_price"]) - max(candidate["atr"], candidate["entry_price"] * 0.01):
+            reason = "Precio deteriorado"
+
+        if reason:
+            conn.execute(
+                """
+                UPDATE alerts
+                SET status = ?, invalidated_at = ?, invalidation_reason = ?
+                WHERE id = ?
+                """,
+                (INVALIDATED, now_ts, reason, row["id"]),
+            )
     conn.commit()
 
 
-def check_legacy_cooldown(conn: sqlite3.Connection, symbol: str, cutoff_ts: int) -> bool:
+def is_material_improvement(candidate: Dict[str, Any], row: sqlite3.Row) -> bool:
+    score_better = candidate["score"] >= float(row["score"]) + 1.0
+    rr_better = candidate["rr_ratio"] >= float(row["rr_ratio"]) + 0.20
+    fib_better = candidate["fib_zone"] in {"0.500-0.618", "0.618-0.786"} and row["fib_zone"] == "0.382-0.500"
+    fresh_cross = candidate.get("bullish_cross", False)
+    return score_better or rr_better or fib_better or fresh_cross
+
+
+def is_similar_setup(candidate: Dict[str, Any], row: sqlite3.Row) -> bool:
+    if row["setup_hash"] == candidate["setup_hash"]:
+        return True
+
+    score = 0.0
+    if row["regime"] == candidate["regime"]:
+        score += 0.35
+    if row["rsi_bucket"] == candidate["rsi_bucket"]:
+        score += 0.15
+    if row["fib_zone"] == candidate["fib_zone"]:
+        score += 0.20
+    if row["price_bucket"] == candidate["price_bucket"]:
+        score += 0.20
+
+    price_close = abs(float(row["entry_price"]) - candidate["entry_price"]) <= max(candidate["atr"] * 0.8, candidate["entry_price"] * 0.006)
+    if price_close:
+        score += 0.10
+
+    return score >= 0.75
+
+
+def blocked_by_legacy_cooldown(conn: sqlite3.Connection, symbol: str, now_ts: int) -> bool:
     row = conn.execute(
         "SELECT sent_at FROM legacy_symbol_cooldowns WHERE symbol = ?",
         (symbol,),
     ).fetchone()
-    return bool(row and row["sent_at"] >= cutoff_ts)
+    if not row:
+        return False
+    return (now_ts - int(row["sent_at"])) < COOLDOWN_HOURS * 3600
 
 
-def should_send_alert(conn: sqlite3.Connection, signal: Dict[str, Any]) -> Tuple[bool, Optional[int], str]:
+def should_send_alert(conn: sqlite3.Connection, candidate: Dict[str, Any]) -> Tuple[bool, Optional[int], str]:
     now_ts = int(time.time())
-    cutoff_ts = now_ts - (COOLDOWN_HOURS * 3600)
+    cutoff = now_ts - (COOLDOWN_HOURS * 3600)
 
-    if check_legacy_cooldown(conn, signal["symbol"], cutoff_ts):
-        return False, None, "Cooldown heredado desde alert_state.json"
+    if blocked_by_legacy_cooldown(conn, candidate["symbol"], now_ts):
+        return False, None, "Cooldown heredado aún vigente"
 
-    active_alerts = get_recent_active_alerts(
-        conn,
-        signal["symbol"],
-        signal["side"],
-        signal["timeframe"],
-        cutoff_ts,
-    )
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM alerts
+        WHERE symbol = ?
+          AND side = ?
+          AND timeframe = ?
+          AND sent_at >= ?
+          AND status = 'ACTIVE'
+        ORDER BY sent_at DESC
+        """,
+        (candidate["symbol"], candidate["side"], candidate["timeframe"], cutoff),
+    ).fetchall()
 
-    if not active_alerts:
-        return True, None, "No hay setup activo similar en las últimas 24h"
+    if not rows:
+        return True, None, "Sin alerta similar activa"
 
-    for old in active_alerts:
-        if old["setup_hash"] == signal["setup_hash"]:
-            if is_material_improvement(signal, old):
-                return True, old["id"], "Misma idea, pero con mejora material"
-            return False, old["id"], "Setup idéntico dentro de la ventana de 24h"
+    for row in rows:
+        if is_similar_setup(candidate, row):
+            if is_material_improvement(candidate, row):
+                return True, int(row["id"]), "Mejora material sobre alerta activa"
+            return False, int(row["id"]), "Setup similar dentro de 24h"
 
-        similarity = similarity_score(signal, old)
-        if similarity >= 0.80:
-            if is_material_improvement(signal, old):
-                return True, old["id"], f"Setup similar ({similarity:.2f}) con mejora material"
-            return False, old["id"], f"Setup similar ({similarity:.2f}) dentro de la ventana de 24h"
-
-    return True, None, "El setup es suficientemente distinto"
-
-
-def expire_old_active_alerts(conn: sqlite3.Connection) -> None:
-    cutoff_ts = int(time.time()) - (COOLDOWN_HOURS * 3600)
-    conn.execute(
-        "UPDATE alerts SET status = ? WHERE status = ? AND sent_at < ?",
-        (EXPIRED, ACTIVE, cutoff_ts),
-    )
-    conn.commit()
+    return True, None, "No hay setup comparable en 24h"
 
 
-# ── Registro ───────────────────────────────────────────────────────────────────
-def save_alert(conn: sqlite3.Connection, signal: Dict[str, Any], improved_from_alert_id: Optional[int]) -> None:
+def save_alert(conn: sqlite3.Connection, candidate: Dict[str, Any], improved_from_alert_id: Optional[int]) -> None:
     now_ts = int(time.time())
     conn.execute(
         """
         INSERT INTO alerts (
-            symbol, cg_id, side, timeframe, setup_key, setup_hash, regime,
-            rsi_bucket, fib_zone, price_bucket, candle_ts, entry_price,
-            stop_loss, take_profit, rr_ratio, score, adx, rsi, atr,
-            reasons_json, status, sent_at, improved_from_alert_id
+            symbol, cg_id, side, timeframe, setup_key, setup_hash, regime, rsi_bucket,
+            fib_zone, price_bucket, candle_ts, entry_price, stop_loss, take_profit,
+            rr_ratio, score, adx, rsi, atr, reasons_json, status, sent_at,
+            improved_from_alert_id
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            signal["symbol"],
-            signal["cg_id"],
-            signal["side"],
-            signal["timeframe"],
-            signal["setup_key"],
-            signal["setup_hash"],
-            signal["regime"],
-            signal["rsi_bucket"],
-            signal["fib_zone"],
-            signal["price_bucket"],
-            signal["candle_ts"],
-            signal["entry_price"],
-            signal["stop_loss"],
-            signal["take_profit"],
-            signal["rr_ratio"],
-            signal["score"],
-            signal["adx"],
-            signal["rsi"],
-            signal["atr"],
-            json.dumps(signal["reasons"], ensure_ascii=False),
+            candidate["symbol"],
+            candidate["cg_id"],
+            candidate["side"],
+            candidate["timeframe"],
+            candidate["setup_key"],
+            candidate["setup_hash"],
+            candidate["regime"],
+            candidate["rsi_bucket"],
+            candidate["fib_zone"],
+            candidate["price_bucket"],
+            candidate["candle_ts"],
+            candidate["entry_price"],
+            candidate["stop_loss"],
+            candidate["take_profit"],
+            candidate["rr_ratio"],
+            candidate["score"],
+            candidate["adx"],
+            candidate["rsi"],
+            candidate["atr"],
+            json.dumps(candidate["reasons"], ensure_ascii=False),
             ACTIVE,
             now_ts,
             improved_from_alert_id,
@@ -784,83 +635,63 @@ def save_alert(conn: sqlite3.Connection, signal: Dict[str, Any], improved_from_a
     conn.commit()
 
 
-# ── Mensaje ────────────────────────────────────────────────────────────────────
-def format_message(signal: Dict[str, Any], decision_reason: str) -> str:
-    fib_label = signal["fib_zone"]
-    rsi_label = f"{signal['rsi']:.1f}"
+def format_message(candidate: Dict[str, Any], decision_reason: str) -> str:
+    reasons_text = ", ".join(candidate["reasons"])
     return (
-        f"🚀 *ALERTA COMPRA: {signal['symbol']}*\n\n"
-        f"⏱️ *Timeframe:* {signal['timeframe']}\n"
-        f"💰 *Precio:* ${signal['entry_price']:.4f}\n"
-        f"📊 *Score:* {signal['score']:.2f}\n"
-        f"⚖️ *R:R:* {signal['rr_ratio']:.2f}\n"
-        f"📐 *Fibonacci:* {fib_label}\n"
-        f"📈 *RSI:* {rsi_label}\n"
-        f"🔥 *ADX:* {signal['adx']:.1f}\n"
-        f"🎯 *TARGET (TP):* ${signal['take_profit']:.4f}\n"
-        f"🛑 *STOP (SL):* ${signal['stop_loss']:.4f}\n\n"
-        f"🧠 *Setup:* {signal['setup_key']}\n"
-        f"📝 *Motivo de envío:* {decision_reason}\n"
-        f"🔎 *Confluencias:* {', '.join(signal['reasons'])}"
+        f"🚀 *ALERTA COMPRA: {candidate['symbol']}*\n\n"
+        f"⏱️ *Timeframe:* {candidate['timeframe']}\n"
+        f"💰 *Precio:* ${candidate['entry_price']:.4f}\n"
+        f"📊 *Score:* {candidate['score']:.2f}\n"
+        f"📈 *ADX:* {candidate['adx']:.2f}\n"
+        f"📉 *RSI:* {candidate['rsi']:.2f}\n"
+        f"🧭 *Régimen:* {candidate['regime']}\n"
+        f"🧩 *Fib:* {candidate['fib_zone']}\n"
+        f"⚖️ *R:R:* {candidate['rr_ratio']:.2f}\n"
+        f"🎯 *TARGET (TP):* ${candidate['take_profit']:.4f}\n"
+        f"🛑 *STOP (SL):* ${candidate['stop_loss']:.4f}\n\n"
+        f"📝 *Análisis:* {reasons_text}\n"
+        f"🧠 *Motivo de envío:* {decision_reason}"
     )
 
 
-# ── Flujo principal ────────────────────────────────────────────────────────────
-def process_symbol(conn: sqlite3.Connection, cg_id: str, symbol: str) -> bool:
-    df = get_data(cg_id)
-    if df is None:
-        return False
-
-    signal = evaluate(df, symbol, cg_id)
-    if signal is None:
-        return False
-
-    latest_active = get_latest_active_alert(conn, symbol, SIDE_LONG, signal["timeframe"])
-    if latest_active:
-        invalidate, reason = should_invalidate(signal, latest_active)
-        if invalidate:
-            invalidate_alert(conn, latest_active["id"], reason)
-            print(f"🧹 {symbol}: setup previo invalidado -> {reason}")
-
-    if not signal["alert"]:
-        print(f"ℹ️ {symbol}: setup no califica para alerta.")
-        return False
-
-    should_send, improved_from_alert_id, decision_reason = should_send_alert(conn, signal)
-    if not should_send:
-        print(f"⏳ {symbol}: alerta suprimida -> {decision_reason}")
-        return False
-
-    message = format_message(signal, decision_reason)
-    send_telegram(message)
-    save_alert(conn, signal, improved_from_alert_id)
-    print(f"✅ {symbol}: alerta enviada.")
-    return True
-
-
+# ── Main ───────────────────────────────────────────────────────────────────────
 def main() -> None:
-    start_ts = time.time()
-    conn = get_db_connection()
-    try:
-        init_db(conn)
-        import_legacy_state_if_needed(conn)
-        expire_old_active_alerts(conn)
+    start = time.time()
+    conn = get_db_connection(DB_FILE)
+    init_db(conn)
+    import_legacy_state_if_needed(conn)
 
-        print(f"🚀 Iniciando escaneo de {len(CRYPTO_IDS)} activos...")
-        total_alerts = 0
+    print(f"🚀 Iniciando escaneo de {len(CRYPTO_IDS)} activos...")
+    sent_count = 0
 
-        for cg_id, symbol in CRYPTO_IDS.items():
-            try:
-                if process_symbol(conn, cg_id, symbol):
-                    total_alerts += 1
-            except Exception as exc:
-                print(f"❌ Error procesando {symbol}: {exc}")
+    for cg_id, symbol in CRYPTO_IDS.items():
+        price_df = get_hourly_prices(cg_id)
+        ohlc_df = build_ohlc_from_hourly(price_df) if price_df is not None else None
+        if ohlc_df is None:
             time.sleep(SLEEP_BETWEEN_ASSETS)
+            continue
 
-        elapsed = time.time() - start_ts
-        print(f"🏁 Fin del escaneo. Alertas enviadas: {total_alerts}. Duración: {elapsed:.1f}s")
-    finally:
-        conn.close()
+        candidate = evaluate(ohlc_df, symbol, cg_id)
+        if not candidate or not candidate["alert"]:
+            if candidate:
+                invalidate_old_alerts(conn, candidate)
+            time.sleep(SLEEP_BETWEEN_ASSETS)
+            continue
+
+        invalidate_old_alerts(conn, candidate)
+        should_send, improved_from_alert_id, decision_reason = should_send_alert(conn, candidate)
+        if should_send:
+            send_telegram(format_message(candidate, decision_reason))
+            save_alert(conn, candidate, improved_from_alert_id)
+            sent_count += 1
+        else:
+            print(f"⏳ {symbol}: omitida. {decision_reason}.")
+
+        time.sleep(SLEEP_BETWEEN_ASSETS)
+
+    duration = round(time.time() - start, 1)
+    print(f"🏁 Fin del escaneo. Alertas enviadas: {sent_count}. Duración: {duration}s")
+    conn.close()
 
 
 if __name__ == "__main__":

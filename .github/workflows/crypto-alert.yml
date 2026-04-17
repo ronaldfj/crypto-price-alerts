@@ -2,34 +2,41 @@ name: Crypto Alert Bot
 
 on:
   schedule:
-    - cron: '0 * * * *' # Ejecución cada 4 horas
-  workflow_dispatch: # Permite ejecución manual desde la pestaña Actions
+    - cron: '0 * * * *'   # cada hora
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   run-alert:
     runs-on: ubuntu-latest
-    # Fuerza el uso de Node 24 para eliminar advertencias de depreciación
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4.2.2 # Versión actualizada con soporte nativo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
-        uses: actions/setup-python@v5.3.0 # Versión optimizada para Node 24
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
       - name: Cache pip
-        uses: actions/cache@v4.2.0 # Elimina el aviso de depreciación en los logs
+        uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
       - name: Install dependencies
         run: |
-          pip install pandas yfinance requests
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Ejecutar script
         env:
@@ -38,10 +45,15 @@ jobs:
           COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
         run: python alert.py
 
-      - name: Commit and push state
+      - name: Commit and push SQLite state
         run: |
           git config --global user.name "GitHub Action"
           git config --global user.email "action@github.com"
-          git add alert_state.json
-          git commit -m "Update alert state [skip ci]" || exit 0
+
+          git add alerts_state.db
+
+          git diff --cached --quiet && echo "Sin cambios en SQLite" && exit 0
+
+          git commit -m "Update alerts SQLite state [skip ci]"
+          git pull --rebase origin main
           git push

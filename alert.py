@@ -25,6 +25,20 @@ CRYPTO_IDS = {
     "binancecoin": "BNB",
 }
 
+ASSET_GROUPS = {
+    "BTC": "Majors",
+    "ETH": "Majors",
+    "TON": "Layer1",
+    "SOL": "Layer1",
+    "DOT": "Layer1",
+    "BNB": "Exchange",
+    "LINK": "Infra",
+    "TRX": "Payments",
+    "XRP": "Payments",
+    "XLM": "Payments",
+    "LTC": "Legacy",
+}
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 CG_API_KEY = os.getenv("COINGECKO_API_KEY", "")
@@ -41,6 +55,10 @@ MIN_RR = float(os.getenv("MIN_RR", "2.0"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
 SLEEP_BETWEEN_ASSETS = float(os.getenv("SLEEP_BETWEEN_ASSETS", "1.0"))
 FIB_LOOKBACK = int(os.getenv("FIB_LOOKBACK", "55"))
+ENABLE_RANKING = os.getenv("ENABLE_RANKING", "true").lower() == "true"
+MAX_ALERTS_PER_RUN = int(os.getenv("MAX_ALERTS_PER_RUN", "2"))
+MAX_ALERTS_PER_GROUP = int(os.getenv("MAX_ALERTS_PER_GROUP", "1"))
+SEND_RUN_SUMMARY = os.getenv("SEND_RUN_SUMMARY", "true").lower() == "true"
 
 SIDE_LONG = "LONG"
 ACTIVE = "ACTIVE"
@@ -74,7 +92,8 @@ def send_telegram(message: str) -> bool:
         print(f"❌ Error enviando a Telegram: {exc}")
         return False
 
-# ── Persistencia SQLite ────────────────────────────────────────────────────────
+
+# ── Persistencia SQLite ───────────────────────────────────────────────────────
 def get_db_connection(db_file: str = DB_FILE) -> sqlite3.Connection:
     conn = sqlite3.connect(db_file)
     conn.row_factory = sqlite3.Row
@@ -190,7 +209,7 @@ def import_legacy_state_if_needed(conn: sqlite3.Connection) -> None:
         set_meta(conn, "legacy_import_done", "1")
 
 
-# ── Datos de mercado ───────────────────────────────────────────────────────────
+# ── Datos de mercado ──────────────────────────────────────────────────────────
 def get_hourly_prices(cg_id: str) -> Optional[pd.DataFrame]:
     url = f"https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart"
     headers = {"accept": "application/json"}
@@ -239,11 +258,10 @@ def build_ohlc_from_hourly(price_df: pd.DataFrame) -> Optional[pd.DataFrame]:
         print(f"⚠️ OHLC reconstruido insuficiente ({len(ohlc)} velas {TRADING_TIMEFRAME}).")
         return None
 
-    # Solo velas cerradas: descarta la última vela del bucket actual.
     return ohlc.iloc[:-1].reset_index(drop=True)
 
 
-# ── Indicadores ────────────────────────────────────────────────────────────────
+# ── Indicadores ───────────────────────────────────────────────────────────────
 def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
     gain = delta.clip(lower=0)
@@ -309,7 +327,7 @@ def fibonacci_context(df: pd.DataFrame, lookback: int = FIB_LOOKBACK) -> Dict[st
     }
 
 
-# ── Setup key / buckets ───────────────────────────────────────────────────────
+# ── Setup key / buckets ──────────────────────────────────────────────────────
 def get_regime(row: pd.Series) -> str:
     ema20 = float(row["ema20"])
     ema50 = float(row["ema50"])
@@ -359,7 +377,11 @@ def build_setup_hash(setup_key: str) -> str:
     return hashlib.sha256(setup_key.encode("utf-8")).hexdigest()
 
 
-# ── Señal ──────────────────────────────────────────────────────────────────────
+def asset_group(symbol: str) -> str:
+    return ASSET_GROUPS.get(symbol, "Other")
+
+
+# ── Señal ─────────────────────────────────────────────────────────────────────
 def evaluate(df: pd.DataFrame, symbol: str, cg_id: str) -> Optional[Dict[str, Any]]:
     if df is None or len(df) < 220:
         print(f"⚠️ {cg_id}: velas insuficientes tras reconstrucción ({0 if df is None else len(df)}).")
@@ -478,6 +500,7 @@ def evaluate(df: pd.DataFrame, symbol: str, cg_id: str) -> Optional[Dict[str, An
         "fib_retracement": round(float(fib["retracement"]), 4),
         "swing_low": float(fib["swing_low"]),
         "swing_high": float(fib["swing_high"]),
+        "asset_group": asset_group(symbol),
         "alert": valid,
     }
     candidate["setup_key"] = build_setup_key(candidate)
@@ -490,7 +513,7 @@ def evaluate(df: pd.DataFrame, symbol: str, cg_id: str) -> Optional[Dict[str, An
     return candidate
 
 
-# ── Invalidación / deduplicación ───────────────────────────────────────────────
+# ── Invalidación / deduplicación ──────────────────────────────────────────────
 def invalidate_old_alerts(conn: sqlite3.Connection, candidate: Dict[str, Any]) -> None:
     rows = conn.execute(
         """
@@ -641,9 +664,112 @@ def save_alert(conn: sqlite3.Connection, candidate: Dict[str, Any], improved_fro
     conn.commit()
 
 
+# ── Ranking y selección ───────────────────────────────────────────────────────
+def compute_rank_score(candidate: Dict[str, Any]) -> Tuple[float, List[str]]:
+    notes: List[str] = []
+    rank = 0.0
+
+    rank += candidate["score"] * 9.0
+    notes.append(f"score {candidate['score']:.2f}")
+
+    adx_component = min(candidate["adx"], 40.0) * 0.6
+    rank += adx_component
+    notes.append(f"adx {candidate['adx']:.1f}")
+
+    ideal_rsi = 57.0
+    rsi_alignment = max(0.0, 1.0 - abs(candidate["rsi"] - ideal_rsi) / 14.0)
+    rsi_component = rsi_alignment * 6.0
+    rank += rsi_component
+    notes.append(f"rsi-fit {rsi_component:.2f}")
+
+    rr_component = min(candidate["rr_ratio"], 3.2) * 2.2
+    rank += rr_component
+    notes.append(f"rr {candidate['rr_ratio']:.2f}")
+
+    fib_bonus_map = {
+        "OUTSIDE": -2.0,
+        "0.382-0.500": 0.8,
+        "0.500-0.618": 2.0,
+        "0.618-0.786": 1.5,
+    }
+    fib_component = fib_bonus_map.get(candidate["fib_zone"], 0.0)
+    rank += fib_component
+    notes.append(f"fib {candidate['fib_zone']}")
+
+    if candidate.get("bullish_cross"):
+        rank += 2.5
+        notes.append("cruce reciente")
+
+    risk_pct = max((candidate["entry_price"] - candidate["stop_loss"]) / max(candidate["entry_price"], 1e-9), 0.0)
+    if risk_pct < 0.006:
+        rank -= 1.5
+        notes.append("stop estrecho")
+    elif risk_pct < 0.01:
+        rank -= 0.5
+        notes.append("stop ajustado")
+
+    if candidate["symbol"] in {"BTC", "ETH"}:
+        rank += 1.25
+        notes.append("major")
+
+    return round(rank, 2), notes
+
+
+def rank_candidates(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    ranked: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        clone = dict(candidate)
+        rank_score, rank_notes = compute_rank_score(clone)
+        clone["rank_score"] = rank_score
+        clone["rank_notes"] = rank_notes
+        ranked.append(clone)
+
+    ranked.sort(
+        key=lambda item: (
+            item["rank_score"],
+            item["score"],
+            item["adx"],
+            item["rr_ratio"],
+        ),
+        reverse=True,
+    )
+    return ranked
+
+
+def select_ranked_candidates(ranked: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    if not ENABLE_RANKING:
+        return ranked, []
+
+    selected: List[Dict[str, Any]] = []
+    deferred: List[Dict[str, Any]] = []
+    group_counts: Dict[str, int] = {}
+
+    for candidate in ranked:
+        group_name = candidate["asset_group"]
+        if len(selected) >= MAX_ALERTS_PER_RUN:
+            deferred.append(candidate)
+            continue
+        if group_counts.get(group_name, 0) >= MAX_ALERTS_PER_GROUP:
+            deferred.append(candidate)
+            continue
+
+        selected.append(candidate)
+        group_counts[group_name] = group_counts.get(group_name, 0) + 1
+
+    return selected, deferred
+
+
+# ── Formato de mensajes ───────────────────────────────────────────────────────
 def format_message(candidate: Dict[str, Any], decision_reason: str) -> str:
     esc = html.escape
     reasons_text = esc(", ".join(candidate["reasons"]))
+    rank_line = ""
+    if ENABLE_RANKING:
+        rank_line = (
+            f"🏅 <b>Prioridad:</b> {candidate['rank_score']:.2f}"
+            f" | Grupo: {esc(candidate['asset_group'])}\n"
+        )
+
     return (
         f"🚀 <b>ALERTA COMPRA: {esc(candidate['symbol'])}</b>\n\n"
         f"⏱️ <b>Timeframe:</b> {esc(candidate['timeframe'])}\n"
@@ -655,12 +781,58 @@ def format_message(candidate: Dict[str, Any], decision_reason: str) -> str:
         f"🧩 <b>Fib:</b> {esc(candidate['fib_zone'])}\n"
         f"⚖️ <b>R:R:</b> {candidate['rr_ratio']:.2f}\n"
         f"🎯 <b>TARGET (TP):</b> ${candidate['take_profit']:.4f}\n"
-        f"🛑 <b>STOP (SL):</b> ${candidate['stop_loss']:.4f}\n\n"
+        f"🛑 <b>STOP (SL):</b> ${candidate['stop_loss']:.4f}\n"
+        f"{rank_line}\n"
         f"📝 <b>Análisis:</b> {reasons_text}\n"
         f"🧠 <b>Motivo de envío:</b> {esc(decision_reason)}"
     )
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+
+def format_run_summary(
+    selected: List[Dict[str, Any]],
+    deferred: List[Dict[str, Any]],
+    blocked: List[str],
+    total_valid: int,
+) -> str:
+    esc = html.escape
+    lines = ["📋 <b>Resumen de ejecución</b>", ""]
+    lines.append(f"✅ <b>Setups válidos:</b> {total_valid}")
+    if ENABLE_RANKING:
+        lines.append(f"🚦 <b>Ranking activo:</b> sí | Límite: {MAX_ALERTS_PER_RUN} por corrida")
+        lines.append(f"🧱 <b>Límite por grupo:</b> {MAX_ALERTS_PER_GROUP}")
+    else:
+        lines.append("🚦 <b>Ranking activo:</b> no")
+
+    lines.append("")
+    if selected:
+        lines.append("🏆 <b>Enviadas:</b>")
+        for item in selected:
+            lines.append(
+                f"• {esc(item['symbol'])} | prioridad {item['rank_score']:.2f} | "
+                f"grupo {esc(item['asset_group'])} | score {item['score']:.2f}"
+            )
+    else:
+        lines.append("🏆 <b>Enviadas:</b> 0")
+
+    if deferred:
+        lines.append("")
+        lines.append("⏸️ <b>Diferidas por ranking/diversificación:</b>")
+        for item in deferred[:8]:
+            lines.append(
+                f"• {esc(item['symbol'])} | prioridad {item['rank_score']:.2f} | "
+                f"grupo {esc(item['asset_group'])}"
+            )
+
+    if blocked:
+        lines.append("")
+        lines.append("🛡️ <b>Omitidas por deduplicación/cooldown:</b>")
+        for text in blocked[:10]:
+            lines.append(f"• {esc(text)}")
+
+    return "\n".join(lines)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
     start = time.time()
     conn = get_db_connection(DB_FILE)
@@ -669,6 +841,9 @@ def main() -> None:
 
     print(f"🚀 Iniciando escaneo de {len(CRYPTO_IDS)} activos...")
     sent_count = 0
+    total_valid = 0
+    ready_candidates: List[Dict[str, Any]] = []
+    blocked_messages: List[str] = []
 
     for cg_id, symbol in CRYPTO_IDS.items():
         price_df = get_hourly_prices(cg_id)
@@ -678,25 +853,65 @@ def main() -> None:
             continue
 
         candidate = evaluate(ohlc_df, symbol, cg_id)
-        if not candidate or not candidate["alert"]:
-            if candidate:
-                invalidate_old_alerts(conn, candidate)
+        if not candidate:
             time.sleep(SLEEP_BETWEEN_ASSETS)
             continue
 
         invalidate_old_alerts(conn, candidate)
+
+        if not candidate["alert"]:
+            time.sleep(SLEEP_BETWEEN_ASSETS)
+            continue
+
+        total_valid += 1
         should_send, improved_from_alert_id, decision_reason = should_send_alert(conn, candidate)
         if should_send:
-            sent_ok = send_telegram(format_message(candidate, decision_reason))
-            if sent_ok:
-                save_alert(conn, candidate, improved_from_alert_id)
-                sent_count += 1
-            else:
-                print(f"⚠️ {symbol}: alerta no guardada porque Telegram no confirmó el envío.")
+            candidate["improved_from_alert_id"] = improved_from_alert_id
+            candidate["decision_reason"] = decision_reason
+            ready_candidates.append(candidate)
         else:
+            blocked_message = f"{symbol}: {decision_reason}"
+            blocked_messages.append(blocked_message)
             print(f"⏳ {symbol}: omitida. {decision_reason}.")
 
         time.sleep(SLEEP_BETWEEN_ASSETS)
+
+    ranked_candidates = rank_candidates(ready_candidates) if ready_candidates else []
+    if ranked_candidates:
+        print("🏅 Ranking interno:")
+        for idx, item in enumerate(ranked_candidates, start=1):
+            print(
+                f"   {idx}. {item['symbol']} | prioridad={item['rank_score']:.2f} | "
+                f"grupo={item['asset_group']} | score={item['score']:.2f} | adx={item['adx']:.2f}"
+            )
+
+    selected_candidates, deferred_candidates = select_ranked_candidates(ranked_candidates)
+
+    for item in deferred_candidates:
+        print(
+            f"⏸️ {item['symbol']}: diferida por ranking/diversificación. "
+            f"prioridad={item['rank_score']:.2f}, grupo={item['asset_group']}"
+        )
+
+    for candidate in selected_candidates:
+        sent_ok = send_telegram(format_message(candidate, candidate["decision_reason"]))
+        if sent_ok:
+            save_alert(conn, candidate, candidate.get("improved_from_alert_id"))
+            sent_count += 1
+        else:
+            print(f"⚠️ {candidate['symbol']}: alerta no guardada porque Telegram no confirmó el envío.")
+
+    if SEND_RUN_SUMMARY and (selected_candidates or deferred_candidates or blocked_messages):
+        summary_sent = send_telegram(
+            format_run_summary(
+                selected_candidates,
+                deferred_candidates,
+                blocked_messages,
+                total_valid,
+            )
+        )
+        if not summary_sent:
+            print("⚠️ No se pudo enviar el resumen de ejecución.")
 
     duration = round(time.time() - start, 1)
     print(f"🏁 Fin del escaneo. Alertas enviadas: {sent_count}. Duración: {duration}s")

@@ -327,6 +327,56 @@ def fibonacci_context(df: pd.DataFrame, lookback: int = FIB_LOOKBACK) -> Dict[st
     }
 
 
+def compute_vwap_proximity(df: pd.DataFrame, lookback: int = 20) -> Dict[str, Any]:
+    """
+    Calcula el VWAP aproximado usando las últimas `lookback` velas 4H.
+    Dado que CoinGecko no provee volumen real, usamos un VWAP sintético
+    basado en precio típico ponderado por rango de vela (proxy de actividad).
+
+    Retorna la distancia porcentual del precio actual al VWAP y si el precio
+    está por encima o debajo — clave para evaluar si estamos en zona de valor
+    o sobreextendidos.
+    """
+    recent = df.tail(lookback).copy()
+    typical_price = (recent["High"] + recent["Low"] + recent["Close"]) / 3
+    # Rango como proxy de volumen: velas con más rango = más actividad
+    candle_range = (recent["High"] - recent["Low"]).clip(lower=1e-9)
+    vwap = (typical_price * candle_range).sum() / candle_range.sum()
+    close = float(recent.iloc[-1]["Close"])
+    distance_pct = (close - vwap) / vwap * 100
+
+    return {
+        "vwap": round(float(vwap), 6),
+        "distance_pct": round(distance_pct, 2),
+        "above_vwap": close > vwap,
+    }
+
+
+def compute_volume_momentum(df: pd.DataFrame, lookback: int = 10) -> Dict[str, Any]:
+    """
+    Evalúa el momentum de volumen relativo usando rango de velas como proxy.
+    Compara el rango promedio de las últimas 3 velas vs el promedio histórico.
+
+    Un rally con rango decreciente = compradores sin convicción.
+    Un rally con rango creciente = momentum institucional real.
+    """
+    recent = df.tail(lookback).copy()
+    candle_range = recent["High"] - recent["Low"]
+    avg_range = float(candle_range.mean())
+    last_3_avg = float(candle_range.tail(3).mean())
+    relative_volume = last_3_avg / max(avg_range, 1e-9)
+
+    # Detectar si el precio sube pero el rango cae (divergencia bajista)
+    price_up = float(recent.iloc[-1]["Close"]) > float(recent.iloc[-3]["Close"])
+    range_declining = last_3_avg < avg_range * 0.85
+
+    return {
+        "relative_volume": round(relative_volume, 2),
+        "divergence": price_up and range_declining,  # Sube precio, cae volumen
+        "strong_momentum": relative_volume >= 1.15,  # Volumen superior al promedio
+    }
+
+
 # ── Setup key / buckets ──────────────────────────────────────────────────────
 def get_regime(row: pd.Series) -> str:
     ema20 = float(row["ema20"])
@@ -462,6 +512,36 @@ def evaluate(df: pd.DataFrame, symbol: str, cg_id: str) -> Optional[Dict[str, An
         score += 0.75
         reasons.append("Retroceso Fib 0.618-0.786")
 
+    # ── VWAP: ¿Está el precio cerca del valor institucional? ──────────────────
+    vwap_data = compute_vwap_proximity(work, lookback=20)
+    vwap_dist = vwap_data["distance_pct"]
+    if vwap_data["above_vwap"] and vwap_dist <= 1.5:
+        # Precio sobre VWAP y cerca — zona de valor, entrada limpia
+        score += 1.0
+        reasons.append(f"Precio cerca del VWAP (+{vwap_dist:.1f}%)")
+    elif vwap_data["above_vwap"] and vwap_dist <= 3.5:
+        # Algo extendido pero aún razonable
+        score += 0.4
+        reasons.append(f"Precio sobre VWAP (+{vwap_dist:.1f}%)")
+    elif vwap_data["above_vwap"] and vwap_dist > 3.5:
+        # Precio muy extendido respecto al VWAP — sobrecompra de corto plazo
+        score -= 1.0
+        reasons.append(f"⚠️ Precio sobreextendido sobre VWAP (+{vwap_dist:.1f}%)")
+    elif not vwap_data["above_vwap"]:
+        # Precio bajo el VWAP — institucionales aún no están comprando aquí
+        score -= 0.5
+        reasons.append(f"Precio bajo VWAP ({vwap_dist:.1f}%)")
+
+    # ── Momentum de volumen relativo ──────────────────────────────────────────
+    vol_data = compute_volume_momentum(work, lookback=10)
+    if vol_data["divergence"]:
+        # Rally sin convicción: precio sube pero rango cae — señal de trampa
+        score -= 1.5
+        reasons.append("⚠️ Divergencia volumen: precio sube, momentum cae")
+    elif vol_data["strong_momentum"]:
+        score += 0.75
+        reasons.append("Momentum de volumen fuerte")
+
     stop_loss = max(fib["swing_low"], close - (atr * 1.8))
     if stop_loss >= close:
         stop_loss = close - max(atr * 1.5, close * 0.01)
@@ -501,6 +581,11 @@ def evaluate(df: pd.DataFrame, symbol: str, cg_id: str) -> Optional[Dict[str, An
         "swing_low": float(fib["swing_low"]),
         "swing_high": float(fib["swing_high"]),
         "asset_group": asset_group(symbol),
+        "vwap": vwap_data["vwap"],
+        "vwap_distance_pct": vwap_data["distance_pct"],
+        "above_vwap": vwap_data["above_vwap"],
+        "volume_divergence": vol_data["divergence"],
+        "volume_strong": vol_data["strong_momentum"],
         "alert": valid,
     }
     candidate["setup_key"] = build_setup_key(candidate)
@@ -770,6 +855,19 @@ def format_message(candidate: Dict[str, Any], decision_reason: str) -> str:
             f" | Grupo: {esc(candidate['asset_group'])}\n"
         )
 
+    # Contexto VWAP
+    vwap_dist = candidate.get("vwap_distance_pct", 0.0)
+    vwap_icon = "🟢" if candidate.get("above_vwap") and abs(vwap_dist) <= 1.5 else ("🟡" if abs(vwap_dist) <= 3.5 else "🔴")
+    vwap_label = f"{'+' if vwap_dist >= 0 else ''}{vwap_dist:.1f}% vs VWAP ${candidate.get('vwap', 0):.4f}"
+
+    # Contexto volumen
+    if candidate.get("volume_divergence"):
+        vol_label = "⚠️ Divergencia (sube precio, cae momentum)"
+    elif candidate.get("volume_strong"):
+        vol_label = "✅ Momentum fuerte"
+    else:
+        vol_label = "➖ Momentum neutral"
+
     return (
         f"🚀 <b>ALERTA COMPRA: {esc(candidate['symbol'])}</b>\n\n"
         f"⏱️ <b>Timeframe:</b> {esc(candidate['timeframe'])}\n"
@@ -782,6 +880,8 @@ def format_message(candidate: Dict[str, Any], decision_reason: str) -> str:
         f"⚖️ <b>R:R:</b> {candidate['rr_ratio']:.2f}\n"
         f"🎯 <b>TARGET (TP):</b> ${candidate['take_profit']:.4f}\n"
         f"🛑 <b>STOP (SL):</b> ${candidate['stop_loss']:.4f}\n"
+        f"{vwap_icon} <b>VWAP:</b> {esc(vwap_label)}\n"
+        f"📦 <b>Volumen:</b> {esc(vol_label)}\n"
         f"{rank_line}\n"
         f"📝 <b>Análisis:</b> {reasons_text}\n"
         f"🧠 <b>Motivo de envío:</b> {esc(decision_reason)}"

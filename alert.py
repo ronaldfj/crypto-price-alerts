@@ -453,7 +453,6 @@ def evaluate(df: pd.DataFrame, symbol: str, cg_id: str) -> Optional[Dict[str, An
         and adx >= 18
         and rr_ratio >= MIN_RR
         and score >= MIN_SCORE
-        and zone != "OUTSIDE"
     )
 
     candidate = {

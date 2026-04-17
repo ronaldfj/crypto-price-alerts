@@ -1,4 +1,5 @@
 import hashlib
+import html
 import json
 import math
 import os
@@ -47,25 +48,31 @@ INVALIDATED = "INVALIDATED"
 EXPIRED = "EXPIRED"
 
 
-def send_telegram(message: str) -> None:
+def send_telegram(message: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Telegram no configurado. Se omite el envío.")
-        return
+        return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
-        "parse_mode": "Markdown",
+        "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
     try:
         response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
         if response.status_code != 200:
             print(f"⚠️ Telegram respondió {response.status_code}: {response.text[:300]}")
+            return False
+        body = response.json()
+        if not body.get("ok", False):
+            print(f"⚠️ Telegram rechazó el mensaje: {str(body)[:300]}")
+            return False
+        return True
     except Exception as exc:
         print(f"❌ Error enviando a Telegram: {exc}")
-
+        return False
 
 # ── Persistencia SQLite ────────────────────────────────────────────────────────
 def get_db_connection(db_file: str = DB_FILE) -> sqlite3.Connection:
@@ -440,14 +447,15 @@ def evaluate(df: pd.DataFrame, symbol: str, cg_id: str) -> Optional[Dict[str, An
     rr_ratio = (take_profit - close) / max(close - stop_loss, 1e-9)
 
     valid = (
-    regime == "BULL_STACK"
-    and close > ema200
-    and plus_di > minus_di
-    and adx >= 18
-    and rr_ratio >= MIN_RR
-    and score >= MIN_SCORE
+        regime == "BULL_STACK"
+        and close > ema200
+        and plus_di > minus_di
+        and adx >= 18
+        and rr_ratio >= MIN_RR
+        and score >= MIN_SCORE
+        and zone != "OUTSIDE"
     )
-    
+
     candidate = {
         "symbol": symbol,
         "cg_id": cg_id,
@@ -635,23 +643,23 @@ def save_alert(conn: sqlite3.Connection, candidate: Dict[str, Any], improved_fro
 
 
 def format_message(candidate: Dict[str, Any], decision_reason: str) -> str:
-    reasons_text = ", ".join(candidate["reasons"])
+    esc = html.escape
+    reasons_text = esc(", ".join(candidate["reasons"]))
     return (
-        f"🚀 *ALERTA COMPRA: {candidate['symbol']}*\n\n"
-        f"⏱️ *Timeframe:* {candidate['timeframe']}\n"
-        f"💰 *Precio:* ${candidate['entry_price']:.4f}\n"
-        f"📊 *Score:* {candidate['score']:.2f}\n"
-        f"📈 *ADX:* {candidate['adx']:.2f}\n"
-        f"📉 *RSI:* {candidate['rsi']:.2f}\n"
-        f"🧭 *Régimen:* {candidate['regime']}\n"
-        f"🧩 *Fib:* {candidate['fib_zone']}\n"
-        f"⚖️ *R:R:* {candidate['rr_ratio']:.2f}\n"
-        f"🎯 *TARGET (TP):* ${candidate['take_profit']:.4f}\n"
-        f"🛑 *STOP (SL):* ${candidate['stop_loss']:.4f}\n\n"
-        f"📝 *Análisis:* {reasons_text}\n"
-        f"🧠 *Motivo de envío:* {decision_reason}"
+        f"🚀 <b>ALERTA COMPRA: {esc(candidate['symbol'])}</b>\n\n"
+        f"⏱️ <b>Timeframe:</b> {esc(candidate['timeframe'])}\n"
+        f"💰 <b>Precio:</b> ${candidate['entry_price']:.4f}\n"
+        f"📊 <b>Score:</b> {candidate['score']:.2f}\n"
+        f"📈 <b>ADX:</b> {candidate['adx']:.2f}\n"
+        f"📉 <b>RSI:</b> {candidate['rsi']:.2f}\n"
+        f"🧭 <b>Régimen:</b> {esc(candidate['regime'])}\n"
+        f"🧩 <b>Fib:</b> {esc(candidate['fib_zone'])}\n"
+        f"⚖️ <b>R:R:</b> {candidate['rr_ratio']:.2f}\n"
+        f"🎯 <b>TARGET (TP):</b> ${candidate['take_profit']:.4f}\n"
+        f"🛑 <b>STOP (SL):</b> ${candidate['stop_loss']:.4f}\n\n"
+        f"📝 <b>Análisis:</b> {reasons_text}\n"
+        f"🧠 <b>Motivo de envío:</b> {esc(decision_reason)}"
     )
-
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main() -> None:
@@ -680,9 +688,12 @@ def main() -> None:
         invalidate_old_alerts(conn, candidate)
         should_send, improved_from_alert_id, decision_reason = should_send_alert(conn, candidate)
         if should_send:
-            send_telegram(format_message(candidate, decision_reason))
-            save_alert(conn, candidate, improved_from_alert_id)
-            sent_count += 1
+            sent_ok = send_telegram(format_message(candidate, decision_reason))
+            if sent_ok:
+                save_alert(conn, candidate, improved_from_alert_id)
+                sent_count += 1
+            else:
+                print(f"⚠️ {symbol}: alerta no guardada porque Telegram no confirmó el envío.")
         else:
             print(f"⏳ {symbol}: omitida. {decision_reason}.")
 

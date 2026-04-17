@@ -440,15 +440,14 @@ def evaluate(df: pd.DataFrame, symbol: str, cg_id: str) -> Optional[Dict[str, An
     rr_ratio = (take_profit - close) / max(close - stop_loss, 1e-9)
 
     valid = (
-        regime == "BULL_STACK"
-        and close > ema200
-        and plus_di > minus_di
-        and adx >= 18
-        and rr_ratio >= MIN_RR
-        and score >= MIN_SCORE
-        and zone != "OUTSIDE"
+    regime == "BULL_STACK"
+    and close > ema200
+    and plus_di > minus_di
+    and adx >= 18
+    and rr_ratio >= MIN_RR
+    and score >= MIN_SCORE
     )
-
+    
     candidate = {
         "symbol": symbol,
         "cg_id": cg_id,

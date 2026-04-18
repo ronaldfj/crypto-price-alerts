@@ -1,0 +1,19 @@
+{
+  "GLOBAL": {
+    "caution_level": "NORMAL"
+  },
+  "BTC": {
+    "macro_regime": "RESOLUTION_RANGE",
+    "macro_bias": "BEARISH",
+    "short_term_bias": "BULLISH",
+    "allowed_sides": ["LONG", "SHORT"],
+    "caution_level": "HIGH",
+    "long_resistance_near": true,
+    "long_resistance_label": "84k / línea cyan",
+    "short_support_label": "línea magenta",
+    "long_score_adjustment": -1.5,
+    "long_rank_adjustment": -8.0,
+    "fast_exit_mode": true,
+    "note": "Rango de resolución; revisar diario y cerrar posiciones rápido."
+  }
+}

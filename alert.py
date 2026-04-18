@@ -61,7 +61,10 @@ COOLDOWN_HOURS = int(os.getenv("COOLDOWN_HOURS", "24"))
 MIN_SCORE = float(os.getenv("MIN_SCORE", "6.0"))
 MIN_RR = float(os.getenv("MIN_RR", "2.0"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
-SLEEP_BETWEEN_ASSETS = float(os.getenv("SLEEP_BETWEEN_ASSETS", "1.0"))
+REQUEST_RETRIES = int(os.getenv("REQUEST_RETRIES", "4"))
+REQUEST_BACKOFF_SECONDS = float(os.getenv("REQUEST_BACKOFF_SECONDS", "2.0"))
+RATE_LIMIT_SLEEP_SECONDS = float(os.getenv("RATE_LIMIT_SLEEP_SECONDS", "8.0"))
+SLEEP_BETWEEN_ASSETS = float(os.getenv("SLEEP_BETWEEN_ASSETS", "1.5"))
 FIB_LOOKBACK = int(os.getenv("FIB_LOOKBACK", "55"))
 
 ENABLE_RANKING = os.getenv("ENABLE_RANKING", "true").lower() == "true"
@@ -243,6 +246,54 @@ def normalize_context(context: Dict[str, Any], symbol: str) -> Dict[str, Any]:
 
 
 # ── Datos de mercado ──────────────────────────────────────────────────────────
+def fetch_coingecko_json(url: str, headers: Dict[str, str], params: Dict[str, Any], label: str) -> Optional[Dict[str, Any]]:
+    for attempt in range(1, REQUEST_RETRIES + 1):
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
+        except Exception as exc:
+            wait_seconds = REQUEST_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            print(f"⚠️ {label}: error de red en intento {attempt}/{REQUEST_RETRIES}: {exc}")
+            if attempt < REQUEST_RETRIES:
+                time.sleep(wait_seconds)
+                continue
+            return None
+
+        if response.status_code == 200:
+            try:
+                payload = response.json()
+                return payload if isinstance(payload, dict) else None
+            except Exception as exc:
+                print(f"⚠️ {label}: respuesta JSON inválida: {exc}")
+                return None
+
+        retriable = response.status_code in {408, 409, 425, 429, 500, 502, 503, 504}
+        preview = response.text[:180]
+        if not retriable:
+            print(f"⚠️ {label}: CoinGecko respondió {response.status_code}: {preview}")
+            return None
+
+        retry_after_raw = response.headers.get("Retry-After", "").strip()
+        if retry_after_raw.isdigit():
+            wait_seconds = float(retry_after_raw)
+        elif response.status_code == 429:
+            wait_seconds = RATE_LIMIT_SLEEP_SECONDS * attempt
+        else:
+            wait_seconds = REQUEST_BACKOFF_SECONDS * (2 ** (attempt - 1))
+
+        print(
+            f"⚠️ {label}: CoinGecko respondió {response.status_code} en intento {attempt}/{REQUEST_RETRIES}. "
+            f"Reintentando en {wait_seconds:.1f}s..."
+        )
+        if attempt < REQUEST_RETRIES:
+            time.sleep(wait_seconds)
+            continue
+
+        print(f"⚠️ {label}: se agotaron los reintentos. Última respuesta: {preview}")
+        return None
+
+    return None
+
+
 def get_market_prices(cg_id: str, days: int, interval: Optional[str] = None) -> Optional[pd.DataFrame]:
     url = f"https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart"
     headers = {"accept": "application/json"}
@@ -257,26 +308,20 @@ def get_market_prices(cg_id: str, days: int, interval: Optional[str] = None) -> 
     if interval:
         params["interval"] = interval
 
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
-        if response.status_code != 200:
-            print(f"⚠️ {cg_id}: CoinGecko respondió {response.status_code}: {response.text[:180]}")
-            return None
-
-        payload = response.json()
-        prices = payload.get("prices", []) if isinstance(payload, dict) else []
-        if len(prices) < 50:
-            print(f"⚠️ {cg_id}: datos insuficientes ({len(prices)} puntos).")
-            return None
-
-        df = pd.DataFrame(prices, columns=["ts", "price"])
-        df["price"] = pd.to_numeric(df["price"], errors="coerce")
-        df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-        df = df.dropna().sort_values("ts").drop_duplicates(subset=["ts"]).reset_index(drop=True)
-        return df
-    except Exception as exc:
-        print(f"❌ Error obteniendo datos para {cg_id}: {exc}")
+    payload = fetch_coingecko_json(url, headers, params, f"{cg_id} [{days}d/{interval or 'auto'}]")
+    if not payload:
         return None
+
+    prices = payload.get("prices", []) if isinstance(payload, dict) else []
+    if len(prices) < 50:
+        print(f"⚠️ {cg_id}: datos insuficientes ({len(prices)} puntos).")
+        return None
+
+    df = pd.DataFrame(prices, columns=["ts", "price"])
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    df = df.dropna().sort_values("ts").drop_duplicates(subset=["ts"]).reset_index(drop=True)
+    return df
 
 
 def build_ohlc_from_prices(price_df: pd.DataFrame, timeframe: str, min_candles: int) -> Optional[pd.DataFrame]:
@@ -738,54 +783,89 @@ def evaluate_timing_confirmation(entry_df: pd.DataFrame, symbol: str) -> Optiona
     reasons: List[str] = []
     score_adjustment = 0.0
     rank_adjustment = 0.0
-
-    timing_ok = True
+    timing_points = 0.0
+    hard_block = False
 
     if ema20 >= ema50:
         reasons.append("15m acompaña la dirección")
+        timing_points += 1.0
+    elif close >= ema20 and ema20 >= ema50 * 0.998:
+        reasons.append("15m casi alineado; vigilancia")
+        timing_points += 0.5
+        score_adjustment -= 0.15
     else:
         reasons.append("15m pierde estructura inmediata")
-        timing_ok = False
+        score_adjustment -= 0.4
+        rank_adjustment -= 0.8
 
-    if close >= ema20 * 0.998:
+    if close >= ema20 * 0.995:
         reasons.append("Precio ejecutable respecto a EMA20 15m")
+        timing_points += 1.0
+    elif close >= ema20 * 0.99:
+        reasons.append("Precio algo débil, pero cerca de EMA20 15m")
+        timing_points += 0.5
+        score_adjustment -= 0.15
     else:
         reasons.append("Precio débil contra EMA20 15m")
-        timing_ok = False
+        score_adjustment -= 0.35
+        rank_adjustment -= 0.5
 
-    if 43 <= rsi <= 69:
+    if 45 <= rsi <= 67:
         reasons.append(f"RSI 15m razonable ({rsi:.1f})")
+        timing_points += 1.0
+    elif 40 <= rsi <= 72:
+        reasons.append(f"RSI 15m usable ({rsi:.1f})")
+        timing_points += 0.5
     else:
         reasons.append(f"RSI 15m incómodo ({rsi:.1f})")
-        timing_ok = False
+        score_adjustment -= 0.3
 
     if vol_data["divergence"]:
         reasons.append("Divergencia de momentum en 15m")
         score_adjustment -= 0.5
-        rank_adjustment -= 1.5
-        timing_ok = False
+        rank_adjustment -= 1.2
+        if vwap_data["distance_pct"] > 3.0 or distance_to_local_high_pct <= 0.35:
+            hard_block = True
+            reasons.append("Divergencia + extensión: timing bloqueado")
     elif vol_data["strong_momentum"]:
         reasons.append("Momentum de entrada 15m fuerte")
+        timing_points += 0.5
         score_adjustment += 0.35
+    else:
+        reasons.append("Momentum 15m neutral")
+        timing_points += 0.25
 
-    if vwap_data["above_vwap"] and abs(vwap_data["distance_pct"]) <= 2.5:
+    if vwap_data["above_vwap"] and abs(vwap_data["distance_pct"]) <= 2.2:
         reasons.append(f"Precio no muy lejos del VWAP 15m ({vwap_data['distance_pct']:+.1f}%)")
-    elif vwap_data["above_vwap"] and vwap_data["distance_pct"] > 2.5:
-        reasons.append(f"Entrada estirada sobre VWAP 15m ({vwap_data['distance_pct']:+.1f}%)")
+        timing_points += 0.75
+    elif vwap_data["above_vwap"] and vwap_data["distance_pct"] <= 3.2:
+        reasons.append(f"Entrada algo estirada sobre VWAP 15m ({vwap_data['distance_pct']:+.1f}%)")
+        timing_points += 0.25
+        score_adjustment -= 0.2
+    elif vwap_data["above_vwap"] and vwap_data["distance_pct"] > 3.2:
+        reasons.append(f"Entrada demasiado estirada sobre VWAP 15m ({vwap_data['distance_pct']:+.1f}%)")
         score_adjustment -= 0.5
-        timing_ok = False
+        rank_adjustment -= 0.8
+        hard_block = True
     else:
         reasons.append(f"Precio bajo VWAP 15m ({vwap_data['distance_pct']:+.1f}%)")
         score_adjustment -= 0.2
+        timing_points += 0.25
 
-    if distance_to_local_high_pct <= 0.45:
-        reasons.append(f"Muy cerca de micro-resistencia ({distance_to_local_high_pct:.2f}% del máximo local)")
-        score_adjustment -= 0.5
-        rank_adjustment -= 1.0
-        timing_ok = False
-    elif distance_to_local_high_pct <= 1.0:
+    if distance_to_local_high_pct <= 0.25:
+        reasons.append(f"Pegado a micro-resistencia ({distance_to_local_high_pct:.2f}% del máximo local)")
+        score_adjustment -= 0.45
+        rank_adjustment -= 0.9
+        hard_block = True
+    elif distance_to_local_high_pct <= 0.7:
         reasons.append(f"Cerca del máximo local ({distance_to_local_high_pct:.2f}%)")
+        score_adjustment -= 0.2
         rank_adjustment -= 0.4
+    else:
+        reasons.append(f"Micro-resistencia con espacio ({distance_to_local_high_pct:.2f}%)")
+        timing_points += 0.5
+
+    timing_ok = (timing_points >= 3.0) and not hard_block
 
     return {
         "ok": timing_ok,
@@ -798,6 +878,8 @@ def evaluate_timing_confirmation(entry_df: pd.DataFrame, symbol: str) -> Optiona
         "volume_divergence": vol_data["divergence"],
         "volume_strong": vol_data["strong_momentum"],
         "distance_to_local_high_pct": round(distance_to_local_high_pct, 2),
+        "timing_points": round(timing_points, 2),
+        "hard_block": hard_block,
         "score_adjustment": round(score_adjustment, 2),
         "rank_adjustment": round(rank_adjustment, 2),
         "reasons": reasons,
@@ -1137,7 +1219,8 @@ def format_message(candidate: Dict[str, Any], decision_reason: str) -> str:
     timing_line = (
         f"🎯 <b>Timing 15m:</b> {bool_icon(candidate['timing_ok'])} | "
         f"RSI {timing_eval.get('rsi', 0):.2f} | "
-        f"VWAP {timing_eval.get('vwap_distance_pct', 0):+.1f}%\n"
+        f"VWAP {timing_eval.get('vwap_distance_pct', 0):+.1f}% | "
+        f"puntos {timing_eval.get('timing_points', 0):.2f}\n"
     )
     setup_line = f"⚙️ <b>Setup 4H:</b> {bool_icon(candidate['setup_ok'])} | confirmaciones {candidate['confirmations_passed']}/3\n"
 
@@ -1261,7 +1344,10 @@ def main() -> None:
         invalidate_old_alerts(conn, candidate)
 
         if not candidate["alert"]:
-            reason = f"{symbol}: confirmaciones {candidate['confirmations_passed']}/3"
+            reason = (
+                f"{symbol}: confirmaciones {candidate['confirmations_passed']}/3 "
+                f"(1D={bool_icon(candidate['macro_ok'])}, 4H={bool_icon(candidate['setup_ok'])}, 15m={bool_icon(candidate['timing_ok'])})"
+            )
             blocked_messages.append(reason)
             time.sleep(SLEEP_BETWEEN_ASSETS)
             continue

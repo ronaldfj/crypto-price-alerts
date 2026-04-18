@@ -1,6 +1,7 @@
 {
   "GLOBAL": {
-    "caution_level": "NORMAL"
+    "caution_level": "NORMAL",
+    "allowed_sides": ["LONG"]
   },
   "BTC": {
     "macro_regime": "RESOLUTION_RANGE",

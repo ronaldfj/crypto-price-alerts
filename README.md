@@ -38,7 +38,7 @@ Bot de alertas de criptomonedas con memoria persistente, deduplicación semánti
 - `VS_CURRENCY` default `usd`
 - `DAILY_LOOKBACK_DAYS` default `365`
 - `HOURLY_LOOKBACK_DAYS` default `90`
-- `INTRADAY_LOOKBACK_DAYS` default `1`
+- `INTRADAY_LOOKBACK_DAYS` default `3`
 - `HOURLY_INTERVAL` default `hourly`
 - `MACRO_TIMEFRAME` default `1D`
 - `TRADING_TIMEFRAME` default `4h`

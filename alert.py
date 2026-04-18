@@ -51,7 +51,7 @@ VS_CURRENCY = os.getenv("VS_CURRENCY", "usd")
 
 DAILY_LOOKBACK_DAYS = int(os.getenv("DAILY_LOOKBACK_DAYS", "365"))
 HOURLY_LOOKBACK_DAYS = int(os.getenv("HOURLY_LOOKBACK_DAYS", "90"))
-INTRADAY_LOOKBACK_DAYS = int(os.getenv("INTRADAY_LOOKBACK_DAYS", "1"))
+INTRADAY_LOOKBACK_DAYS = int(os.getenv("INTRADAY_LOOKBACK_DAYS", "3"))
 HOURLY_INTERVAL = os.getenv("HOURLY_INTERVAL", "hourly")
 
 MACRO_TIMEFRAME = os.getenv("MACRO_TIMEFRAME", "1D")
@@ -449,7 +449,11 @@ def compute_volume_momentum(df: pd.DataFrame, lookback: int = 10) -> Dict[str, A
     last_3_avg = float(candle_range.tail(3).mean())
     relative_volume = last_3_avg / max(avg_range, 1e-9)
 
-    price_up = float(recent.iloc[-1]["Close"]) > float(recent.iloc[-3]["Close"])
+    # Requiere al menos 4 velas para comparar precio actual vs hace 3 velas
+    if len(recent) >= 4:
+        price_up = float(recent.iloc[-1]["Close"]) > float(recent.iloc[-4]["Close"])
+    else:
+        price_up = False
     range_declining = last_3_avg < avg_range * 0.85
 
     return {
@@ -764,9 +768,20 @@ def evaluate_setup_confirmation(fourh_df: pd.DataFrame, symbol: str, cg_id: str)
 
 
 # ── Confirmación 15m ──────────────────────────────────────────────────────────
+def add_indicators_lightweight(df: pd.DataFrame) -> pd.DataFrame:
+    """Indicadores ligeros para 15m: solo EMA20/50, RSI y ATR.
+    EMA200 no es fiable con menos de 300 velas y en 15m no aporta para timing."""
+    work = df.copy()
+    work["ema20"] = work["Close"].ewm(span=20, adjust=False).mean()
+    work["ema50"] = work["Close"].ewm(span=50, adjust=False).mean()
+    work["rsi"] = compute_rsi(work["Close"], 14)
+    work["atr"] = compute_atr(work, 14)
+    return work.dropna(subset=["ema20", "ema50", "rsi", "atr"]).reset_index(drop=True)
+
+
 def evaluate_timing_confirmation(entry_df: pd.DataFrame, symbol: str) -> Optional[Dict[str, Any]]:
-    work = add_indicators(entry_df)
-    if len(work) < 60:
+    work = add_indicators_lightweight(entry_df)
+    if len(work) < 30:
         print(f"⚠️ {symbol}: histórico 15m insuficiente ({len(work)} velas útiles).")
         return None
 
@@ -904,8 +919,16 @@ def build_candidate(
 
     candidate["setup_score"] = round(setup_score, 2)
     candidate["score_adjustment"] = round(score_adjustment, 2)
-    candidate["score"] = final_score
+    # Floor en 0.0 para evitar scores negativos absurdos por acumulación de penalizaciones
+    candidate["score"] = max(0.0, final_score)
     candidate["rank_adjustment"] = round(float(macro_eval["rank_adjustment"]) + float(timing_eval["rank_adjustment"]), 2)
+
+    if abs(score_adjustment) >= 1.0:
+        print(
+            f"📊 {symbol}: ajuste macro/timing significativo: "
+            f"setup_score={setup_score:.2f} → final={candidate['score']:.2f} "
+            f"(ajuste={score_adjustment:+.2f})"
+        )
 
     candidate["macro_ok"] = bool(macro_eval["ok"])
     candidate["timing_ok"] = bool(timing_eval["ok"])
@@ -953,11 +976,15 @@ def invalidate_old_alerts(conn: sqlite3.Connection, candidate: Dict[str, Any]) -
     now_ts = int(time.time())
     for row in rows:
         reason = None
-        if not candidate.get("macro_ok", True):
+        # Verificaciones explícitas — sin fallback True para evitar silenciar errores
+        macro_ok = candidate.get("macro_ok")
+        timing_ok = candidate.get("timing_ok")
+
+        if macro_ok is False:
             reason = "Confirmación macro perdida"
-        elif not candidate.get("timing_ok", True):
+        elif timing_ok is False:
             reason = "Timing de entrada perdido"
-        elif candidate["regime"] != "BULL_STACK":
+        elif candidate.get("regime") != "BULL_STACK":
             reason = "Regimen perdido"
         elif candidate["entry_price"] <= float(row["stop_loss"]):
             reason = "Stop tecnico vulnerado"

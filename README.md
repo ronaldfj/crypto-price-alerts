@@ -15,11 +15,14 @@ Bot de alertas de criptomonedas con memoria persistente, deduplicación semánti
 - Reenvía solo si hubo **invalidación** o **mejora material**.
 - Rankea los setups válidos y envía solo los mejores por corrida.
 - Permite incorporar **contexto macro manual** desde `market_context.json`.
-- Enriquece la alerta con **VWAP sintético**, **momentum de volumen**, confirmaciones por timeframe y contexto macro.
+- Usa **total_volumes** de CoinGecko para medir momentum de volumen. Cuando no hay datos de volumen, hace fallback al rango de vela.
+- Enriquece la alerta con lectura humana, VWAP, volumen, confirmaciones por timeframe y contexto macro.
+- Incluye un **esqueleto de backtesting** en `backtester.py` para validar la estrategia fuera de producción.
 
 ## Archivos principales
 
 - `alert.py`: motor principal.
+- `backtester.py`: esqueleto para backtesting histórico.
 - `alerts_state.db`: base SQLite generada automáticamente.
 - `market_context.json`: contexto macro manual opcional.
 - `.github/workflows/crypto-alert.yml`: ejecución programada y persistencia del estado.
@@ -47,8 +50,13 @@ Bot de alertas de criptomonedas con memoria persistente, deduplicación semánti
 - `MIN_SCORE` default `6.0`
 - `MIN_RR` default `2.0`
 - `REQUEST_TIMEOUT` default `20`
+- `REQUEST_RETRIES` default `4`
+- `REQUEST_BACKOFF_SECONDS` default `2.0`
+- `RATE_LIMIT_SLEEP_SECONDS` default `8.0`
 - `SLEEP_BETWEEN_ASSETS` default `1.0`
 - `FIB_LOOKBACK` default `55`
+- `TIMING_MIN_POINTS` default `3.0`
+- `WATCHLIST_MIN_SETUP_SCORE` default `6.0`
 - `ENABLE_RANKING` default `true`
 - `MAX_ALERTS_PER_RUN` default `2`
 - `MAX_ALERTS_PER_GROUP` default `1`
@@ -76,9 +84,11 @@ Qué revisa:
 - RSI
 - R:R
 - Fibonacci
-- VWAP sintético
+- VWAP ponderado por volumen 24h si existe
 - momentum de volumen
 - cercanía al swing high
+- stop ATR + swing low
+- TP1 / TP2 por múltiplos de riesgo
 
 ### 3) Confirmación de timing — 15m
 
@@ -90,6 +100,7 @@ Qué revisa:
 - distancia al VWAP 15m
 - divergencia de momentum
 - cercanía al máximo local reciente
+- sistema de puntos con bloqueo duro solo en combinaciones realmente malas
 
 ## Regla principal
 
@@ -99,19 +110,28 @@ El bot solo manda una alerta si se cumplen las **3 confirmaciones**:
 - `setup_ok = True`
 - `timing_ok = True`
 
-Si alguna falla, no dispara alerta.
+Si alguna falla, no dispara alerta. Si el activo queda cerca, entra a **vigilancia táctica**.
 
-## Cómo funciona el flujo
+## Qué significan las variables de la alerta
 
-1. Descarga datos diarios, horarios y de 1 día intradía desde CoinGecko.
-2. Reconstruye velas **1D**, **4H** y **15m**.
-3. Descarta la última vela abierta de cada timeframe.
-4. Calcula indicadores por capa.
-5. Aplica el contexto macro manual si existe.
-6. Exige `3/3` confirmaciones.
-7. Revisa si existe una alerta similar activa en las últimas 24h.
-8. Rankea las alertas válidas y envía solo las mejores.
-9. Guarda en SQLite únicamente las alertas realmente confirmadas por Telegram.
+- `Score final`: score después de ajustes macro y timing.
+- `Score 4H`: score puro del setup 4H antes de castigos o premios de otras capas.
+- `ADX`: fuerza de tendencia en 4H.
+- `RSI`: momento relativo en 4H.
+- `Régimen`: estructura de EMAs en 4H. `BULL_STACK` significa EMA20 > EMA50 > EMA200.
+- `Fib`: zona de retroceso en el lookback configurado.
+- `R:R`: relación riesgo/beneficio entre entrada y target principal.
+- `TP1`: objetivo parcial de 1:2.
+- `TP2`: objetivo extendido de 1:4.
+- `STOP (SL)`: stop técnico por ATR y swing low.
+- `VWAP`: distancia del precio frente al VWAP del timeframe operativo.
+- `Volumen`: lectura del momentum usando `total_volumes` de CoinGecko cuando existe.
+- `Macro 1D`: indica si la capa diaria confirmó o no el long.
+- `Setup 4H`: indica si la lógica operativa validó el setup base.
+- `Timing 15m`: indica si el momento de ejecución fue aceptable.
+- `Prioridad`: puntuación final del ranking para decidir cuáles alertas salen primero.
+- `Análisis`: razones técnicas y macro que explican el resultado.
+- `Motivo de envío`: por qué el bot decidió enviarla a pesar del cooldown y la deduplicación.
 
 ## Contexto macro manual
 
@@ -142,67 +162,24 @@ Si alguna falla, no dispara alerta.
 }
 ```
 
-### Variables soportadas
+## Backtesting
 
-- `macro_regime`: estado macro, por ejemplo `BULLISH`, `BEARISH`, `RANGE`, `RESOLUTION_RANGE`.
-- `macro_bias`: sesgo macro principal.
-- `short_term_bias`: sesgo de corto plazo.
-- `allowed_sides`: lados permitidos.
-- `caution_level`: `LOW`, `NORMAL`, `MEDIUM`, `HIGH`, `EXTREME`.
-- `long_score_adjustment`: ajuste directo al score del setup long.
-- `long_rank_adjustment`: ajuste a la prioridad final del ranking.
-- `hard_block_long`: bloqueo duro del lado long.
-- `fast_exit_mode`: añade cautela y gestión táctica rápida al mensaje.
-- `long_resistance_near`: indica que hay resistencia macro cerca.
-- `long_resistance_label`: texto corto de esa resistencia.
-- `short_support_label`: texto corto del soporte relevante.
-- `note`: nota libre corta que saldrá en la alerta.
+`backtester.py` es un punto de partida para validar histórico sin tocar producción.
 
-## Qué significan las variables de la alerta
+Uso básico:
 
-- `Timeframe`: temporalidad operativa principal. En esta versión, `4h`.
-- `Precio`: precio de entrada evaluado sobre la última vela 4H cerrada.
-- `Score`: puntuación final después de ajustes técnicos, macro y timing.
-- `ADX`: fuerza de tendencia en 4H.
-- `RSI`: momento relativo en 4H.
-- `Régimen`: estructura de EMAs en 4H. `BULL_STACK` significa EMA20 > EMA50 > EMA200.
-- `Fib`: zona de retroceso en el lookback configurado.
-- `R:R`: relación riesgo/beneficio entre entrada, stop y target.
-- `TARGET (TP)`: objetivo técnico calculado.
-- `STOP (SL)`: stop técnico calculado.
-- `VWAP`: distancia del precio frente al VWAP sintético de 4H.
-- `Volumen`: lectura de momentum basada en rango de velas como proxy de actividad.
-- `Macro 1D`: indica si la capa diaria confirmó o no el long.
-- `Setup 4H`: indica si la lógica operativa validó el setup.
-- `Timing 15m`: indica si el momento de ejecución fue aceptable.
-- `Prioridad`: puntuación final del ranking para decidir cuáles alertas salen primero.
-- `Análisis`: razones técnicas y macro que explican el resultado.
-- `Motivo de envío`: por qué el bot decidió enviarla a pesar del cooldown y la deduplicación.
+```bash
+python backtester.py --symbol BTC
+```
 
-## Cómo mantener `market_context.json`
+Sirve para:
+- probar una versión simplificada del flujo histórico
+- medir cuántas señales 3/3 aparecen
+- estimar retorno a 48h, win rate y profit factor básico
 
-No lo cambies por rutina. Cámbialo solo cuando cambie el escenario.
-
-Ejemplos:
-- ruptura de una línea o nivel mayor
-- cambio de sesgo macro
-- nueva resistencia o soporte relevante
-- cambio del nivel de cautela
-- cambio de lados permitidos
-
-Regla práctica:
-- revisión rápida diaria
-- actualización real solo si cambió la estructura
-- revisión más completa al cierre semanal
-
-## Nota sobre el estado legacy
-
-Si todavía existe `alert_state.json`, el bot puede migrarlo una vez. Después de validar que todo está bien, puedes eliminarlo.
-
-## Recomendación operativa
+## Nota operativa
 
 El bot es un filtro técnico y táctico. La decisión final sigue siendo humana, sobre todo cuando:
-
-- el activo está en zona de resistencia macro,
-- el mercado está en rango de resolución,
-- o el contexto diario contradice el 4H.
+- el activo está en zona de resistencia macro
+- el mercado está en rango de resolución
+- o el contexto diario contradice el 4H

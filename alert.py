@@ -25,49 +25,22 @@ CRYPTO_IDS = {
     "binancecoin": "BNB",
 }
 
-ASSET_GROUPS = {
-    "BTC": "Majors",
-    "ETH": "Majors",
-    "TON": "Layer1",
-    "SOL": "Layer1",
-    "DOT": "Layer1",
-    "BNB": "Exchange",
-    "LINK": "Infra",
-    "TRX": "Payments",
-    "XRP": "Payments",
-    "XLM": "Payments",
-    "LTC": "Legacy",
-}
-
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 CG_API_KEY = os.getenv("COINGECKO_API_KEY", "")
 
 DB_FILE = os.getenv("ALERT_DB_FILE", "alerts_state.db")
 LEGACY_STATE_FILE = os.getenv("LEGACY_STATE_FILE", "alert_state.json")
-MARKET_CONTEXT_FILE = os.getenv("MARKET_CONTEXT_FILE", "market_context.json")
 VS_CURRENCY = os.getenv("VS_CURRENCY", "usd")
-
-DAILY_LOOKBACK_DAYS = int(os.getenv("DAILY_LOOKBACK_DAYS", "365"))
-HOURLY_LOOKBACK_DAYS = int(os.getenv("HOURLY_LOOKBACK_DAYS", "90"))
-INTRADAY_LOOKBACK_DAYS = int(os.getenv("INTRADAY_LOOKBACK_DAYS", "1"))
-HOURLY_INTERVAL = os.getenv("HOURLY_INTERVAL", "hourly")
-
-MACRO_TIMEFRAME = os.getenv("MACRO_TIMEFRAME", "1D")
+MARKET_CHART_DAYS = int(os.getenv("MARKET_CHART_DAYS", "90"))
+BASE_INTERVAL = os.getenv("BASE_INTERVAL", "hourly")
 TRADING_TIMEFRAME = os.getenv("TRADING_TIMEFRAME", "4h")
-ENTRY_TIMEFRAME = os.getenv("ENTRY_TIMEFRAME", "15min")
-
 COOLDOWN_HOURS = int(os.getenv("COOLDOWN_HOURS", "24"))
 MIN_SCORE = float(os.getenv("MIN_SCORE", "6.0"))
 MIN_RR = float(os.getenv("MIN_RR", "2.0"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
 SLEEP_BETWEEN_ASSETS = float(os.getenv("SLEEP_BETWEEN_ASSETS", "1.0"))
 FIB_LOOKBACK = int(os.getenv("FIB_LOOKBACK", "55"))
-
-ENABLE_RANKING = os.getenv("ENABLE_RANKING", "true").lower() == "true"
-MAX_ALERTS_PER_RUN = int(os.getenv("MAX_ALERTS_PER_RUN", "2"))
-MAX_ALERTS_PER_GROUP = int(os.getenv("MAX_ALERTS_PER_GROUP", "1"))
-SEND_RUN_SUMMARY = os.getenv("SEND_RUN_SUMMARY", "true").lower() == "true"
 
 SIDE_LONG = "LONG"
 ACTIVE = "ACTIVE"
@@ -101,8 +74,7 @@ def send_telegram(message: str) -> bool:
         print(f"❌ Error enviando a Telegram: {exc}")
         return False
 
-
-# ── Persistencia SQLite ───────────────────────────────────────────────────────
+# ── Persistencia SQLite ────────────────────────────────────────────────────────
 def get_db_connection(db_file: str = DB_FILE) -> sqlite3.Connection:
     conn = sqlite3.connect(db_file)
     conn.row_factory = sqlite3.Row
@@ -218,32 +190,8 @@ def import_legacy_state_if_needed(conn: sqlite3.Connection) -> None:
         set_meta(conn, "legacy_import_done", "1")
 
 
-# ── Contexto manual ───────────────────────────────────────────────────────────
-def load_market_context(path: str = MARKET_CONTEXT_FILE) -> Dict[str, Any]:
-    context_path = Path(path)
-    if not context_path.exists():
-        return {}
-    try:
-        raw = json.loads(context_path.read_text())
-        return raw if isinstance(raw, dict) else {}
-    except Exception as exc:
-        print(f"⚠️ No se pudo leer {path}: {exc}")
-        return {}
-
-
-def normalize_context(context: Dict[str, Any], symbol: str) -> Dict[str, Any]:
-    merged: Dict[str, Any] = {}
-    global_ctx = context.get("GLOBAL", {})
-    asset_ctx = context.get(symbol, {})
-    if isinstance(global_ctx, dict):
-        merged.update(global_ctx)
-    if isinstance(asset_ctx, dict):
-        merged.update(asset_ctx)
-    return merged
-
-
-# ── Datos de mercado ──────────────────────────────────────────────────────────
-def get_market_prices(cg_id: str, days: int, interval: Optional[str] = None) -> Optional[pd.DataFrame]:
+# ── Datos de mercado ───────────────────────────────────────────────────────────
+def get_hourly_prices(cg_id: str) -> Optional[pd.DataFrame]:
     url = f"https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart"
     headers = {"accept": "application/json"}
     if CG_API_KEY:
@@ -251,11 +199,10 @@ def get_market_prices(cg_id: str, days: int, interval: Optional[str] = None) -> 
 
     params = {
         "vs_currency": VS_CURRENCY,
-        "days": str(days),
+        "days": str(MARKET_CHART_DAYS),
+        "interval": BASE_INTERVAL,
         "precision": "full",
     }
-    if interval:
-        params["interval"] = interval
 
     try:
         response = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
@@ -265,8 +212,8 @@ def get_market_prices(cg_id: str, days: int, interval: Optional[str] = None) -> 
 
         payload = response.json()
         prices = payload.get("prices", []) if isinstance(payload, dict) else []
-        if len(prices) < 50:
-            print(f"⚠️ {cg_id}: datos insuficientes ({len(prices)} puntos).")
+        if len(prices) < 500:
+            print(f"⚠️ {cg_id}: datos horarios insuficientes ({len(prices)} puntos).")
             return None
 
         df = pd.DataFrame(prices, columns=["ts", "price"])
@@ -279,28 +226,24 @@ def get_market_prices(cg_id: str, days: int, interval: Optional[str] = None) -> 
         return None
 
 
-def build_ohlc_from_prices(price_df: pd.DataFrame, timeframe: str, min_candles: int) -> Optional[pd.DataFrame]:
+def build_ohlc_from_hourly(price_df: pd.DataFrame) -> Optional[pd.DataFrame]:
     if price_df is None or price_df.empty:
         return None
 
     df = price_df.copy().set_index("ts")
-    ohlc = df["price"].resample(timeframe, label="right", closed="right").ohlc()
+    ohlc = df["price"].resample(TRADING_TIMEFRAME, label="right", closed="right").ohlc()
     ohlc.columns = ["Open", "High", "Low", "Close"]
     ohlc = ohlc.dropna().reset_index()
 
-    if len(ohlc) <= min_candles:
-        print(f"⚠️ OHLC insuficiente ({len(ohlc)} velas {timeframe}).")
+    if len(ohlc) < 220:
+        print(f"⚠️ OHLC reconstruido insuficiente ({len(ohlc)} velas {TRADING_TIMEFRAME}).")
         return None
 
-    # Solo velas cerradas.
-    closed = ohlc.iloc[:-1].reset_index(drop=True)
-    if len(closed) < min_candles:
-        print(f"⚠️ Velas cerradas insuficientes ({len(closed)} velas {timeframe}).")
-        return None
-    return closed
+    # Solo velas cerradas: descarta la última vela del bucket actual.
+    return ohlc.iloc[:-1].reset_index(drop=True)
 
 
-# ── Indicadores ───────────────────────────────────────────────────────────────
+# ── Indicadores ────────────────────────────────────────────────────────────────
 def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
     gain = delta.clip(lower=0)
@@ -345,17 +288,6 @@ def compute_adx(df: pd.DataFrame, period: int = 14) -> Tuple[pd.Series, pd.Serie
     return adx, plus_di, minus_di
 
 
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    work = df.copy()
-    work["ema20"] = work["Close"].ewm(span=20, adjust=False).mean()
-    work["ema50"] = work["Close"].ewm(span=50, adjust=False).mean()
-    work["ema200"] = work["Close"].ewm(span=200, adjust=False).mean()
-    work["rsi"] = compute_rsi(work["Close"], 14)
-    work["atr"] = compute_atr(work, 14)
-    work["adx"], work["plus_di"], work["minus_di"] = compute_adx(work, 14)
-    return work.dropna().reset_index(drop=True)
-
-
 def fibonacci_context(df: pd.DataFrame, lookback: int = FIB_LOOKBACK) -> Dict[str, Any]:
     recent = df.tail(lookback).copy()
     swing_low = float(recent["Low"].min())
@@ -377,38 +309,7 @@ def fibonacci_context(df: pd.DataFrame, lookback: int = FIB_LOOKBACK) -> Dict[st
     }
 
 
-def compute_vwap_proximity(df: pd.DataFrame, lookback: int = 20) -> Dict[str, Any]:
-    recent = df.tail(lookback).copy()
-    typical_price = (recent["High"] + recent["Low"] + recent["Close"]) / 3
-    candle_range = (recent["High"] - recent["Low"]).clip(lower=1e-9)
-    vwap = (typical_price * candle_range).sum() / candle_range.sum()
-    close = float(recent.iloc[-1]["Close"])
-    distance_pct = (close - vwap) / vwap * 100
-
-    return {
-        "vwap": round(float(vwap), 6),
-        "distance_pct": round(distance_pct, 2),
-        "above_vwap": close > vwap,
-    }
-
-
-def compute_volume_momentum(df: pd.DataFrame, lookback: int = 10) -> Dict[str, Any]:
-    recent = df.tail(lookback).copy()
-    candle_range = recent["High"] - recent["Low"]
-    avg_range = float(candle_range.mean())
-    last_3_avg = float(candle_range.tail(3).mean())
-    relative_volume = last_3_avg / max(avg_range, 1e-9)
-
-    price_up = float(recent.iloc[-1]["Close"]) > float(recent.iloc[-3]["Close"])
-    range_declining = last_3_avg < avg_range * 0.85
-
-    return {
-        "relative_volume": round(relative_volume, 2),
-        "divergence": price_up and range_declining,
-        "strong_momentum": relative_volume >= 1.15,
-    }
-
-
+# ── Setup key / buckets ───────────────────────────────────────────────────────
 def get_regime(row: pd.Series) -> str:
     ema20 = float(row["ema20"])
     ema50 = float(row["ema50"])
@@ -458,121 +359,23 @@ def build_setup_hash(setup_key: str) -> str:
     return hashlib.sha256(setup_key.encode("utf-8")).hexdigest()
 
 
-def asset_group(symbol: str) -> str:
-    return ASSET_GROUPS.get(symbol, "Other")
-
-
-def bool_icon(flag: bool) -> str:
-    return "✅" if flag else "❌"
-
-
-# ── Confirmación 1D ───────────────────────────────────────────────────────────
-def evaluate_macro_confirmation(daily_df: pd.DataFrame, symbol: str, context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    work = add_indicators(daily_df)
-    if len(work) < 210:
-        print(f"⚠️ {symbol}: histórico diario insuficiente ({len(work)} velas útiles).")
+# ── Señal ──────────────────────────────────────────────────────────────────────
+def evaluate(df: pd.DataFrame, symbol: str, cg_id: str) -> Optional[Dict[str, Any]]:
+    if df is None or len(df) < 220:
+        print(f"⚠️ {cg_id}: velas insuficientes tras reconstrucción ({0 if df is None else len(df)}).")
         return None
 
-    last = work.iloc[-1]
-    close = float(last["Close"])
-    ema20 = float(last["ema20"])
-    ema50 = float(last["ema50"])
-    ema200 = float(last["ema200"])
-    rsi = float(last["rsi"])
-    adx = float(last["adx"])
-    plus_di = float(last["plus_di"])
-    minus_di = float(last["minus_di"])
-    regime = get_regime(last)
+    work = df.copy()
+    work["ema20"] = work["Close"].ewm(span=20, adjust=False).mean()
+    work["ema50"] = work["Close"].ewm(span=50, adjust=False).mean()
+    work["ema200"] = work["Close"].ewm(span=200, adjust=False).mean()
+    work["rsi"] = compute_rsi(work["Close"], 14)
+    work["atr"] = compute_atr(work, 14)
+    work["adx"], work["plus_di"], work["minus_di"] = compute_adx(work, 14)
+    work = work.dropna().reset_index(drop=True)
 
-    reasons: List[str] = []
-    adjustments = {
-        "score": 0.0,
-        "rank": 0.0,
-    }
-
-    allowed_sides = context.get("allowed_sides", [SIDE_LONG])
-    hard_block_long = bool(context.get("hard_block_long", False))
-    caution_level = str(context.get("caution_level", "NORMAL")).upper()
-    macro_regime = str(context.get("macro_regime", "UNSPECIFIED")).upper()
-    macro_bias = str(context.get("macro_bias", "UNSPECIFIED")).upper()
-    short_term_bias = str(context.get("short_term_bias", "UNSPECIFIED")).upper()
-    long_resistance_near = bool(context.get("long_resistance_near", False))
-    long_resistance_label = str(context.get("long_resistance_label", "")).strip()
-    note = str(context.get("note", "")).strip()
-    fast_exit_mode = bool(context.get("fast_exit_mode", False))
-
-    technical_ok = (
-        close > ema20
-        and ema20 >= ema50
-        and rsi >= 45
-        and rsi <= 70
-        and (plus_di >= minus_di or adx < 18)
-    )
-
-    if regime == "BULL_STACK":
-        reasons.append("Diario con estructura alcista")
-    elif technical_ok:
-        reasons.append("Diario permite longs, aunque no está en pila alcista completa")
-    else:
-        reasons.append("Diario no confirma longs con claridad")
-
-    if hard_block_long or SIDE_LONG not in allowed_sides:
-        macro_ok = False
-        reasons.append("Bloqueo manual del lado long")
-    else:
-        macro_ok = technical_ok
-
-    if long_resistance_near:
-        reasons.append(f"Resistencia macro cerca: {long_resistance_label or 'nivel mayor'}")
-    if fast_exit_mode:
-        reasons.append("Gestión táctica: salida rápida")
-    if note:
-        reasons.append(note)
-
-    adjustments["score"] += float(context.get("long_score_adjustment", 0.0))
-    adjustments["rank"] += float(context.get("long_rank_adjustment", 0.0))
-
-    caution_penalty_map = {
-        "LOW": 0.0,
-        "NORMAL": 0.0,
-        "MEDIUM": -0.25,
-        "HIGH": -0.6,
-        "EXTREME": -1.0,
-    }
-    adjustments["score"] += caution_penalty_map.get(caution_level, 0.0)
-    if long_resistance_near:
-        adjustments["rank"] -= 2.0
-
-    return {
-        "ok": macro_ok,
-        "regime": regime,
-        "rsi": round(rsi, 2),
-        "adx": round(adx, 2),
-        "close": close,
-        "ema20": ema20,
-        "ema50": ema50,
-        "ema200": ema200,
-        "technical_ok": technical_ok,
-        "macro_regime": macro_regime,
-        "macro_bias": macro_bias,
-        "short_term_bias": short_term_bias,
-        "caution_level": caution_level,
-        "long_resistance_near": long_resistance_near,
-        "long_resistance_label": long_resistance_label,
-        "short_support_label": str(context.get("short_support_label", "")).strip(),
-        "fast_exit_mode": fast_exit_mode,
-        "note": note,
-        "score_adjustment": round(adjustments["score"], 2),
-        "rank_adjustment": round(adjustments["rank"], 2),
-        "reasons": reasons,
-    }
-
-
-# ── Confirmación 4H ───────────────────────────────────────────────────────────
-def evaluate_setup_confirmation(fourh_df: pd.DataFrame, symbol: str, cg_id: str) -> Optional[Dict[str, Any]]:
-    work = add_indicators(fourh_df)
     if len(work) < 210:
-        print(f"⚠️ {symbol}: histórico 4h insuficiente ({len(work)} velas útiles).")
+        print(f"⚠️ {symbol}: historial útil insuficiente tras indicadores ({len(work)} velas).")
         return None
 
     last = work.iloc[-1]
@@ -594,6 +397,7 @@ def evaluate_setup_confirmation(fourh_df: pd.DataFrame, symbol: str, cg_id: str)
 
     score = 0.0
     reasons: List[str] = []
+
     regime = get_regime(last)
     bullish_cross = float(prev["ema20"]) <= float(prev["ema50"]) and ema20 > ema50
 
@@ -636,44 +440,13 @@ def evaluate_setup_confirmation(fourh_df: pd.DataFrame, symbol: str, cg_id: str)
         score += 0.75
         reasons.append("Retroceso Fib 0.618-0.786")
 
-    vwap_data = compute_vwap_proximity(work, lookback=20)
-    vwap_dist = vwap_data["distance_pct"]
-    if vwap_data["above_vwap"] and vwap_dist <= 1.5:
-        score += 1.0
-        reasons.append(f"Precio cerca del VWAP (+{vwap_dist:.1f}%)")
-    elif vwap_data["above_vwap"] and vwap_dist <= 3.5:
-        score += 0.4
-        reasons.append(f"Precio sobre VWAP (+{vwap_dist:.1f}%)")
-    elif vwap_data["above_vwap"] and vwap_dist > 3.5:
-        score -= 1.0
-        reasons.append(f"Precio sobreextendido sobre VWAP (+{vwap_dist:.1f}%)")
-    elif not vwap_data["above_vwap"]:
-        score -= 0.5
-        reasons.append(f"Precio bajo VWAP ({vwap_dist:.1f}%)")
-
-    vol_data = compute_volume_momentum(work, lookback=10)
-    if vol_data["divergence"]:
-        score -= 1.5
-        reasons.append("Divergencia volumen: precio sube, momentum cae")
-    elif vol_data["strong_momentum"]:
-        score += 0.75
-        reasons.append("Momentum de volumen fuerte")
-
-    distance_to_swing_high_pct = ((fib["swing_high"] - close) / max(close, 1e-9)) * 100
-    if distance_to_swing_high_pct <= 0.8:
-        score -= 1.25
-        reasons.append(f"Precio a {distance_to_swing_high_pct:.2f}% del swing high")
-    elif distance_to_swing_high_pct <= 1.5:
-        score -= 0.60
-        reasons.append(f"Precio cerca de resistencia ({distance_to_swing_high_pct:.2f}% del swing high)")
-
     stop_loss = max(fib["swing_low"], close - (atr * 1.8))
     if stop_loss >= close:
         stop_loss = close - max(atr * 1.5, close * 0.01)
     take_profit = close + max((close - stop_loss) * 2.4, atr * 2.8)
     rr_ratio = (take_profit - close) / max(close - stop_loss, 1e-9)
 
-    setup_ok = (
+    valid = (
         regime == "BULL_STACK"
         and close > ema200
         and plus_di > minus_di
@@ -682,7 +455,7 @@ def evaluate_setup_confirmation(fourh_df: pd.DataFrame, symbol: str, cg_id: str)
         and score >= MIN_SCORE
     )
 
-    return {
+    candidate = {
         "symbol": symbol,
         "cg_id": cg_id,
         "side": SIDE_LONG,
@@ -705,145 +478,19 @@ def evaluate_setup_confirmation(fourh_df: pd.DataFrame, symbol: str, cg_id: str)
         "fib_retracement": round(float(fib["retracement"]), 4),
         "swing_low": float(fib["swing_low"]),
         "swing_high": float(fib["swing_high"]),
-        "asset_group": asset_group(symbol),
-        "vwap": vwap_data["vwap"],
-        "vwap_distance_pct": vwap_data["distance_pct"],
-        "above_vwap": vwap_data["above_vwap"],
-        "volume_divergence": vol_data["divergence"],
-        "volume_strong": vol_data["strong_momentum"],
-        "distance_to_swing_high_pct": round(distance_to_swing_high_pct, 2),
-        "setup_ok": setup_ok,
+        "alert": valid,
     }
-
-
-# ── Confirmación 15m ──────────────────────────────────────────────────────────
-def evaluate_timing_confirmation(entry_df: pd.DataFrame, symbol: str) -> Optional[Dict[str, Any]]:
-    work = add_indicators(entry_df)
-    if len(work) < 60:
-        print(f"⚠️ {symbol}: histórico 15m insuficiente ({len(work)} velas útiles).")
-        return None
-
-    last = work.iloc[-1]
-    close = float(last["Close"])
-    ema20 = float(last["ema20"])
-    ema50 = float(last["ema50"])
-    rsi = float(last["rsi"])
-    atr = float(last["atr"])
-
-    vwap_data = compute_vwap_proximity(work, lookback=16)
-    vol_data = compute_volume_momentum(work, lookback=12)
-    local_high = float(work.tail(24)["High"].max())
-    distance_to_local_high_pct = ((local_high - close) / max(close, 1e-9)) * 100
-
-    reasons: List[str] = []
-    score_adjustment = 0.0
-    rank_adjustment = 0.0
-
-    timing_ok = True
-
-    if ema20 >= ema50:
-        reasons.append("15m acompaña la dirección")
-    else:
-        reasons.append("15m pierde estructura inmediata")
-        timing_ok = False
-
-    if close >= ema20 * 0.998:
-        reasons.append("Precio ejecutable respecto a EMA20 15m")
-    else:
-        reasons.append("Precio débil contra EMA20 15m")
-        timing_ok = False
-
-    if 43 <= rsi <= 69:
-        reasons.append(f"RSI 15m razonable ({rsi:.1f})")
-    else:
-        reasons.append(f"RSI 15m incómodo ({rsi:.1f})")
-        timing_ok = False
-
-    if vol_data["divergence"]:
-        reasons.append("Divergencia de momentum en 15m")
-        score_adjustment -= 0.5
-        rank_adjustment -= 1.5
-        timing_ok = False
-    elif vol_data["strong_momentum"]:
-        reasons.append("Momentum de entrada 15m fuerte")
-        score_adjustment += 0.35
-
-    if vwap_data["above_vwap"] and abs(vwap_data["distance_pct"]) <= 2.5:
-        reasons.append(f"Precio no muy lejos del VWAP 15m ({vwap_data['distance_pct']:+.1f}%)")
-    elif vwap_data["above_vwap"] and vwap_data["distance_pct"] > 2.5:
-        reasons.append(f"Entrada estirada sobre VWAP 15m ({vwap_data['distance_pct']:+.1f}%)")
-        score_adjustment -= 0.5
-        timing_ok = False
-    else:
-        reasons.append(f"Precio bajo VWAP 15m ({vwap_data['distance_pct']:+.1f}%)")
-        score_adjustment -= 0.2
-
-    if distance_to_local_high_pct <= 0.45:
-        reasons.append(f"Muy cerca de micro-resistencia ({distance_to_local_high_pct:.2f}% del máximo local)")
-        score_adjustment -= 0.5
-        rank_adjustment -= 1.0
-        timing_ok = False
-    elif distance_to_local_high_pct <= 1.0:
-        reasons.append(f"Cerca del máximo local ({distance_to_local_high_pct:.2f}%)")
-        rank_adjustment -= 0.4
-
-    return {
-        "ok": timing_ok,
-        "rsi": round(rsi, 2),
-        "ema20": ema20,
-        "ema50": ema50,
-        "atr": atr,
-        "vwap": vwap_data["vwap"],
-        "vwap_distance_pct": vwap_data["distance_pct"],
-        "volume_divergence": vol_data["divergence"],
-        "volume_strong": vol_data["strong_momentum"],
-        "distance_to_local_high_pct": round(distance_to_local_high_pct, 2),
-        "score_adjustment": round(score_adjustment, 2),
-        "rank_adjustment": round(rank_adjustment, 2),
-        "reasons": reasons,
-    }
-
-
-# ── Integración multi-timeframe ───────────────────────────────────────────────
-def build_candidate(
-    symbol: str,
-    cg_id: str,
-    macro_eval: Dict[str, Any],
-    setup_eval: Dict[str, Any],
-    timing_eval: Dict[str, Any],
-) -> Dict[str, Any]:
-    candidate = dict(setup_eval)
-
-    score_adjustment = macro_eval["score_adjustment"] + timing_eval["score_adjustment"]
-    candidate["score"] = round(candidate["score"] + score_adjustment, 2)
-    candidate["rank_adjustment"] = round(macro_eval["rank_adjustment"] + timing_eval["rank_adjustment"], 2)
-
-    candidate["macro_ok"] = macro_eval["ok"]
-    candidate["timing_ok"] = timing_eval["ok"]
-    candidate["setup_ok"] = setup_eval["setup_ok"] and candidate["score"] >= MIN_SCORE
-    candidate["confirmations_passed"] = int(candidate["macro_ok"]) + int(candidate["setup_ok"]) + int(candidate["timing_ok"])
-    candidate["alert"] = candidate["confirmations_passed"] == 3
-
-    candidate["macro"] = macro_eval
-    candidate["timing"] = timing_eval
-
-    combined_reasons = list(setup_eval["reasons"])
-    combined_reasons.extend([f"1D: {text}" for text in macro_eval["reasons"]])
-    combined_reasons.extend([f"15m: {text}" for text in timing_eval["reasons"]])
-    candidate["reasons"] = combined_reasons
     candidate["setup_key"] = build_setup_key(candidate)
     candidate["setup_hash"] = build_setup_hash(candidate["setup_key"])
 
     print(
-        f"🔍 {symbol}: 1D={bool_icon(candidate['macro_ok'])}, "
-        f"4H={bool_icon(candidate['setup_ok'])}, "
-        f"15m={bool_icon(candidate['timing_ok'])}, "
-        f"score={candidate['score']:.2f}, rr={candidate['rr_ratio']:.2f}, alert={candidate['alert']}"
+        f"🔍 {symbol}: score={candidate['score']}, rr={candidate['rr_ratio']:.2f}, "
+        f"regime={candidate['regime']}, fib={candidate['fib_zone']}, alert={candidate['alert']}"
     )
     return candidate
 
 
-# ── Invalidación / deduplicación ──────────────────────────────────────────────
+# ── Invalidación / deduplicación ───────────────────────────────────────────────
 def invalidate_old_alerts(conn: sqlite3.Connection, candidate: Dict[str, Any]) -> None:
     rows = conn.execute(
         """
@@ -861,11 +508,7 @@ def invalidate_old_alerts(conn: sqlite3.Connection, candidate: Dict[str, Any]) -
     now_ts = int(time.time())
     for row in rows:
         reason = None
-        if not candidate.get("macro_ok", True):
-            reason = "Confirmación macro perdida"
-        elif not candidate.get("timing_ok", True):
-            reason = "Timing de entrada perdido"
-        elif candidate["regime"] != "BULL_STACK":
+        if candidate["regime"] != "BULL_STACK":
             reason = "Regimen perdido"
         elif candidate["entry_price"] <= float(row["stop_loss"]):
             reason = "Stop tecnico vulnerado"
@@ -998,256 +641,11 @@ def save_alert(conn: sqlite3.Connection, candidate: Dict[str, Any], improved_fro
     conn.commit()
 
 
-# ── Ranking y selección ───────────────────────────────────────────────────────
-def compute_rank_score(candidate: Dict[str, Any]) -> Tuple[float, List[str]]:
-    notes: List[str] = []
-    rank = 0.0
-
-    rank += candidate["score"] * 9.0
-    notes.append(f"score {candidate['score']:.2f}")
-
-    adx_component = min(candidate["adx"], 40.0) * 0.6
-    rank += adx_component
-    notes.append(f"adx {candidate['adx']:.1f}")
-
-    ideal_rsi = 57.0
-    rsi_alignment = max(0.0, 1.0 - abs(candidate["rsi"] - ideal_rsi) / 14.0)
-    rsi_component = rsi_alignment * 6.0
-    rank += rsi_component
-    notes.append(f"rsi-fit {rsi_component:.2f}")
-
-    rr_component = min(candidate["rr_ratio"], 3.2) * 2.2
-    rank += rr_component
-    notes.append(f"rr {candidate['rr_ratio']:.2f}")
-
-    fib_bonus_map = {
-        "OUTSIDE": -2.0,
-        "0.382-0.500": 0.8,
-        "0.500-0.618": 2.0,
-        "0.618-0.786": 1.5,
-    }
-    fib_component = fib_bonus_map.get(candidate["fib_zone"], 0.0)
-    rank += fib_component
-    notes.append(f"fib {candidate['fib_zone']}")
-
-    if candidate.get("bullish_cross"):
-        rank += 2.5
-        notes.append("cruce reciente")
-
-    risk_pct = max((candidate["entry_price"] - candidate["stop_loss"]) / max(candidate["entry_price"], 1e-9), 0.0)
-    if risk_pct < 0.006:
-        rank -= 1.5
-        notes.append("stop estrecho")
-    elif risk_pct < 0.01:
-        rank -= 0.5
-        notes.append("stop ajustado")
-
-    if candidate["symbol"] in {"BTC", "ETH"}:
-        rank += 1.25
-        notes.append("major")
-
-    if candidate.get("distance_to_swing_high_pct", 9.0) <= 0.8:
-        rank -= 1.2
-        notes.append("cerca swing high")
-
-    rank += float(candidate.get("rank_adjustment", 0.0))
-    if candidate.get("rank_adjustment", 0.0):
-        notes.append(f"ajuste macro/timing {candidate['rank_adjustment']:+.2f}")
-
-    if candidate.get("confirmations_passed", 0) < 3:
-        rank -= 50.0
-        notes.append("sin 3/3 confirmaciones")
-
-    return round(rank, 2), notes
-
-
-def rank_candidates(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    ranked: List[Dict[str, Any]] = []
-    for candidate in candidates:
-        clone = dict(candidate)
-        rank_score, rank_notes = compute_rank_score(clone)
-        clone["rank_score"] = rank_score
-        clone["rank_notes"] = rank_notes
-        ranked.append(clone)
-
-    ranked.sort(
-        key=lambda item: (
-            item["rank_score"],
-            item["score"],
-            item["adx"],
-            item["rr_ratio"],
-        ),
-        reverse=True,
-    )
-    return ranked
-
-
-def select_ranked_candidates(ranked: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    if not ENABLE_RANKING:
-        return ranked, []
-
-    selected: List[Dict[str, Any]] = []
-    deferred: List[Dict[str, Any]] = []
-    group_counts: Dict[str, int] = {}
-
-    for candidate in ranked:
-        group_name = candidate["asset_group"]
-        if len(selected) >= MAX_ALERTS_PER_RUN:
-            deferred.append(candidate)
-            continue
-        if group_counts.get(group_name, 0) >= MAX_ALERTS_PER_GROUP:
-            deferred.append(candidate)
-            continue
-
-        selected.append(candidate)
-        group_counts[group_name] = group_counts.get(group_name, 0) + 1
-
-    return selected, deferred
-
-
-
-def build_human_signal_summary(candidate: Dict[str, Any]) -> Dict[str, str]:
-    macro_eval = candidate.get("macro", {})
-    caution_level = str(macro_eval.get("caution_level", "NORMAL")).upper()
-    resistance_near = bool(macro_eval.get("long_resistance_near", False))
-    fast_exit_mode = bool(macro_eval.get("fast_exit_mode", False))
-    timing_points = float(candidate.get("timing", {}).get("points", 0.0))
-    final_score = float(candidate.get("score", 0.0))
-    adx = float(candidate.get("adx", 0.0))
-
-    if candidate.get("macro_ok") and candidate.get("setup_ok") and candidate.get("timing_ok"):
-        if final_score >= 8.0 and timing_points >= 4.0 and adx >= 25 and not resistance_near and caution_level not in {"HIGH", "EXTREME"}:
-            label = "COMPRA FUERTE"
-            reading = "El activo mantiene contexto favorable, setup sólido y timing aceptable."
-            recommendation = "Se puede considerar entrada, respetando stop y sin perseguir demasiado el precio."
-        elif final_score >= 6.8:
-            label = "COMPRA VÁLIDA"
-            reading = "La señal de compra está confirmada y el contexto técnico acompaña."
-            recommendation = "Entrada posible, idealmente sin perseguir demasiado el precio y respetando el stop."
-        else:
-            label = "COMPRA CON CAUTELA"
-            reading = "Hay señal de compra, pero con advertencias que justifican una ejecución prudente."
-            recommendation = "Se puede operar con cautela; mejor si confirma continuidad o aparece un pullback corto."
-    elif candidate.get("macro_ok") and candidate.get("setup_ok") and not candidate.get("timing_ok"):
-        label = "SEÑAL DE COMPRA, PERO DÉBIL"
-        reading = "El contexto y el setup acompañan, pero el momento de entrada aún no convence."
-        recommendation = "No entrar todavía. Esperar que el 15m confirme mejor o que el precio mejore la entrada."
-    elif not candidate.get("macro_ok") and candidate.get("setup_ok"):
-        label = "SETUP ALCISTA, PERO CONTRA MACRO"
-        reading = "La estructura operativa existe, pero el contexto diario no acompaña."
-        recommendation = "Solo vigilar. Evitar longs agresivos mientras el diario no mejore."
-    elif candidate.get("macro_ok") and not candidate.get("setup_ok"):
-        label = "AÚN NO HAY SETUP OPERABLE"
-        reading = "El contexto permite longs, pero el 4H todavía no confirma una oportunidad limpia."
-        recommendation = "Esperar a que el 4H reconstruya mejor la estructura antes de operar."
-    else:
-        label = "DESCARTAR"
-        reading = "La señal no tiene suficiente respaldo entre contexto, setup y timing."
-        recommendation = "No operar este activo por ahora."
-
-    if not candidate.get("timing_ok"):
-        main_risk = "El timing de entrada sigue flojo y podrías entrar tarde o con poco impulso."
-    elif not candidate.get("macro_ok"):
-        main_risk = "El contexto diario no acompaña y el precio puede rechazar aunque el 4H luzca bien."
-    elif resistance_near:
-        main_risk = "Hay resistencia macro cerca y el precio podría frenarse antes de desarrollar el movimiento."
-    elif candidate.get("volume_divergence"):
-        main_risk = "El impulso muestra divergencia y aumenta la probabilidad de retroceso."
-    elif float(candidate.get("distance_to_swing_high_pct", 9.0)) <= 0.8:
-        main_risk = "El precio está muy cerca del swing high reciente y puede reaccionar allí."
-    elif fast_exit_mode:
-        main_risk = "El escenario exige gestión táctica; la posición no debería darse mucho espacio."
-    else:
-        main_risk = "El riesgo técnico parece controlado mientras respete el stop."
-
-    return {
-        "label": label,
-        "reading": reading,
-        "main_risk": main_risk,
-        "recommendation": recommendation,
-    }
-
-
-def sort_watch_candidates(watch_candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    ranked = []
-    for candidate in watch_candidates:
-        clone = dict(candidate)
-        clone["human_summary"] = build_human_signal_summary(clone)
-        clone["watch_priority"] = round(
-            float(clone.get("setup_score", clone.get("score", 0.0))) * 2.0
-            + float(clone.get("score", 0.0))
-            + (1.0 if clone.get("macro_ok") else 0.0)
-            + (0.5 if clone.get("timing_ok") else 0.0)
-            + min(float(clone.get("adx", 0.0)), 30.0) * 0.05,
-            2,
-        )
-        ranked.append(clone)
-
-    ranked.sort(
-        key=lambda item: (
-            item.get("watch_priority", 0.0),
-            item.get("setup_score", item.get("score", 0.0)),
-            item.get("score", 0.0),
-            item.get("adx", 0.0),
-        ),
-        reverse=True,
-    )
-    return ranked
-
-
-# ── Formato de mensajes ───────────────────────────────────────────────────────
 def format_message(candidate: Dict[str, Any], decision_reason: str) -> str:
     esc = html.escape
-    human = build_human_signal_summary(candidate)
     reasons_text = esc(", ".join(candidate["reasons"]))
-    rank_line = ""
-    if ENABLE_RANKING:
-        rank_line = (
-            f"🏅 <b>Prioridad:</b> {candidate['rank_score']:.2f}"
-            f" | Grupo: {esc(candidate['asset_group'])}\n"
-        )
-
-    vwap_dist = candidate.get("vwap_distance_pct", 0.0)
-    vwap_icon = "🟢" if candidate.get("above_vwap") and abs(vwap_dist) <= 1.5 else ("🟡" if abs(vwap_dist) <= 3.5 else "🔴")
-    vwap_label = f"{'+' if vwap_dist >= 0 else ''}{vwap_dist:.1f}% vs VWAP ${candidate.get('vwap', 0):.4f}"
-
-    if candidate.get("volume_divergence"):
-        vol_label = "⚠️ Divergencia (sube precio, cae momentum)"
-    elif candidate.get("volume_strong"):
-        vol_label = "✅ Momentum fuerte"
-    else:
-        vol_label = "➖ Momentum neutral"
-
-    macro_eval = candidate.get("macro", {})
-    timing_eval = candidate.get("timing", {})
-    macro_line = (
-        f"🌐 <b>Macro 1D:</b> {bool_icon(candidate['macro_ok'])} | "
-        f"{esc(macro_eval.get('macro_regime', 'UNSPECIFIED'))} | "
-        f"sesgo {esc(macro_eval.get('macro_bias', 'UNSPECIFIED'))}\n"
-    )
-    timing_line = (
-        f"🎯 <b>Timing 15m:</b> {bool_icon(candidate['timing_ok'])} | "
-        f"RSI {timing_eval.get('rsi', 0):.2f} | "
-        f"VWAP {timing_eval.get('vwap_distance_pct', 0):+.1f}%\n"
-    )
-    setup_line = f"⚙️ <b>Setup 4H:</b> {bool_icon(candidate['setup_ok'])} | confirmaciones {candidate['confirmations_passed']}/3\n"
-
-    caution_line = ""
-    if macro_eval.get("caution_level"):
-        caution_line += f"⚠️ <b>Cautela:</b> {esc(str(macro_eval['caution_level']))}\n"
-    if macro_eval.get("long_resistance_label"):
-        caution_line += f"🚧 <b>Resistencia mayor:</b> {esc(macro_eval['long_resistance_label'])}\n"
-    if macro_eval.get("fast_exit_mode"):
-        caution_line += "🏃 <b>Gestión:</b> salida rápida\n"
-    if macro_eval.get("note"):
-        caution_line += f"📝 <b>Nota macro:</b> {esc(macro_eval['note'])}\n"
-
     return (
-        f"🚀 <b>ALERTA COMPRA: {esc(candidate['symbol'])}</b>\n"
-        f"🗣️ <b>Lectura:</b> {esc(human['label'])}\n\n"
-        f"📌 <b>Resumen:</b> {esc(human['reading'])}\n"
-        f"⚠️ <b>Riesgo principal:</b> {esc(human['main_risk'])}\n"
-        f"✅ <b>Recomendación:</b> {esc(human['recommendation'])}\n\n"
+        f"🚀 <b>ALERTA COMPRA: {esc(candidate['symbol'])}</b>\n\n"
         f"⏱️ <b>Timeframe:</b> {esc(candidate['timeframe'])}\n"
         f"💰 <b>Precio:</b> ${candidate['entry_price']:.4f}\n"
         f"📊 <b>Score:</b> {candidate['score']:.2f}\n"
@@ -1257,219 +655,48 @@ def format_message(candidate: Dict[str, Any], decision_reason: str) -> str:
         f"🧩 <b>Fib:</b> {esc(candidate['fib_zone'])}\n"
         f"⚖️ <b>R:R:</b> {candidate['rr_ratio']:.2f}\n"
         f"🎯 <b>TARGET (TP):</b> ${candidate['take_profit']:.4f}\n"
-        f"🛑 <b>STOP (SL):</b> ${candidate['stop_loss']:.4f}\n"
-        f"{vwap_icon} <b>VWAP:</b> {esc(vwap_label)}\n"
-        f"📦 <b>Volumen:</b> {esc(vol_label)}\n"
-        f"{macro_line}"
-        f"{setup_line}"
-        f"{timing_line}"
-        f"{rank_line}"
-        f"{caution_line}\n"
+        f"🛑 <b>STOP (SL):</b> ${candidate['stop_loss']:.4f}\n\n"
         f"📝 <b>Análisis:</b> {reasons_text}\n"
         f"🧠 <b>Motivo de envío:</b> {esc(decision_reason)}"
     )
 
-def format_run_summary(
-    selected: List[Dict[str, Any]],
-    deferred: List[Dict[str, Any]],
-    blocked: List[str],
-    total_ready: int,
-    watch_candidates: Optional[List[Dict[str, Any]]] = None,
-) -> str:
-    esc = html.escape
-    lines = []
-
-    # ── Encabezado: estado del mercado en esta corrida ────────────────────────
-    scanned = len(CRYPTO_IDS)
-    watch_count = len(watch_candidates) if watch_candidates else 0
-
-    if total_ready >= 3:
-        market_pulse = "Mercado activo — múltiples setups válidos"
-        pulse_icon = "🟢"
-    elif total_ready >= 1:
-        market_pulse = "Mercado selectivo — pocas oportunidades"
-        pulse_icon = "🟡"
-    elif watch_count >= 3:
-        market_pulse = "Sin señales completas — varios activos en vigilancia"
-        pulse_icon = "🟠"
-    else:
-        market_pulse = "Mercado sin oportunidades claras"
-        pulse_icon = "🔴"
-
-    lines.append(f"{pulse_icon} <b>{esc(market_pulse)}</b>")
-    lines.append(f"<i>Escaneados: {scanned} | Señales 3/3: {total_ready} | En vigilancia: {watch_count}</i>")
-
-    # ── Alertas enviadas ──────────────────────────────────────────────────────
-    if selected:
-        lines.append("")
-        lines.append("🚀 <b>Alertas enviadas:</b>")
-        for item in selected:
-            human = build_human_signal_summary(item)
-            mode_icon = "🟢" if human["modo"] == "normal" else "🟡"
-            lines.append(
-                f"  {mode_icon} <b>{esc(item['symbol'])}</b> — {esc(human['label'])}\n"
-                f"     {esc(human['main_risk'])}"
-            )
-
-    # ── Vigilancia táctica: los más cerca de completar señal ─────────────────
-    if watch_candidates:
-        lines.append("")
-        lines.append("👀 <b>Vigilancia táctica:</b>")
-        for item in watch_candidates[:4]:
-            macro_ok = bool(item.get("macro_ok"))
-            setup_ok = bool(item.get("setup_ok"))
-            timing_ok = bool(item.get("timing_ok"))
-            confirmations = int(item.get("confirmations_passed", 0))
-            # Identificar qué falta
-            missing = []
-            if not macro_ok:
-                missing.append("1D")
-            if not setup_ok:
-                missing.append("4H")
-            if not timing_ok:
-                missing.append("15m")
-            missing_str = ", ".join(missing) if missing else "—"
-            score = item.get("setup_score", item.get("score", 0.0))
-            lines.append(
-                f"  • <b>{esc(item['symbol'])}</b> {confirmations}/3 "
-                f"| falta: {esc(missing_str)} "
-                f"| score 4H {score:.1f} "
-                f"| ADX {item.get('adx', 0):.0f}"
-            )
-
-    # ── Diferidas por límite de ranking ──────────────────────────────────────
-    if deferred:
-        lines.append("")
-        lines.append("⏸️ <b>Válidas pero no enviadas (límite de corrida):</b>")
-        for item in deferred[:4]:
-            human = build_human_signal_summary(item)
-            lines.append(
-                f"  • <b>{esc(item['symbol'])}</b> — {esc(human['label'])} "
-                f"| próxima corrida"
-            )
-
-    # ── Descartadas: solo si hay algo informativo que decir ──────────────────
-    # Filtra mensajes puramente técnicos (datos insuficientes, cooldown) y
-    # muestra solo los que revelan algo sobre el estado del mercado
-    informative_blocked = [
-        b for b in blocked
-        if any(kw in b for kw in ["macro", "1D=", "4H=", "15m=", "confirmaciones"])
-    ]
-    if informative_blocked:
-        lines.append("")
-        lines.append("📉 <b>Activos descartados:</b>")
-        for text in informative_blocked[:6]:
-            lines.append(f"  • {esc(text)}")
-
-    return "\n".join(lines)
-
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main ───────────────────────────────────────────────────────────────────────
 def main() -> None:
     start = time.time()
     conn = get_db_connection(DB_FILE)
     init_db(conn)
     import_legacy_state_if_needed(conn)
-    market_context = load_market_context(MARKET_CONTEXT_FILE)
 
     print(f"🚀 Iniciando escaneo de {len(CRYPTO_IDS)} activos...")
     sent_count = 0
-    total_ready = 0
-    ready_candidates: List[Dict[str, Any]] = []
-    watch_candidates: List[Dict[str, Any]] = []
-    blocked_messages: List[str] = []
 
     for cg_id, symbol in CRYPTO_IDS.items():
-        daily_prices = get_market_prices(cg_id, DAILY_LOOKBACK_DAYS, interval=None)
-        fourh_prices = get_market_prices(cg_id, HOURLY_LOOKBACK_DAYS, interval=HOURLY_INTERVAL)
-        intraday_prices = get_market_prices(cg_id, INTRADAY_LOOKBACK_DAYS, interval=None)
-
-        daily_df = build_ohlc_from_prices(daily_prices, "1D", 220) if daily_prices is not None else None
-        fourh_df = build_ohlc_from_prices(fourh_prices, TRADING_TIMEFRAME, 220) if fourh_prices is not None else None
-        entry_df = build_ohlc_from_prices(intraday_prices, ENTRY_TIMEFRAME, 60) if intraday_prices is not None else None
-
-        if daily_df is None or fourh_df is None or entry_df is None:
-            blocked_messages.append(f"{symbol}: datos insuficientes para 1D/4H/15m")
+        price_df = get_hourly_prices(cg_id)
+        ohlc_df = build_ohlc_from_hourly(price_df) if price_df is not None else None
+        if ohlc_df is None:
             time.sleep(SLEEP_BETWEEN_ASSETS)
             continue
 
-        normalized_context = normalize_context(market_context, symbol)
-        macro_eval = evaluate_macro_confirmation(daily_df, symbol, normalized_context)
-        setup_eval = evaluate_setup_confirmation(fourh_df, symbol, cg_id)
-        timing_eval = evaluate_timing_confirmation(entry_df, symbol)
-
-        if not macro_eval or not setup_eval or not timing_eval:
-            blocked_messages.append(f"{symbol}: no se pudo evaluar alguna confirmación")
+        candidate = evaluate(ohlc_df, symbol, cg_id)
+        if not candidate or not candidate["alert"]:
+            if candidate:
+                invalidate_old_alerts(conn, candidate)
             time.sleep(SLEEP_BETWEEN_ASSETS)
             continue
 
-        candidate = build_candidate(symbol, cg_id, macro_eval, setup_eval, timing_eval)
         invalidate_old_alerts(conn, candidate)
-
-        if not candidate["alert"]:
-            reason = f"{symbol}: confirmaciones {candidate['confirmations_passed']}/3"
-            blocked_messages.append(reason)
-            if candidate.get("macro_ok") or candidate.get("setup_ok"):
-                watch_candidates.append(candidate)
-            time.sleep(SLEEP_BETWEEN_ASSETS)
-            continue
-
-        total_ready += 1
         should_send, improved_from_alert_id, decision_reason = should_send_alert(conn, candidate)
         if should_send:
-            candidate["improved_from_alert_id"] = improved_from_alert_id
-            candidate["decision_reason"] = decision_reason
-            ready_candidates.append(candidate)
+            sent_ok = send_telegram(format_message(candidate, decision_reason))
+            if sent_ok:
+                save_alert(conn, candidate, improved_from_alert_id)
+                sent_count += 1
+            else:
+                print(f"⚠️ {symbol}: alerta no guardada porque Telegram no confirmó el envío.")
         else:
-            blocked_message = f"{symbol}: {decision_reason}"
-            blocked_messages.append(blocked_message)
             print(f"⏳ {symbol}: omitida. {decision_reason}.")
 
         time.sleep(SLEEP_BETWEEN_ASSETS)
-
-    ranked_candidates = rank_candidates(ready_candidates) if ready_candidates else []
-    sorted_watch_candidates = sort_watch_candidates(watch_candidates) if watch_candidates else []
-    if ranked_candidates:
-        print("🏅 Ranking interno:")
-        for idx, item in enumerate(ranked_candidates, start=1):
-            print(
-                f"   {idx}. {item['symbol']} | prioridad={item['rank_score']:.2f} | "
-                f"grupo={item['asset_group']} | 3/3 | score={item['score']:.2f}"
-            )
-
-    selected_candidates, deferred_candidates = select_ranked_candidates(ranked_candidates)
-
-    for item in deferred_candidates:
-        print(
-            f"⏸️ {item['symbol']}: diferida por ranking/diversificación. "
-            f"prioridad={item['rank_score']:.2f}, grupo={item['asset_group']}"
-        )
-
-    if sorted_watch_candidates:
-        print("👀 Vigilancia táctica:")
-        for item in sorted_watch_candidates[:5]:
-            human = item.get("human_summary") or build_human_signal_summary(item)
-            print(f"   - {item['symbol']}: {human['label']}")
-
-    for candidate in selected_candidates:
-        sent_ok = send_telegram(format_message(candidate, candidate["decision_reason"]))
-        if sent_ok:
-            save_alert(conn, candidate, candidate.get("improved_from_alert_id"))
-            sent_count += 1
-        else:
-            print(f"⚠️ {candidate['symbol']}: alerta no guardada porque Telegram no confirmó el envío.")
-
-    if SEND_RUN_SUMMARY and (selected_candidates or deferred_candidates or blocked_messages):
-        summary_sent = send_telegram(
-            format_run_summary(
-                selected_candidates,
-                deferred_candidates,
-                blocked_messages,
-                total_ready,
-                sorted_watch_candidates,
-            )
-        )
-        if not summary_sent:
-            print("⚠️ No se pudo enviar el resumen de ejecución.")
 
     duration = round(time.time() - start, 1)
     print(f"🏁 Fin del escaneo. Alertas enviadas: {sent_count}. Duración: {duration}s")

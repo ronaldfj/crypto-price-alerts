@@ -231,6 +231,23 @@ def load_market_context(path: str = MARKET_CONTEXT_FILE) -> Dict[str, Any]:
         return {}
 
 
+def fetch_btc_dominance() -> Optional[float]:
+    """Obtiene dominancia de BTC desde /global. Alta (>58%) penaliza altcoins,
+    baja (<44%) les da viento de cola por rotación de capital."""
+    url = "https://api.coingecko.com/api/v3/global"
+    headers = {"accept": "application/json"}
+    if CG_API_KEY:
+        headers["x-cg-demo-api-key"] = CG_API_KEY
+    try:
+        r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            pct = r.json().get("data", {}).get("market_cap_percentage", {}).get("btc")
+            return round(float(pct), 1) if pct else None
+    except Exception:
+        pass
+    return None
+
+
 def normalize_context(context: Dict[str, Any], symbol: str) -> Dict[str, Any]:
     merged: Dict[str, Any] = {}
     global_ctx = context.get("GLOBAL", {})
@@ -260,40 +277,20 @@ def get_market_prices(cg_id: str, days: int, interval: Optional[str] = None) -> 
     try:
         response = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
         if response.status_code != 200:
-            print(f"⚠️ {cg_id}: CoinGecko respondió {response.status_code}")
+            print(f"⚠️ {cg_id}: CoinGecko respondió {response.status_code}: {response.text[:180]}")
             return None
 
         payload = response.json()
-        prices = payload.get("prices", [])
-        volumes = payload.get("total_volumes", [])
-
+        prices = payload.get("prices", []) if isinstance(payload, dict) else []
         if len(prices) < 50:
             print(f"⚠️ {cg_id}: datos insuficientes ({len(prices)} puntos).")
             return None
 
-        price_df = pd.DataFrame(prices, columns=["ts", "price"])
-        price_df["price"] = pd.to_numeric(price_df["price"], errors="coerce")
-        price_df["ts"] = pd.to_datetime(price_df["ts"], unit="ms", utc=True)
-
-        df = price_df.dropna().sort_values("ts").reset_index(drop=True)
-
-        # Incorporar volumen real si tiene cobertura suficiente.
-        # Los arrays vienen alineados en el mismo payload — tolerance de 5min
-        # es más honesta que 1h para no mezclar puntos de horas distintas.
-        if volumes and len(volumes) >= len(prices) * 0.85:
-            vol_df = pd.DataFrame(volumes, columns=["ts", "volume"])
-            vol_df["volume"] = pd.to_numeric(vol_df["volume"], errors="coerce")
-            vol_df["ts"] = pd.to_datetime(vol_df["ts"], unit="ms", utc=True)
-            vol_df = vol_df.dropna().sort_values("ts").reset_index(drop=True)
-            df = pd.merge_asof(
-                df, vol_df, on="ts", direction="nearest", tolerance=pd.Timedelta("5min")
-            )
-
-        # Indexar por timestamp para que build_ohlc_from_prices pueda resamplear
-        # directamente sin necesitar un set_index posterior.
-        df = df.set_index("ts")
+        df = pd.DataFrame(prices, columns=["ts", "price"])
+        df["price"] = pd.to_numeric(df["price"], errors="coerce")
+        df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+        df = df.dropna().sort_values("ts").drop_duplicates(subset=["ts"]).reset_index(drop=True)
         return df
-
     except Exception as exc:
         print(f"❌ Error obteniendo datos para {cg_id}: {exc}")
         return None
@@ -303,24 +300,16 @@ def build_ohlc_from_prices(price_df: pd.DataFrame, timeframe: str, min_candles: 
     if price_df is None or price_df.empty:
         return None
 
-    # price_df ya viene con índice de timestamp desde get_market_prices.
-    # Resamplear directamente evita el set_index intermedio y garantiza que
-    # el volumen se alinee correctamente antes de cualquier dropna.
-    ohlc = price_df["price"].resample(timeframe, label="right", closed="right").ohlc()
+    df = price_df.copy().set_index("ts")
+    ohlc = df["price"].resample(timeframe, label="right", closed="right").ohlc()
     ohlc.columns = ["Open", "High", "Low", "Close"]
-
-    if "volume" in price_df.columns:
-        vol_resampled = price_df["volume"].resample(timeframe, label="right", closed="right").sum()
-        ohlc = ohlc.join(vol_resampled.rename("Volume"))
-    else:
-        ohlc["Volume"] = float("nan")
-
-    ohlc = ohlc.dropna(subset=["Open", "High", "Low", "Close"]).reset_index()
+    ohlc = ohlc.dropna().reset_index()
 
     if len(ohlc) <= min_candles:
         print(f"⚠️ OHLC insuficiente ({len(ohlc)} velas {timeframe}).")
         return None
 
+    # Solo velas cerradas.
     closed = ohlc.iloc[:-1].reset_index(drop=True)
     if len(closed) < min_candles:
         print(f"⚠️ Velas cerradas insuficientes ({len(closed)} velas {timeframe}).")
@@ -421,19 +410,44 @@ def compute_vwap_proximity(df: pd.DataFrame, lookback: int = 20) -> Dict[str, An
 
 
 def compute_volume_momentum(df: pd.DataFrame, lookback: int = 10) -> Dict[str, Any]:
+    """
+    Usa volumen real (USD) si la columna Volume está disponible y tiene
+    cobertura suficiente. Cae al proxy de rango de vela si no.
+    Indica la fuente usada para transparencia en la alerta.
+    """
     recent = df.tail(lookback).copy()
-    candle_range = recent["High"] - recent["Low"]
-    avg_range = float(candle_range.mean())
-    last_3_avg = float(candle_range.tail(3).mean())
-    relative_volume = last_3_avg / max(avg_range, 1e-9)
 
-    price_up = float(recent.iloc[-1]["Close"]) > float(recent.iloc[-3]["Close"])
-    range_declining = last_3_avg < avg_range * 0.85
+    has_real_volume = (
+        "Volume" in recent.columns
+        and recent["Volume"].notna().sum() >= max(4, len(recent) // 2)
+    )
+
+    if has_real_volume:
+        vol_series = recent["Volume"].fillna(0.0)
+        avg_vol = float(vol_series.mean())
+        last_3_avg = float(vol_series.tail(3).mean())
+        volume_source = "real"
+    else:
+        vol_series = recent["High"] - recent["Low"]
+        avg_vol = float(vol_series.mean())
+        last_3_avg = float(vol_series.tail(3).mean())
+        volume_source = "proxy"
+
+    relative_volume = last_3_avg / max(avg_vol, 1e-9)
+
+    # Requiere al menos 4 velas para comparación de precio válida
+    if len(recent) >= 4:
+        price_up = float(recent.iloc[-1]["Close"]) > float(recent.iloc[-4]["Close"])
+    else:
+        price_up = False
+
+    vol_declining = last_3_avg < avg_vol * 0.85
 
     return {
         "relative_volume": round(relative_volume, 2),
-        "divergence": price_up and range_declining,
+        "divergence": price_up and vol_declining,
         "strong_momentum": relative_volume >= 1.15,
+        "volume_source": volume_source,
     }
 
 
@@ -571,8 +585,24 @@ def evaluate_macro_confirmation(daily_df: pd.DataFrame, symbol: str, context: Di
     if long_resistance_near:
         adjustments["rank"] -= 2.0
 
+    # ── BTC Dominance: penaliza altcoins en ciclo BTC, premia en rotación ────
+    btc_dominance = context.get("btc_dominance")
+    dominance_note = ""
+    if btc_dominance is not None and symbol != "BTC":
+        if btc_dominance >= 58:
+            adjustments["score"] -= 0.5
+            adjustments["rank"] -= 2.0
+            dominance_note = f"BTC dominance alta ({btc_dominance:.1f}%) — altcoins rezagadas"
+            reasons.append(dominance_note)
+        elif btc_dominance <= 44:
+            adjustments["score"] += 0.3
+            dominance_note = f"BTC dominance baja ({btc_dominance:.1f}%) — rotación a altcoins"
+            reasons.append(dominance_note)
+
     return {
         "ok": macro_ok,
+        "btc_dominance": btc_dominance,
+        "dominance_note": dominance_note,
         "regime": regime,
         "rsi": round(rsi, 2),
         "adx": round(adx, 2),
@@ -695,11 +725,27 @@ def evaluate_setup_confirmation(fourh_df: pd.DataFrame, symbol: str, cg_id: str)
         score -= 0.60
         reasons.append(f"Precio cerca de resistencia ({distance_to_swing_high_pct:.2f}% del swing high)")
 
-    stop_loss = max(fib["swing_low"], close - (atr * 1.8))
+    # ── Stop dinámico ────────────────────────────────────────────────────────
+    # Si el swing_low está más de 4 ATR lejos (mercado en rango amplio),
+    # usar solo ATR para no arriesgar de más en un stop demasiado distante.
+    atr_stop = close - (atr * 1.8)
+    structure_stop = fib["swing_low"]
+    stop_loss = atr_stop if (close - structure_stop) > atr * 4.0 else max(structure_stop, atr_stop)
     if stop_loss >= close:
         stop_loss = close - max(atr * 1.5, close * 0.01)
-    take_profit = close + max((close - stop_loss) * 2.4, atr * 2.8)
-    rr_ratio = (take_profit - close) / max(close - stop_loss, 1e-9)
+
+    risk = max(close - stop_loss, 1e-9)
+
+    # ── Múltiples targets ────────────────────────────────────────────────────
+    # TP1 en 1:2 — zona de parciales para asegurar la posición
+    # TP2 en 1:4 o extensión Fib 1.272, lo más cercano
+    tp1 = close + risk * 2.0
+    tp2_rr = close + risk * 4.0
+    tp2_fib = fib["swing_high"] + (fib["swing_high"] - fib["swing_low"]) * 0.272
+    tp2 = min(tp2_rr, tp2_fib) if tp2_fib > close else tp2_rr
+
+    take_profit = tp2
+    rr_ratio = (take_profit - close) / risk
 
     setup_ok = (
         regime == "BULL_STACK"
@@ -723,6 +769,8 @@ def evaluate_setup_confirmation(fourh_df: pd.DataFrame, symbol: str, cg_id: str)
         "entry_price": close,
         "stop_loss": float(stop_loss),
         "take_profit": float(take_profit),
+        "tp1": float(tp1),
+        "tp2": float(tp2),
         "rr_ratio": float(rr_ratio),
         "score": round(score, 2),
         "adx": round(adx, 2),
@@ -1360,6 +1408,11 @@ def main() -> None:
     init_db(conn)
     import_legacy_state_if_needed(conn)
     market_context = load_market_context(MARKET_CONTEXT_FILE)
+    btc_dominance = fetch_btc_dominance()
+    if btc_dominance is not None:
+        print(f"📊 BTC Dominance: {btc_dominance:.1f}%")
+    else:
+        print("⚠️ BTC Dominance no disponible — se omite del análisis macro.")
 
     print(f"🚀 Iniciando escaneo de {len(CRYPTO_IDS)} activos...")
     sent_count = 0
@@ -1383,6 +1436,8 @@ def main() -> None:
             continue
 
         normalized_context = normalize_context(market_context, symbol)
+        if btc_dominance is not None:
+            normalized_context["btc_dominance"] = btc_dominance
         macro_eval = evaluate_macro_confirmation(daily_df, symbol, normalized_context)
         setup_eval = evaluate_setup_confirmation(fourh_df, symbol, cg_id)
         timing_eval = evaluate_timing_confirmation(entry_df, symbol)

@@ -1107,125 +1107,64 @@ def select_ranked_candidates(ranked: List[Dict[str, Any]]) -> Tuple[List[Dict[st
 
 
 def build_human_signal_summary(candidate: Dict[str, Any]) -> Dict[str, str]:
-    """
-    Genera un veredicto táctico específico basado en la combinación real de señales.
-    El objetivo es que en 5 segundos sepas: qué hacer, cómo gestionarlo y por qué.
-    """
     macro_eval = candidate.get("macro", {})
-    timing_eval = candidate.get("timing", {})
     caution_level = str(macro_eval.get("caution_level", "NORMAL")).upper()
     resistance_near = bool(macro_eval.get("long_resistance_near", False))
     fast_exit_mode = bool(macro_eval.get("fast_exit_mode", False))
-    timing_points = float(timing_eval.get("points", 0.0))
+    timing_points = float(candidate.get("timing", {}).get("points", 0.0))
     final_score = float(candidate.get("score", 0.0))
     adx = float(candidate.get("adx", 0.0))
-    rsi = float(candidate.get("rsi", 50.0))
-    fib_zone = candidate.get("fib_zone", "OUTSIDE")
-    vwap_dist = float(candidate.get("vwap_distance_pct", 0.0))
-    vol_divergence = bool(candidate.get("volume_divergence", False))
-    dist_swing_high = float(candidate.get("distance_to_swing_high_pct", 9.0))
-    macro_ok = bool(candidate.get("macro_ok"))
-    setup_ok = bool(candidate.get("setup_ok"))
-    timing_ok = bool(candidate.get("timing_ok"))
 
-    # ── Contar señales de calidad y señales de alerta ─────────────────────────
-    quality_flags = sum([
-        final_score >= 8.0,
-        adx >= 28,
-        timing_points >= 4.0,
-        fib_zone in {"0.500-0.618", "0.618-0.786"},
-        abs(vwap_dist) <= 1.5,
-        not vol_divergence,
-        not resistance_near,
-        caution_level in {"LOW", "NORMAL"},
-    ])
-    warning_flags = sum([
-        vol_divergence,
-        resistance_near,
-        dist_swing_high <= 1.5,
-        vwap_dist > 3.5,
-        caution_level in {"HIGH", "EXTREME"},
-        fast_exit_mode,
-        rsi >= 68,
-        fib_zone == "OUTSIDE",
-    ])
-
-    # ── Determinar label y modo de gestión ───────────────────────────────────
-    if not (macro_ok and setup_ok and timing_ok):
-        # No cumple 3/3 — no debería llegar aquí, pero cubrimos el caso
-        label = "NO OPERAR"
-        modo = "fuera"
-    elif quality_flags >= 6 and warning_flags == 0:
-        label = "ENTRADA LIMPIA"
-        modo = "normal"
-    elif quality_flags >= 4 and warning_flags <= 1:
-        label = "ENTRADA VÁLIDA"
-        modo = "normal"
-    elif warning_flags >= 3 or caution_level == "EXTREME":
-        label = "ENTRADA DE ALTO RIESGO"
-        modo = "rapido"
-    elif fast_exit_mode or resistance_near or caution_level == "HIGH":
-        label = "ENTRADA CON CAUTELA"
-        modo = "rapido"
+    if candidate.get("macro_ok") and candidate.get("setup_ok") and candidate.get("timing_ok"):
+        if final_score >= 8.0 and timing_points >= 4.0 and adx >= 25 and not resistance_near and caution_level not in {"HIGH", "EXTREME"}:
+            label = "COMPRA FUERTE"
+            reading = "El activo mantiene contexto favorable, setup sólido y timing aceptable."
+            recommendation = "Se puede considerar entrada, respetando stop y sin perseguir demasiado el precio."
+        elif final_score >= 6.8:
+            label = "COMPRA VÁLIDA"
+            reading = "La señal de compra está confirmada y el contexto técnico acompaña."
+            recommendation = "Entrada posible, idealmente sin perseguir demasiado el precio y respetando el stop."
+        else:
+            label = "COMPRA CON CAUTELA"
+            reading = "Hay señal de compra, pero con advertencias que justifican una ejecución prudente."
+            recommendation = "Se puede operar con cautela; mejor si confirma continuidad o aparece un pullback corto."
+    elif candidate.get("macro_ok") and candidate.get("setup_ok") and not candidate.get("timing_ok"):
+        label = "SEÑAL DE COMPRA, PERO DÉBIL"
+        reading = "El contexto y el setup acompañan, pero el momento de entrada aún no convence."
+        recommendation = "No entrar todavía. Esperar que el 15m confirme mejor o que el precio mejore la entrada."
+    elif not candidate.get("macro_ok") and candidate.get("setup_ok"):
+        label = "SETUP ALCISTA, PERO CONTRA MACRO"
+        reading = "La estructura operativa existe, pero el contexto diario no acompaña."
+        recommendation = "Solo vigilar. Evitar longs agresivos mientras el diario no mejore."
+    elif candidate.get("macro_ok") and not candidate.get("setup_ok"):
+        label = "AÚN NO HAY SETUP OPERABLE"
+        reading = "El contexto permite longs, pero el 4H todavía no confirma una oportunidad limpia."
+        recommendation = "Esperar a que el 4H reconstruya mejor la estructura antes de operar."
     else:
-        label = "ENTRADA MODERADA"
-        modo = "normal"
+        label = "DESCARTAR"
+        reading = "La señal no tiene suficiente respaldo entre contexto, setup y timing."
+        recommendation = "No operar este activo por ahora."
 
-    # ── Construir la frase táctica específica ────────────────────────────────
-    # Identifica el factor dominante positivo
-    if fib_zone in {"0.500-0.618", "0.618-0.786"} and abs(vwap_dist) <= 1.5:
-        contexto_positivo = f"precio en zona Fib {fib_zone} cerca del VWAP"
-    elif fib_zone in {"0.500-0.618", "0.618-0.786"}:
-        contexto_positivo = f"retroceso limpio a zona Fib {fib_zone}"
-    elif abs(vwap_dist) <= 1.5:
-        contexto_positivo = "precio pegado al VWAP, zona de valor institucional"
-    elif adx >= 28:
-        contexto_positivo = f"tendencia definida (ADX {adx:.0f})"
-    else:
-        contexto_positivo = "estructura alcista confirmada en los tres marcos"
-
-    # Identifica el factor de riesgo dominante
-    if vol_divergence and dist_swing_high <= 1.5:
-        riesgo_dominante = "divergencia de volumen Y cerca de resistencia — doble freno"
-    elif vol_divergence:
-        riesgo_dominante = "precio sube pero el momentum cae — posible trampa"
-    elif dist_swing_high <= 0.8:
-        riesgo_dominante = f"a solo {dist_swing_high:.1f}% del swing high — puede rebotar"
+    if not candidate.get("timing_ok"):
+        main_risk = "El timing de entrada sigue flojo y podrías entrar tarde o con poco impulso."
+    elif not candidate.get("macro_ok"):
+        main_risk = "El contexto diario no acompaña y el precio puede rechazar aunque el 4H luzca bien."
     elif resistance_near:
-        riesgo_dominante = f"resistencia macro cerca ({macro_eval.get('long_resistance_label', 'nivel mayor')})"
-    elif vwap_dist > 3.5:
-        riesgo_dominante = f"precio estirado +{vwap_dist:.1f}% sobre VWAP — esperar pullback"
-    elif rsi >= 68:
-        riesgo_dominante = f"RSI en {rsi:.0f} — momentum sobrecomprado en 4H"
-    elif caution_level in {"HIGH", "EXTREME"}:
-        riesgo_dominante = "contexto macro en cautela alta — tamaño reducido"
+        main_risk = "Hay resistencia macro cerca y el precio podría frenarse antes de desarrollar el movimiento."
+    elif candidate.get("volume_divergence"):
+        main_risk = "El impulso muestra divergencia y aumenta la probabilidad de retroceso."
+    elif float(candidate.get("distance_to_swing_high_pct", 9.0)) <= 0.8:
+        main_risk = "El precio está muy cerca del swing high reciente y puede reaccionar allí."
+    elif fast_exit_mode:
+        main_risk = "El escenario exige gestión táctica; la posición no debería darse mucho espacio."
     else:
-        riesgo_dominante = "sin riesgo dominante claro — respetar el stop definido"
-
-    # ── Generar instrucción táctica según modo ───────────────────────────────
-    if modo == "normal":
-        recomendacion = (
-            f"Entrada a mercado o en pullback al VWAP. "
-            f"Stop bajo ${candidate.get('stop_loss', 0):.4f}. "
-            f"TP parcial en mitad del recorrido, resto al objetivo."
-        )
-    elif modo == "rapido":
-        recomendacion = (
-            f"Si entras, tamaño reducido (50% de lo habitual). "
-            f"Stop estricto bajo ${candidate.get('stop_loss', 0):.4f}. "
-            f"No alejarse de la pantalla — cerrar si no avanza en la primera vela."
-        )
-    else:
-        recomendacion = "No hay condiciones para operar. Esperar próxima corrida."
-
-    reading = f"{contexto_positivo.capitalize()}."
+        main_risk = "El riesgo técnico parece controlado mientras respete el stop."
 
     return {
         "label": label,
         "reading": reading,
-        "main_risk": riesgo_dominante,
-        "recommendation": recomendacion,
-        "modo": modo,
+        "main_risk": main_risk,
+        "recommendation": recommendation,
     }
 
 
@@ -1260,62 +1199,74 @@ def sort_watch_candidates(watch_candidates: List[Dict[str, Any]]) -> List[Dict[s
 def format_message(candidate: Dict[str, Any], decision_reason: str) -> str:
     esc = html.escape
     human = build_human_signal_summary(candidate)
-    macro_eval = candidate.get("macro", {})
-    timing_eval = candidate.get("timing", {})
+    reasons_text = esc(", ".join(candidate["reasons"]))
+    rank_line = ""
+    if ENABLE_RANKING:
+        rank_line = (
+            f"🏅 <b>Prioridad:</b> {candidate['rank_score']:.2f}"
+            f" | Grupo: {esc(candidate['asset_group'])}\n"
+        )
 
     vwap_dist = candidate.get("vwap_distance_pct", 0.0)
     vwap_icon = "🟢" if candidate.get("above_vwap") and abs(vwap_dist) <= 1.5 else ("🟡" if abs(vwap_dist) <= 3.5 else "🔴")
+    vwap_label = f"{'+' if vwap_dist >= 0 else ''}{vwap_dist:.1f}% vs VWAP ${candidate.get('vwap', 0):.4f}"
 
     if candidate.get("volume_divergence"):
-        vol_icon = "⚠️"
+        vol_label = "⚠️ Divergencia (sube precio, cae momentum)"
     elif candidate.get("volume_strong"):
-        vol_icon = "✅"
+        vol_label = "✅ Momentum fuerte"
     else:
-        vol_icon = "➖"
+        vol_label = "➖ Momentum neutral"
 
-    # Línea de cautela macro — solo si hay algo que decir
-    caution_lines = []
-    if macro_eval.get("fast_exit_mode"):
-        caution_lines.append("🏃 No alejarse de pantalla")
+    macro_eval = candidate.get("macro", {})
+    timing_eval = candidate.get("timing", {})
+    macro_line = (
+        f"🌐 <b>Macro 1D:</b> {bool_icon(candidate['macro_ok'])} | "
+        f"{esc(macro_eval.get('macro_regime', 'UNSPECIFIED'))} | "
+        f"sesgo {esc(macro_eval.get('macro_bias', 'UNSPECIFIED'))}\n"
+    )
+    timing_line = (
+        f"🎯 <b>Timing 15m:</b> {bool_icon(candidate['timing_ok'])} | "
+        f"RSI {timing_eval.get('rsi', 0):.2f} | "
+        f"VWAP {timing_eval.get('vwap_distance_pct', 0):+.1f}%\n"
+    )
+    setup_line = f"⚙️ <b>Setup 4H:</b> {bool_icon(candidate['setup_ok'])} | confirmaciones {candidate['confirmations_passed']}/3\n"
+
+    caution_line = ""
+    if macro_eval.get("caution_level"):
+        caution_line += f"⚠️ <b>Cautela:</b> {esc(str(macro_eval['caution_level']))}\n"
     if macro_eval.get("long_resistance_label"):
-        caution_lines.append(f"🚧 Resistencia: {macro_eval['long_resistance_label']}")
+        caution_line += f"🚧 <b>Resistencia mayor:</b> {esc(macro_eval['long_resistance_label'])}\n"
+    if macro_eval.get("fast_exit_mode"):
+        caution_line += "🏃 <b>Gestión:</b> salida rápida\n"
     if macro_eval.get("note"):
-        caution_lines.append(f"📝 {macro_eval['note']}")
-    caution_block = "\n".join(esc(l) for l in caution_lines)
-    if caution_block:
-        caution_block = caution_block + "\n"
-
-    rank_line = ""
-    if ENABLE_RANKING:
-        rank_line = f"🏅 Prioridad {candidate['rank_score']:.0f} | {esc(candidate['asset_group'])}\n"
+        caution_line += f"📝 <b>Nota macro:</b> {esc(macro_eval['note'])}\n"
 
     return (
-        # ── Veredicto (lo que lees primero) ──────────────────────────────────
-        f"{'🟢' if human['modo'] == 'normal' else '🟡'} "
-        f"<b>{esc(candidate['symbol'])} — {esc(human['label'])}</b>\n"
-        f"<i>{esc(human['reading'])}</i>\n"
-        f"⚡ <b>Acción:</b> {esc(human['recommendation'])}\n"
-        f"⚠️ <b>Riesgo:</b> {esc(human['main_risk'])}\n"
-        f"{caution_block}"
-        f"\n"
-        # ── Datos clave (verificación rápida) ────────────────────────────────
-        f"💰 <b>${candidate['entry_price']:.4f}</b> "
-        f"| SL <b>${candidate['stop_loss']:.4f}</b> "
-        f"| TP <b>${candidate['take_profit']:.4f}</b> "
-        f"| R:R <b>{candidate['rr_ratio']:.1f}</b>\n"
-        f"📊 Score {candidate['score']:.1f} "
-        f"| ADX {candidate['adx']:.0f} "
-        f"| RSI {candidate['rsi']:.0f} "
-        f"| Fib {esc(candidate['fib_zone'])}\n"
-        f"{vwap_icon} VWAP {vwap_dist:+.1f}% "
-        f"| {vol_icon} Vol "
-        f"| 1D {bool_icon(candidate['macro_ok'])} "
-        f"4H {bool_icon(candidate['setup_ok'])} "
-        f"15m {bool_icon(candidate['timing_ok'])}\n"
+        f"🚀 <b>ALERTA COMPRA: {esc(candidate['symbol'])}</b>\n"
+        f"🗣️ <b>Lectura:</b> {esc(human['label'])}\n\n"
+        f"📌 <b>Resumen:</b> {esc(human['reading'])}\n"
+        f"⚠️ <b>Riesgo principal:</b> {esc(human['main_risk'])}\n"
+        f"✅ <b>Recomendación:</b> {esc(human['recommendation'])}\n\n"
+        f"⏱️ <b>Timeframe:</b> {esc(candidate['timeframe'])}\n"
+        f"💰 <b>Precio:</b> ${candidate['entry_price']:.4f}\n"
+        f"📊 <b>Score:</b> {candidate['score']:.2f}\n"
+        f"📈 <b>ADX:</b> {candidate['adx']:.2f}\n"
+        f"📉 <b>RSI:</b> {candidate['rsi']:.2f}\n"
+        f"🧭 <b>Régimen:</b> {esc(candidate['regime'])}\n"
+        f"🧩 <b>Fib:</b> {esc(candidate['fib_zone'])}\n"
+        f"⚖️ <b>R:R:</b> {candidate['rr_ratio']:.2f}\n"
+        f"🎯 <b>TARGET (TP):</b> ${candidate['take_profit']:.4f}\n"
+        f"🛑 <b>STOP (SL):</b> ${candidate['stop_loss']:.4f}\n"
+        f"{vwap_icon} <b>VWAP:</b> {esc(vwap_label)}\n"
+        f"📦 <b>Volumen:</b> {esc(vol_label)}\n"
+        f"{macro_line}"
+        f"{setup_line}"
+        f"{timing_line}"
         f"{rank_line}"
-        f"\n"
-        # ── Motivo técnico (para aprender, no para decidir) ──────────────────
-        f"<i>{esc(', '.join(candidate['reasons'][:4]))}</i>"
+        f"{caution_line}\n"
+        f"📝 <b>Análisis:</b> {reasons_text}\n"
+        f"🧠 <b>Motivo de envío:</b> {esc(decision_reason)}"
     )
 
 def format_run_summary(
@@ -1326,51 +1277,89 @@ def format_run_summary(
     watch_candidates: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     esc = html.escape
-    lines = ["📋 <b>Resumen de ejecución</b>", ""]
-    lines.append(f"✅ <b>Setups con 3/3 confirmaciones:</b> {total_ready}")
-    if ENABLE_RANKING:
-        lines.append(f"🚦 <b>Ranking activo:</b> sí | Límite: {MAX_ALERTS_PER_RUN} por corrida")
-        lines.append(f"🧱 <b>Límite por grupo:</b> {MAX_ALERTS_PER_GROUP}")
-    else:
-        lines.append("🚦 <b>Ranking activo:</b> no")
+    lines = []
 
-    lines.append("")
+    # ── Encabezado: estado del mercado en esta corrida ────────────────────────
+    scanned = len(CRYPTO_IDS)
+    watch_count = len(watch_candidates) if watch_candidates else 0
+
+    if total_ready >= 3:
+        market_pulse = "Mercado activo — múltiples setups válidos"
+        pulse_icon = "🟢"
+    elif total_ready >= 1:
+        market_pulse = "Mercado selectivo — pocas oportunidades"
+        pulse_icon = "🟡"
+    elif watch_count >= 3:
+        market_pulse = "Sin señales completas — varios activos en vigilancia"
+        pulse_icon = "🟠"
+    else:
+        market_pulse = "Mercado sin oportunidades claras"
+        pulse_icon = "🔴"
+
+    lines.append(f"{pulse_icon} <b>{esc(market_pulse)}</b>")
+    lines.append(f"<i>Escaneados: {scanned} | Señales 3/3: {total_ready} | En vigilancia: {watch_count}</i>")
+
+    # ── Alertas enviadas ──────────────────────────────────────────────────────
     if selected:
-        lines.append("🏆 <b>Enviadas:</b>")
+        lines.append("")
+        lines.append("🚀 <b>Alertas enviadas:</b>")
         for item in selected:
             human = build_human_signal_summary(item)
+            mode_icon = "🟢" if human["modo"] == "normal" else "🟡"
             lines.append(
-                f"• {esc(item['symbol'])} | {esc(human['label'])} | "
-                f"prioridad {item['rank_score']:.2f}"
-            )
-    else:
-        lines.append("🏆 <b>Enviadas:</b> 0")
-
-    if deferred:
-        lines.append("")
-        lines.append("⏸️ <b>Diferidas por ranking/diversificación:</b>")
-        for item in deferred[:8]:
-            human = build_human_signal_summary(item)
-            lines.append(
-                f"• {esc(item['symbol'])} | {esc(human['label'])} | "
-                f"prioridad {item['rank_score']:.2f} | grupo {esc(item['asset_group'])}"
+                f"  {mode_icon} <b>{esc(item['symbol'])}</b> — {esc(human['label'])}\n"
+                f"     {esc(human['main_risk'])}"
             )
 
+    # ── Vigilancia táctica: los más cerca de completar señal ─────────────────
     if watch_candidates:
         lines.append("")
         lines.append("👀 <b>Vigilancia táctica:</b>")
-        for item in watch_candidates[:5]:
-            human = item.get("human_summary") or build_human_signal_summary(item)
+        for item in watch_candidates[:4]:
+            macro_ok = bool(item.get("macro_ok"))
+            setup_ok = bool(item.get("setup_ok"))
+            timing_ok = bool(item.get("timing_ok"))
+            confirmations = int(item.get("confirmations_passed", 0))
+            # Identificar qué falta
+            missing = []
+            if not macro_ok:
+                missing.append("1D")
+            if not setup_ok:
+                missing.append("4H")
+            if not timing_ok:
+                missing.append("15m")
+            missing_str = ", ".join(missing) if missing else "—"
+            score = item.get("setup_score", item.get("score", 0.0))
             lines.append(
-                f"• {esc(item['symbol'])} | {esc(human['label'])} | "
-                f"{esc(human['recommendation'])}"
+                f"  • <b>{esc(item['symbol'])}</b> {confirmations}/3 "
+                f"| falta: {esc(missing_str)} "
+                f"| score 4H {score:.1f} "
+                f"| ADX {item.get('adx', 0):.0f}"
             )
 
-    if blocked:
+    # ── Diferidas por límite de ranking ──────────────────────────────────────
+    if deferred:
         lines.append("")
-        lines.append("🛡️ <b>Descartadas u omitidas:</b>")
-        for text in blocked[:12]:
-            lines.append(f"• {esc(text)}")
+        lines.append("⏸️ <b>Válidas pero no enviadas (límite de corrida):</b>")
+        for item in deferred[:4]:
+            human = build_human_signal_summary(item)
+            lines.append(
+                f"  • <b>{esc(item['symbol'])}</b> — {esc(human['label'])} "
+                f"| próxima corrida"
+            )
+
+    # ── Descartadas: solo si hay algo informativo que decir ──────────────────
+    # Filtra mensajes puramente técnicos (datos insuficientes, cooldown) y
+    # muestra solo los que revelan algo sobre el estado del mercado
+    informative_blocked = [
+        b for b in blocked
+        if any(kw in b for kw in ["macro", "1D=", "4H=", "15m=", "confirmaciones"])
+    ]
+    if informative_blocked:
+        lines.append("")
+        lines.append("📉 <b>Activos descartados:</b>")
+        for text in informative_blocked[:6]:
+            lines.append(f"  • {esc(text)}")
 
     return "\n".join(lines)
 

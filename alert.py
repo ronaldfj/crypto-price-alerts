@@ -569,20 +569,47 @@ def evaluate_macro_confirmation(daily_df: pd.DataFrame, symbol: str, context: Di
     except (TypeError, ValueError):
         require_breakout_above = None
 
-    technical_ok = (
-        close > ema20
-        and ema20 >= ema50
-        and rsi >= 45
-        and rsi <= 70
-        and (plus_di >= minus_di or adx < 18)
-    )
+    # Sistema de puntos 1D: 3 de 4 criterios en lugar de los 4 en AND.
+    # Permite que el bot opere en condiciones reales donde un criterio
+    # puede estar marginalmente fuera sin invalidar el contexto completo.
+    macro_points = 0
+    macro_point_reasons: List[str] = []
+
+    if close > ema20:
+        macro_points += 1
+    else:
+        macro_point_reasons.append(f"close ({close:.4f}) <= EMA20 ({ema20:.4f})")
+
+    if ema20 >= ema50:
+        macro_points += 1
+    else:
+        macro_point_reasons.append(f"EMA20 ({ema20:.4f}) < EMA50 ({ema50:.4f})")
+
+    if 43 <= rsi <= 72:
+        macro_points += 1
+    else:
+        macro_point_reasons.append(f"RSI {rsi:.1f} fuera de rango 43-72")
+
+    if plus_di >= minus_di or adx < 20:
+        macro_points += 1
+    else:
+        macro_point_reasons.append(f"DI+ ({plus_di:.1f}) < DI- ({minus_di:.1f}) con ADX ({adx:.1f}) >= 20")
+
+    technical_ok = macro_points >= 3
 
     if regime == "BULL_STACK":
         reasons.append("Diario con estructura alcista")
     elif technical_ok:
-        reasons.append("Diario permite longs, aunque no está en pila alcista completa")
+        criteria_met = 4 - len(macro_point_reasons)
+        reasons.append(
+            f"Diario permite longs ({criteria_met}/4 criterios: "
+            f"{'falla: ' + ', '.join(macro_point_reasons) if macro_point_reasons else 'todos ok'})"
+        )
     else:
-        reasons.append("Diario no confirma longs con claridad")
+        reasons.append(
+            f"Diario no confirma longs — solo {macro_points}/4 criterios: "
+            + ", ".join(macro_point_reasons)
+        )
 
     if hard_block_long or SIDE_LONG not in allowed_sides:
         macro_ok = False
@@ -947,10 +974,13 @@ def evaluate_timing_confirmation(entry_df: pd.DataFrame, symbol: str) -> Optiona
             hard_fail = True
 
     if distance_to_local_high_pct <= 0.20:
+        # Era hard_fail=True. Ahora penaliza fuerte pero no bloquea.
+        # Razón: en mercados consolidando el precio está casi siempre
+        # cerca del máximo local de 24 velas, lo que hacía que este filtro
+        # eliminara la mayoría de señales válidas.
         reasons.append(f"Pegado a micro-resistencia ({distance_to_local_high_pct:.2f}% del máximo local)")
-        score_adjustment -= 0.35
-        rank_adjustment -= 0.8
-        hard_fail = True
+        score_adjustment -= 0.50
+        rank_adjustment -= 1.5
     elif distance_to_local_high_pct <= 0.60:
         reasons.append(f"Cerca del máximo local ({distance_to_local_high_pct:.2f}%)")
         score_adjustment -= 0.10
@@ -1064,6 +1094,49 @@ def build_candidate(
         f"15m={bool_icon(candidate['timing_ok'])}, "
         f"score={candidate['score']:.2f}, rr={candidate['rr_ratio']:.2f}, alert={candidate['alert']}"
     )
+
+    # ── Diagnóstico detallado por capa ────────────────────────────────────────
+    # Muestra exactamente qué filtro bloqueó la señal en cada timeframe.
+    if not candidate["macro_ok"]:
+        rsi_1d  = macro_eval.get("rsi", 0)
+        close_1d = macro_eval.get("close", 0)
+        ema20_1d = macro_eval.get("ema20", 0)
+        ema50_1d = macro_eval.get("ema50", 0)
+        close_vs_ema20 = ">" if close_1d > ema20_1d else "<="
+        ema20_vs_ema50 = ">=" if ema20_1d >= ema50_1d else "<"
+        print(
+            f"   └─ 1D BLOQUEADO | RSI={rsi_1d:.1f} (necesita 43-72) | "
+            f"close {close_vs_ema20} EMA20 | "
+            f"EMA20 {ema20_vs_ema50} EMA50 | "
+            f"régimen={macro_eval.get('regime', '?')}"
+        )
+        print(f"      Razones 1D: {' | '.join(macro_eval.get('reasons', []))}")
+
+    if not candidate["setup_ok"]:
+        s_eval = setup_eval
+        trend_ok   = s_eval.get("regime") == "BULL_STACK" or (
+            s_eval.get("regime") != "BEAR_STACK"
+        )
+        print(
+            f"   └─ 4H BLOQUEADO | score={s_eval.get('score', 0):.2f} "
+            f"(floor={s_eval.get('setup_score_floor', 0):.2f}) | "
+            f"rr={candidate['rr_ratio']:.2f} | "
+            f"régimen={s_eval.get('regime', '?')} | "
+            f"ADX={s_eval.get('adx', 0):.1f} | RSI={s_eval.get('rsi', 0):.1f}"
+        )
+        print(f"      Razones 4H: {' | '.join(s_eval.get('reasons', [])[-5:])}")
+
+    if not candidate["timing_ok"]:
+        t_eval = timing_eval
+        print(
+            f"   └─ 15m BLOQUEADO | points={t_eval.get('points', 0):.2f} "
+            f"(necesita >=2.4 y sin hard_fail) | "
+            f"RSI={t_eval.get('rsi', 0):.1f} | "
+            f"VWAP={t_eval.get('vwap_distance_pct', 0):+.1f}% | "
+            f"dist_max_local={t_eval.get('distance_to_local_high_pct', 0):.2f}%"
+        )
+        print(f"      Razones 15m: {' | '.join(t_eval.get('reasons', []))}")
+
     return candidate
 
 # ── Invalidación / deduplicación ──────────────────────────────────────────────

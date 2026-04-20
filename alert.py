@@ -75,18 +75,27 @@ INVALIDATED = "INVALIDATED"
 EXPIRED = "EXPIRED"
 
 
-def send_telegram(message: str) -> bool:
+def send_telegram(message: str, reply_markup: Optional[Dict[str, Any]] = None) -> bool:
+    """
+    Envía un mensaje a Telegram.
+    Si se pasa reply_markup (botones inline), los incluye en el mensaje.
+    Esto permite que las alertas de compra tengan botones Aprobar/Rechazar
+    que son procesados por trader_bot.py corriendo en Railway.
+    """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Telegram no configurado. Se omite el envío.")
         return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
+    payload: Dict[str, Any] = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+
     try:
         response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
         if response.status_code != 200:
@@ -1632,6 +1641,32 @@ def format_run_summary(
 
     return "\n".join(lines)
 
+# ── Botones inline para trader_bot.py ────────────────────────────────────────
+def build_trade_buttons(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Construye el reply_markup con botones inline Aprobar/Rechazar.
+    El callback_data contiene los datos necesarios para que trader_bot.py
+    ejecute la orden sin necesidad de estado compartido.
+    Formato: approve:{symbol}|{entry}|{stop}|{tp1}|{tp2}|{ts}
+    """
+    symbol = candidate["symbol"]
+    entry  = candidate["entry_price"]
+    stop   = candidate["stop_loss"]
+    tp1    = candidate.get("tp1", entry * 1.01)
+    tp2    = candidate.get("tp2", candidate.get("take_profit", entry * 1.02))
+    ts     = int(time.time())
+
+    approve_data = f"approve:{symbol}|{entry:.6f}|{stop:.6f}|{tp1:.6f}|{tp2:.6f}|{ts}"
+    reject_data  = f"reject:{symbol}|{ts}"
+
+    return {
+        "inline_keyboard": [[
+            {"text": "✅ Ejecutar", "callback_data": approve_data},
+            {"text": "❌ Rechazar", "callback_data": reject_data},
+        ]]
+    }
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
     start = time.time()
@@ -1727,7 +1762,12 @@ def main() -> None:
             print(f"   - {item['symbol']}: {human['label']}")
 
     for candidate in selected_candidates:
-        sent_ok = send_telegram(format_message(candidate, candidate["decision_reason"]))
+        # Construir botones inline Aprobar/Rechazar para trader_bot.py
+        trade_buttons = build_trade_buttons(candidate)
+        sent_ok = send_telegram(
+            format_message(candidate, candidate["decision_reason"]),
+            reply_markup=trade_buttons,
+        )
         if sent_ok:
             save_alert(conn, candidate, candidate.get("improved_from_alert_id"))
             sent_count += 1

@@ -666,6 +666,7 @@ def evaluate_macro_confirmation(daily_df: pd.DataFrame, symbol: str, context: Di
 
 
 # ── Confirmación 4H ───────────────────────────────────────────────────────────
+
 def evaluate_setup_confirmation(fourh_df: pd.DataFrame, symbol: str, cg_id: str) -> Optional[Dict[str, Any]]:
     work = add_indicators(fourh_df)
     if len(work) < 210:
@@ -697,6 +698,9 @@ def evaluate_setup_confirmation(fourh_df: pd.DataFrame, symbol: str, cg_id: str)
     if regime == "BULL_STACK":
         score += 2.5
         reasons.append("Régimen alcista EMA20>EMA50>EMA200")
+    elif close > ema50 > ema200 and ema20 >= ema50 * 0.997:
+        score += 1.5
+        reasons.append("Estructura 4H casi en pila alcista")
     if close > ema20:
         score += 1.0
         reasons.append("Precio sobre EMA20")
@@ -712,15 +716,15 @@ def evaluate_setup_confirmation(fourh_df: pd.DataFrame, symbol: str, cg_id: str)
     if 48 <= rsi <= 64:
         score += 1.0
         reasons.append(f"RSI sano ({rsi:.1f})")
-    elif 45 <= rsi <= 68:
+    elif 44 <= rsi <= 69:
         score += 0.5
         reasons.append(f"RSI aceptable ({rsi:.1f})")
     if adx >= 22 and plus_di > minus_di:
         score += 1.25
         reasons.append(f"ADX con dirección ({adx:.1f})")
-    elif adx >= 18 and plus_di > minus_di:
-        score += 0.75
-        reasons.append(f"ADX emergente ({adx:.1f})")
+    elif adx >= 16 and plus_di >= minus_di * 0.97:
+        score += 0.65
+        reasons.append(f"ADX utilizable ({adx:.1f})")
 
     zone = fib_zone(fib["retracement"])
     if zone == "0.382-0.500":
@@ -801,13 +805,17 @@ def evaluate_setup_confirmation(fourh_df: pd.DataFrame, symbol: str, cg_id: str)
     take_profit = tp2
     rr_ratio = (take_profit - close) / risk
 
+    setup_score_floor = max(MIN_SCORE - 0.5, 5.25)
+    trend_ok = regime == "BULL_STACK" or (close > ema50 > ema200 and ema20 >= ema50 * 0.997)
+    direction_ok = plus_di >= minus_di * 0.97
+    strength_ok = adx >= 16
     setup_ok = (
-        regime == "BULL_STACK"
-        and close > ema200
-        and plus_di > minus_di
-        and adx >= 18
-        and rr_ratio >= 1.15
-        and score >= MIN_SCORE
+        trend_ok
+        and close >= ema200 * 0.995
+        and direction_ok
+        and strength_ok
+        and rr_ratio >= 1.05
+        and score >= setup_score_floor
     )
 
     return {
@@ -845,10 +853,11 @@ def evaluate_setup_confirmation(fourh_df: pd.DataFrame, symbol: str, cg_id: str)
         "volume_strong": vol_data["strong_momentum"],
         "distance_to_swing_high_pct": round(distance_to_swing_high_pct, 2),
         "setup_ok": setup_ok,
+        "setup_score_floor": round(setup_score_floor, 2),
     }
 
-
 # ── Confirmación 15m ──────────────────────────────────────────────────────────
+
 def evaluate_timing_confirmation(entry_df: pd.DataFrame, symbol: str) -> Optional[Dict[str, Any]]:
     work = add_indicators(entry_df)
     if len(work) < 60:
@@ -871,59 +880,86 @@ def evaluate_timing_confirmation(entry_df: pd.DataFrame, symbol: str) -> Optiona
     score_adjustment = 0.0
     rank_adjustment = 0.0
     points = 0.0
+    hard_fail = False
 
-    timing_ok = True
+    trend_gap_pct = ((ema20 - ema50) / max(ema50, 1e-9)) * 100
 
     if ema20 >= ema50:
         reasons.append("15m acompaña la dirección")
-        points += 1.5
+        points += 1.2
+    elif close > ema50 and trend_gap_pct >= -0.35:
+        reasons.append("15m casi alineado; pullback controlado")
+        points += 0.6
+        score_adjustment -= 0.10
     else:
         reasons.append("15m pierde estructura inmediata")
-        timing_ok = False
+        hard_fail = True
 
-    if close >= ema20 * 0.998:
+    if close >= ema20 * 0.996:
         reasons.append("Precio ejecutable respecto a EMA20 15m")
-        points += 1.5
+        points += 1.2
+    elif close >= ema20 * 0.992:
+        reasons.append("Precio ligeramente bajo EMA20 15m")
+        points += 0.4
+        score_adjustment -= 0.15
     else:
-        reasons.append("Precio débil contra EMA20 15m")
-        timing_ok = False
+        reasons.append("Precio demasiado débil contra EMA20 15m")
+        hard_fail = True
 
-    if 43 <= rsi <= 69:
+    if 40 <= rsi <= 72:
         reasons.append(f"RSI 15m razonable ({rsi:.1f})")
-        points += 1.0
+        points += 0.9
+    elif 37 <= rsi <= 75:
+        reasons.append(f"RSI 15m usable ({rsi:.1f})")
+        points += 0.3
     else:
         reasons.append(f"RSI 15m incómodo ({rsi:.1f})")
-        timing_ok = False
+        hard_fail = True
 
     if vol_data["divergence"]:
         reasons.append("Divergencia de momentum en 15m")
-        score_adjustment -= 0.5
-        rank_adjustment -= 1.5
-        timing_ok = False
+        score_adjustment -= 0.35
+        rank_adjustment -= 1.0
     elif vol_data["strong_momentum"]:
         reasons.append("Momentum de entrada 15m fuerte")
-        score_adjustment += 0.35
-        points += 1.0
+        score_adjustment += 0.25
+        points += 0.8
 
-    if vwap_data["above_vwap"] and abs(vwap_data["distance_pct"]) <= 2.5:
-        reasons.append(f"Precio no muy lejos del VWAP 15m ({vwap_data['distance_pct']:+.1f}%)")
-        points += 1.0
-    elif vwap_data["above_vwap"] and vwap_data["distance_pct"] > 2.5:
-        reasons.append(f"Entrada estirada sobre VWAP 15m ({vwap_data['distance_pct']:+.1f}%)")
-        score_adjustment -= 0.5
-        timing_ok = False
+    if vwap_data["above_vwap"]:
+        if abs(vwap_data["distance_pct"]) <= 3.2:
+            reasons.append(f"Precio aceptable vs VWAP 15m ({vwap_data['distance_pct']:+.1f}%)")
+            points += 0.8
+        elif vwap_data["distance_pct"] <= 4.5:
+            reasons.append(f"Entrada algo estirada sobre VWAP 15m ({vwap_data['distance_pct']:+.1f}%)")
+            score_adjustment -= 0.20
+        else:
+            reasons.append(f"Entrada demasiado extendida sobre VWAP 15m ({vwap_data['distance_pct']:+.1f}%)")
+            hard_fail = True
     else:
-        reasons.append(f"Precio bajo VWAP 15m ({vwap_data['distance_pct']:+.1f}%)")
-        score_adjustment -= 0.2
+        if vwap_data["distance_pct"] >= -1.2:
+            reasons.append(f"Ligero descuento bajo VWAP 15m ({vwap_data['distance_pct']:+.1f}%)")
+            points += 0.25
+        elif vwap_data["distance_pct"] >= -2.5:
+            reasons.append(f"Bajo VWAP 15m, requiere rebote ({vwap_data['distance_pct']:+.1f}%)")
+            score_adjustment -= 0.15
+        else:
+            reasons.append(f"Demasiado bajo VWAP 15m ({vwap_data['distance_pct']:+.1f}%)")
+            hard_fail = True
 
-    if distance_to_local_high_pct <= 0.45:
-        reasons.append(f"Muy cerca de micro-resistencia ({distance_to_local_high_pct:.2f}% del máximo local)")
-        score_adjustment -= 0.5
-        rank_adjustment -= 1.0
-        timing_ok = False
-    elif distance_to_local_high_pct <= 1.0:
+    if distance_to_local_high_pct <= 0.20:
+        reasons.append(f"Pegado a micro-resistencia ({distance_to_local_high_pct:.2f}% del máximo local)")
+        score_adjustment -= 0.35
+        rank_adjustment -= 0.8
+        hard_fail = True
+    elif distance_to_local_high_pct <= 0.60:
         reasons.append(f"Cerca del máximo local ({distance_to_local_high_pct:.2f}%)")
+        score_adjustment -= 0.10
         rank_adjustment -= 0.4
+    elif distance_to_local_high_pct <= 1.20:
+        reasons.append(f"Aún con espacio táctico antes del máximo local ({distance_to_local_high_pct:.2f}%)")
+        points += 0.25
+
+    timing_ok = (not hard_fail) and points >= 2.4
 
     return {
         "ok": timing_ok,
@@ -941,8 +977,6 @@ def evaluate_timing_confirmation(entry_df: pd.DataFrame, symbol: str) -> Optiona
         "rank_adjustment": round(rank_adjustment, 2),
         "reasons": reasons,
     }
-
-
 
 
 def apply_context_execution_policy(candidate: Dict[str, Any], macro_eval: Dict[str, Any]) -> Dict[str, Any]:
@@ -992,6 +1026,7 @@ def apply_context_execution_policy(candidate: Dict[str, Any], macro_eval: Dict[s
 
 
 # ── Integración multi-timeframe ───────────────────────────────────────────────
+
 def build_candidate(
     symbol: str,
     cg_id: str,
@@ -1005,9 +1040,10 @@ def build_candidate(
     candidate["score"] = round(candidate["score"] + score_adjustment, 2)
     candidate["rank_adjustment"] = round(macro_eval["rank_adjustment"] + timing_eval["rank_adjustment"], 2)
 
+    setup_score_floor = float(setup_eval.get("setup_score_floor", max(MIN_SCORE - 0.5, 5.25)))
     candidate["macro_ok"] = macro_eval["ok"]
     candidate["timing_ok"] = timing_eval["ok"]
-    candidate["setup_ok"] = setup_eval["setup_ok"] and candidate["score"] >= MIN_SCORE
+    candidate["setup_ok"] = setup_eval["setup_ok"] and candidate["score"] >= setup_score_floor
     candidate["macro"] = macro_eval
     candidate["timing"] = timing_eval
 
@@ -1029,7 +1065,6 @@ def build_candidate(
         f"score={candidate['score']:.2f}, rr={candidate['rr_ratio']:.2f}, alert={candidate['alert']}"
     )
     return candidate
-
 
 # ── Invalidación / deduplicación ──────────────────────────────────────────────
 def invalidate_old_alerts(conn: sqlite3.Connection, candidate: Dict[str, Any]) -> None:

@@ -1,20 +1,39 @@
 {
   "GLOBAL": {
     "caution_level": "NORMAL",
-    "allowed_sides": ["LONG"]
+    "allowed_sides": [
+      "LONG"
+    ],
+    "tp1_rr": 0.85,
+    "tp2_rr": 1.55,
+    "max_rr_long": 1.65,
+    "move_to_be_rr": 0.75,
+    "risk_multiplier": 0.9,
+    "min_structural_room_rr": 1.0,
+    "reject_if_distance_to_resistance_pct_below": 0.65
   },
   "BTC": {
     "macro_regime": "RESOLUTION_RANGE",
     "macro_bias": "BEARISH",
     "short_term_bias": "BULLISH",
-    "allowed_sides": ["LONG", "SHORT"],
+    "allowed_sides": [
+      "LONG",
+      "SHORT"
+    ],
     "caution_level": "HIGH",
     "long_resistance_near": true,
     "long_resistance_label": "84k / línea cyan",
     "short_support_label": "línea magenta",
-    "long_score_adjustment": -1.5,
-    "long_rank_adjustment": -8.0,
+    "long_score_adjustment": -0.8,
+    "long_rank_adjustment": -3.0,
     "fast_exit_mode": true,
-    "note": "Rango de resolución; revisar diario y cerrar posiciones rápido."
+    "tp1_rr": 0.75,
+    "tp2_rr": 1.2,
+    "max_rr_long": 1.25,
+    "move_to_be_rr": 0.65,
+    "risk_multiplier": 0.65,
+    "min_structural_room_rr": 0.9,
+    "reject_if_distance_to_resistance_pct_below": 0.75,
+    "note": "Long solo táctico mientras BTC siga en rango de resolución; cobrar rápido y no perseguir."
   }
 }

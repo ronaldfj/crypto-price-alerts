@@ -78,6 +78,11 @@ ALERT_FORWARD_BARS = int(os.getenv("ALERT_FORWARD_BARS", "24"))
 VALIDATION_FETCH_MAX_DAYS = int(os.getenv("VALIDATION_FETCH_MAX_DAYS", "90"))
 SEND_OUTCOME_UPDATES = os.getenv("SEND_OUTCOME_UPDATES", "false").lower() == "true"
 
+ENABLE_TACTICAL_ALERTS = os.getenv("ENABLE_TACTICAL_ALERTS", "true").lower() == "true"
+TACTICAL_MIN_SCORE = float(os.getenv("TACTICAL_MIN_SCORE", "8.0"))
+TACTICAL_MIN_TIMING_POINTS = float(os.getenv("TACTICAL_MIN_TIMING_POINTS", "3.0"))
+TACTICAL_RISK_MULTIPLIER_CAP = float(os.getenv("TACTICAL_RISK_MULTIPLIER_CAP", "0.75"))
+
 SIDE_LONG = "LONG"
 SIDE_SHORT = "SHORT"
 VALID_SIDES = (SIDE_LONG, SIDE_SHORT)
@@ -848,9 +853,19 @@ def evaluate_macro_confirmation(
     }
     adjustments["score"] += caution_penalty_map.get(caution_level, 0.0)
 
+    side_allowed = side in allowed_sides
+    soft_ok = (
+        (side == SIDE_LONG and regime != "BEAR_STACK" and close >= ema200 * 0.985 and rsi >= 40)
+        or
+        (side == SIDE_SHORT and regime != "BULL_STACK" and close <= ema200 * 1.015 and rsi <= 60)
+    )
+
     return {
         "ok": macro_ok,
         "side": side,
+        "hard_block": hard_block,
+        "side_allowed": side_allowed,
+        "soft_ok": soft_ok,
         "btc_dominance": btc_dominance,
         "regime": regime,
         "rsi": round(rsi, 2),
@@ -1483,6 +1498,36 @@ def compute_required_min_rr(candidate: Dict[str, Any], macro_eval: Dict[str, Any
     )
     return round(max(1.0, min(float(MIN_RR), rr_policy_cap)), 2)
 
+
+
+def compute_tactical_eligibility(
+    candidate: Dict[str, Any],
+    macro_eval: Dict[str, Any],
+    timing_eval: Dict[str, Any],
+) -> Tuple[bool, str]:
+    """
+    Ruta táctica para setups muy limpios en 4H + 15m, aun cuando el 1D no esté totalmente alineado.
+    Mantiene sesgo "láser": exige score alto, timing válido y no permite hard blocks ni lados prohibidos.
+    """
+    if not ENABLE_TACTICAL_ALERTS:
+        return False, ""
+    if candidate.get("macro_ok"):
+        return False, ""
+    if not candidate.get("setup_ok") or not candidate.get("timing_ok"):
+        return False, ""
+    if candidate.get("score", 0.0) < max(TACTICAL_MIN_SCORE, MIN_SCORE + 1.0):
+        return False, ""
+    if candidate.get("rr_ratio", 0.0) < candidate.get("required_min_rr", 1.0):
+        return False, ""
+    if macro_eval.get("hard_block") or not macro_eval.get("side_allowed", True):
+        return False, ""
+    if not macro_eval.get("soft_ok", False):
+        return False, ""
+    if float(timing_eval.get("points", 0.0)) < TACTICAL_MIN_TIMING_POINTS:
+        return False, ""
+    return True, "macro_soft_override"
+
+
 def build_candidate(
     symbol: str,
     cg_id: str,
@@ -1512,16 +1557,42 @@ def build_candidate(
     candidate = apply_context_execution_policy(candidate, macro_eval)
     candidate["confirmations_passed"] = int(candidate["macro_ok"]) + int(candidate["setup_ok"]) + int(candidate["timing_ok"])
     candidate["required_min_rr"] = compute_required_min_rr(candidate, macro_eval)
-    candidate["alert"] = (
+
+    full_alert = (
         candidate["confirmations_passed"] == 3
         and candidate["score"] >= MIN_SCORE
         and candidate["rr_ratio"] >= candidate["required_min_rr"]
     )
+    tactical_alert, tactical_reason = compute_tactical_eligibility(candidate, macro_eval, timing_eval)
+
+    candidate["full_alert"] = full_alert
+    candidate["tactical_alert"] = tactical_alert
+    candidate["alert_profile"] = "NONE"
+    candidate["profile_reason"] = ""
+
+    if full_alert:
+        candidate["alert"] = True
+        candidate["alert_profile"] = "FULL"
+        candidate["profile_reason"] = "three_of_three"
+    elif tactical_alert:
+        candidate["alert"] = True
+        candidate["alert_profile"] = "TACTICAL"
+        candidate["profile_reason"] = tactical_reason
+        candidate["risk_multiplier"] = round(
+            min(float(candidate.get("risk_multiplier", 1.0)), TACTICAL_RISK_MULTIPLIER_CAP),
+            2,
+        )
+        candidate["reasons"].append(
+            "Modo táctico: macro 1D no está perfecto, pero 4H y 15m están alineados con score alto."
+        )
+    else:
+        candidate["alert"] = False
+
     candidate["setup_key"] = build_setup_key(candidate)
     candidate["setup_hash"] = build_setup_hash(candidate["setup_key"])
 
     blockers: List[str] = []
-    if not candidate["macro_ok"]:
+    if not candidate["macro_ok"] and not tactical_alert:
         blockers.append("macro")
     if not candidate["setup_ok"]:
         blockers.append("setup")
@@ -1540,9 +1611,11 @@ def build_candidate(
         f"15m={bool_icon(candidate['timing_ok'])}, "
         f"score={candidate['score']:.2f}, "
         f"rr={candidate['rr_ratio']:.2f}/{candidate['required_min_rr']:.2f}, "
+        f"profile={candidate['alert_profile']}, "
         f"alert={candidate['alert']} | blockers={blocker_text}"
     )
     return candidate
+
 
 
 # ── Invalidación / deduplicación ──────────────────────────────────────────────
@@ -1783,7 +1856,10 @@ def compute_rank_score(candidate: Dict[str, Any]) -> Tuple[float, List[str]]:
     if candidate.get("rank_adjustment", 0.0):
         notes.append(f"ajuste macro/timing {candidate['rank_adjustment']:+.2f}")
 
-    if candidate.get("confirmations_passed", 0) < 3:
+    if candidate.get("alert_profile") == "TACTICAL":
+        rank -= 6.0
+        notes.append("táctica 2/3")
+    elif candidate.get("confirmations_passed", 0) < 3:
         rank -= 50.0
         notes.append("sin 3/3 confirmaciones")
 
@@ -1843,6 +1919,21 @@ def build_human_signal_summary(candidate: Dict[str, Any]) -> Dict[str, str]:
     timing_points = float(candidate.get("timing", {}).get("points", 0.0))
     final_score = float(candidate.get("score", 0.0))
     adx = float(candidate.get("adx", 0.0))
+
+    if candidate.get("alert") and candidate.get("alert_profile") == "TACTICAL":
+        if side == SIDE_LONG:
+            return {
+                "label": "COMPRA TÁCTICA",
+                "reading": "La estructura de 4H y el timing de 15m son fuertes, aunque el diario aún no está totalmente alineado.",
+                "main_risk": "El principal riesgo es que el 1D siga pesado y limite la extensión del movimiento.",
+                "recommendation": "Ejecutar solo como trade táctico, con tamaño reducido y gestión rápida en TP1/BE.",
+            }
+        return {
+            "label": "VENTA TÁCTICA",
+            "reading": "La presión de 4H y el timing de 15m son sólidos, aunque el diario aún no confirma todo el escenario.",
+            "main_risk": "El principal riesgo es un rebote del 1D que frene la continuación bajista.",
+            "recommendation": "Ejecutar solo como trade táctico, con tamaño reducido y gestión rápida en TP1/BE.",
+        }
 
     if side == SIDE_LONG:
         strong_label = "COMPRA FUERTE"
@@ -2325,14 +2416,16 @@ def format_message(candidate: Dict[str, Any], decision_reason: str) -> str:
         f"{'resistencia' if side == SIDE_LONG else 'soporte'} estructural\n"
     )
 
+    profile_label = "LÁSER" if candidate.get("alert_profile") == "FULL" else ("TÁCTICA" if candidate.get("alert_profile") == "TACTICAL" else "WATCH")
     return (
-        f"{side_icon(side)} <b>ALERTA {esc(side)}: {esc(candidate['symbol'])}</b>\n"
+        f"{side_icon(side)} <b>ALERTA {esc(side)} {esc(profile_label)}: {esc(candidate['symbol'])}</b>\n"
         f"🗣️ <b>Lectura:</b> {esc(human['label'])}\n\n"
         f"📌 <b>Resumen:</b> {esc(human['reading'])}\n"
         f"⚠️ <b>Riesgo principal:</b> {esc(human['main_risk'])}\n"
         f"✅ <b>Recomendación:</b> {esc(human['recommendation'])}\n\n"
         f"⏱️ <b>Timeframe:</b> {esc(candidate['timeframe'])}\n"
         f"🎯 <b>Lado:</b> {esc(side)}\n"
+        f"🧬 <b>Perfil:</b> {esc(profile_label)}\n"
         f"💰 <b>Precio:</b> ${candidate['entry_price']:.4f}\n"
         f"📊 <b>Score:</b> {candidate['score']:.2f}\n"
         f"📈 <b>ADX:</b> {candidate['adx']:.2f}\n"
@@ -2384,9 +2477,10 @@ def format_run_summary(
         lines.append("🏆 <b>Enviadas:</b>")
         for item in selected:
             human = build_human_signal_summary(item)
+            profile = str(item.get("alert_profile", "FULL"))
             lines.append(
                 f"• {esc(item['symbol'])} {esc(item['side'])} | {esc(human['label'])} | "
-                f"prioridad {item['rank_score']:.2f}"
+                f"{esc(profile)} | prioridad {item['rank_score']:.2f}"
             )
     else:
         lines.append("🏆 <b>Enviadas:</b> 0")
@@ -2396,9 +2490,10 @@ def format_run_summary(
         lines.append("⏸️ <b>Diferidas por ranking/diversificación:</b>")
         for item in deferred[:8]:
             human = build_human_signal_summary(item)
+            profile = str(item.get("alert_profile", "FULL"))
             lines.append(
                 f"• {esc(item['symbol'])} {esc(item['side'])} | {esc(human['label'])} | "
-                f"prioridad {item['rank_score']:.2f} | grupo {esc(item['asset_group'])}"
+                f"{esc(profile)} | prioridad {item['rank_score']:.2f} | grupo {esc(item['asset_group'])}"
             )
 
     if watch_candidates:
@@ -2509,7 +2604,7 @@ def main() -> None:
         for idx, item in enumerate(ranked_candidates, start=1):
             print(
                 f"   {idx}. {item['symbol']} {item['side']} | prioridad={item['rank_score']:.2f} | "
-                f"grupo={item['asset_group']} | 3/3 | score={item['score']:.2f}"
+                f"grupo={item['asset_group']} | perfil={item.get('alert_profile','FULL')} | score={item['score']:.2f}"
             )
 
     selected_candidates, deferred_candidates = select_ranked_candidates(ranked_candidates)

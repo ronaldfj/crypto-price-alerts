@@ -75,27 +75,18 @@ INVALIDATED = "INVALIDATED"
 EXPIRED = "EXPIRED"
 
 
-def send_telegram(message: str, reply_markup: Optional[Dict[str, Any]] = None) -> bool:
-    """
-    Envía un mensaje a Telegram.
-    Si se pasa reply_markup (botones inline), los incluye en el mensaje.
-    Esto permite que las alertas de compra tengan botones Aprobar/Rechazar
-    que son procesados por trader_bot.py corriendo en Railway.
-    """
+def send_telegram(message: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Telegram no configurado. Se omite el envío.")
         return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload: Dict[str, Any] = {
+    payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-
     try:
         response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
         if response.status_code != 200:
@@ -578,47 +569,20 @@ def evaluate_macro_confirmation(daily_df: pd.DataFrame, symbol: str, context: Di
     except (TypeError, ValueError):
         require_breakout_above = None
 
-    # Sistema de puntos 1D: 3 de 4 criterios en lugar de los 4 en AND.
-    # Permite que el bot opere en condiciones reales donde un criterio
-    # puede estar marginalmente fuera sin invalidar el contexto completo.
-    macro_points = 0
-    macro_point_reasons: List[str] = []
-
-    if close > ema20:
-        macro_points += 1
-    else:
-        macro_point_reasons.append(f"close ({close:.4f}) <= EMA20 ({ema20:.4f})")
-
-    if ema20 >= ema50:
-        macro_points += 1
-    else:
-        macro_point_reasons.append(f"EMA20 ({ema20:.4f}) < EMA50 ({ema50:.4f})")
-
-    if 43 <= rsi <= 72:
-        macro_points += 1
-    else:
-        macro_point_reasons.append(f"RSI {rsi:.1f} fuera de rango 43-72")
-
-    if plus_di >= minus_di or adx < 20:
-        macro_points += 1
-    else:
-        macro_point_reasons.append(f"DI+ ({plus_di:.1f}) < DI- ({minus_di:.1f}) con ADX ({adx:.1f}) >= 20")
-
-    technical_ok = macro_points >= 3
+    technical_ok = (
+        close > ema20
+        and ema20 >= ema50
+        and rsi >= 45
+        and rsi <= 70
+        and (plus_di >= minus_di or adx < 18)
+    )
 
     if regime == "BULL_STACK":
         reasons.append("Diario con estructura alcista")
     elif technical_ok:
-        criteria_met = 4 - len(macro_point_reasons)
-        reasons.append(
-            f"Diario permite longs ({criteria_met}/4 criterios: "
-            f"{'falla: ' + ', '.join(macro_point_reasons) if macro_point_reasons else 'todos ok'})"
-        )
+        reasons.append("Diario permite longs, aunque no está en pila alcista completa")
     else:
-        reasons.append(
-            f"Diario no confirma longs — solo {macro_points}/4 criterios: "
-            + ", ".join(macro_point_reasons)
-        )
+        reasons.append("Diario no confirma longs con claridad")
 
     if hard_block_long or SIDE_LONG not in allowed_sides:
         macro_ok = False
@@ -983,13 +947,10 @@ def evaluate_timing_confirmation(entry_df: pd.DataFrame, symbol: str) -> Optiona
             hard_fail = True
 
     if distance_to_local_high_pct <= 0.20:
-        # Era hard_fail=True. Ahora penaliza fuerte pero no bloquea.
-        # Razón: en mercados consolidando el precio está casi siempre
-        # cerca del máximo local de 24 velas, lo que hacía que este filtro
-        # eliminara la mayoría de señales válidas.
         reasons.append(f"Pegado a micro-resistencia ({distance_to_local_high_pct:.2f}% del máximo local)")
-        score_adjustment -= 0.50
-        rank_adjustment -= 1.5
+        score_adjustment -= 0.35
+        rank_adjustment -= 0.8
+        hard_fail = True
     elif distance_to_local_high_pct <= 0.60:
         reasons.append(f"Cerca del máximo local ({distance_to_local_high_pct:.2f}%)")
         score_adjustment -= 0.10
@@ -1103,49 +1064,6 @@ def build_candidate(
         f"15m={bool_icon(candidate['timing_ok'])}, "
         f"score={candidate['score']:.2f}, rr={candidate['rr_ratio']:.2f}, alert={candidate['alert']}"
     )
-
-    # ── Diagnóstico detallado por capa ────────────────────────────────────────
-    # Muestra exactamente qué filtro bloqueó la señal en cada timeframe.
-    if not candidate["macro_ok"]:
-        rsi_1d  = macro_eval.get("rsi", 0)
-        close_1d = macro_eval.get("close", 0)
-        ema20_1d = macro_eval.get("ema20", 0)
-        ema50_1d = macro_eval.get("ema50", 0)
-        close_vs_ema20 = ">" if close_1d > ema20_1d else "<="
-        ema20_vs_ema50 = ">=" if ema20_1d >= ema50_1d else "<"
-        print(
-            f"   └─ 1D BLOQUEADO | RSI={rsi_1d:.1f} (necesita 43-72) | "
-            f"close {close_vs_ema20} EMA20 | "
-            f"EMA20 {ema20_vs_ema50} EMA50 | "
-            f"régimen={macro_eval.get('regime', '?')}"
-        )
-        print(f"      Razones 1D: {' | '.join(macro_eval.get('reasons', []))}")
-
-    if not candidate["setup_ok"]:
-        s_eval = setup_eval
-        trend_ok   = s_eval.get("regime") == "BULL_STACK" or (
-            s_eval.get("regime") != "BEAR_STACK"
-        )
-        print(
-            f"   └─ 4H BLOQUEADO | score={s_eval.get('score', 0):.2f} "
-            f"(floor={s_eval.get('setup_score_floor', 0):.2f}) | "
-            f"rr={candidate['rr_ratio']:.2f} | "
-            f"régimen={s_eval.get('regime', '?')} | "
-            f"ADX={s_eval.get('adx', 0):.1f} | RSI={s_eval.get('rsi', 0):.1f}"
-        )
-        print(f"      Razones 4H: {' | '.join(s_eval.get('reasons', [])[-5:])}")
-
-    if not candidate["timing_ok"]:
-        t_eval = timing_eval
-        print(
-            f"   └─ 15m BLOQUEADO | points={t_eval.get('points', 0):.2f} "
-            f"(necesita >=2.4 y sin hard_fail) | "
-            f"RSI={t_eval.get('rsi', 0):.1f} | "
-            f"VWAP={t_eval.get('vwap_distance_pct', 0):+.1f}% | "
-            f"dist_max_local={t_eval.get('distance_to_local_high_pct', 0):.2f}%"
-        )
-        print(f"      Razones 15m: {' | '.join(t_eval.get('reasons', []))}")
-
     return candidate
 
 # ── Invalidación / deduplicación ──────────────────────────────────────────────
@@ -1641,32 +1559,6 @@ def format_run_summary(
 
     return "\n".join(lines)
 
-# ── Botones inline para trader_bot.py ────────────────────────────────────────
-def build_trade_buttons(candidate: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Construye el reply_markup con botones inline Aprobar/Rechazar.
-    El callback_data contiene los datos necesarios para que trader_bot.py
-    ejecute la orden sin necesidad de estado compartido.
-    Formato: approve:{symbol}|{entry}|{stop}|{tp1}|{tp2}|{ts}
-    """
-    symbol = candidate["symbol"]
-    entry  = candidate["entry_price"]
-    stop   = candidate["stop_loss"]
-    tp1    = candidate.get("tp1", entry * 1.01)
-    tp2    = candidate.get("tp2", candidate.get("take_profit", entry * 1.02))
-    ts     = int(time.time())
-
-    approve_data = f"approve:{symbol}|{entry:.6f}|{stop:.6f}|{tp1:.6f}|{tp2:.6f}|{ts}"
-    reject_data  = f"reject:{symbol}|{ts}"
-
-    return {
-        "inline_keyboard": [[
-            {"text": "✅ Ejecutar", "callback_data": approve_data},
-            {"text": "❌ Rechazar", "callback_data": reject_data},
-        ]]
-    }
-
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
     start = time.time()
@@ -1762,12 +1654,7 @@ def main() -> None:
             print(f"   - {item['symbol']}: {human['label']}")
 
     for candidate in selected_candidates:
-        # Construir botones inline Aprobar/Rechazar para trader_bot.py
-        trade_buttons = build_trade_buttons(candidate)
-        sent_ok = send_telegram(
-            format_message(candidate, candidate["decision_reason"]),
-            reply_markup=trade_buttons,
-        )
+        sent_ok = send_telegram(format_message(candidate, candidate["decision_reason"]))
         if sent_ok:
             save_alert(conn, candidate, candidate.get("improved_from_alert_id"))
             sent_count += 1

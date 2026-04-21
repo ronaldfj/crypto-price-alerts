@@ -1470,6 +1470,19 @@ def apply_context_execution_policy(candidate: Dict[str, Any], macro_eval: Dict[s
 
 
 # ── Integración multi-timeframe ───────────────────────────────────────────────
+
+def compute_required_min_rr(candidate: Dict[str, Any], macro_eval: Dict[str, Any]) -> float:
+    """
+    Evita contradicciones entre el filtro global MIN_RR y los caps tácticos del contexto.
+    Si el contexto recorta el target máximo a 1.20R / 1.55R, no tiene sentido exigir 2.0R.
+    Conserva el umbral más estricto que siga siendo alcanzable por la política vigente.
+    """
+    rr_policy_cap = max(
+        float(candidate.get("tp2_rr", candidate.get("rr_ratio", MIN_RR))),
+        float(macro_eval.get("min_structural_room_rr", 1.0)),
+    )
+    return round(max(1.0, min(float(MIN_RR), rr_policy_cap)), 2)
+
 def build_candidate(
     symbol: str,
     cg_id: str,
@@ -1498,15 +1511,36 @@ def build_candidate(
 
     candidate = apply_context_execution_policy(candidate, macro_eval)
     candidate["confirmations_passed"] = int(candidate["macro_ok"]) + int(candidate["setup_ok"]) + int(candidate["timing_ok"])
-    candidate["alert"] = candidate["confirmations_passed"] == 3 and candidate["score"] >= MIN_SCORE and candidate["rr_ratio"] >= MIN_RR
+    candidate["required_min_rr"] = compute_required_min_rr(candidate, macro_eval)
+    candidate["alert"] = (
+        candidate["confirmations_passed"] == 3
+        and candidate["score"] >= MIN_SCORE
+        and candidate["rr_ratio"] >= candidate["required_min_rr"]
+    )
     candidate["setup_key"] = build_setup_key(candidate)
     candidate["setup_hash"] = build_setup_hash(candidate["setup_key"])
+
+    blockers: List[str] = []
+    if not candidate["macro_ok"]:
+        blockers.append("macro")
+    if not candidate["setup_ok"]:
+        blockers.append("setup")
+    if not candidate["timing_ok"]:
+        blockers.append("timing")
+    if candidate["score"] < MIN_SCORE:
+        blockers.append(f"score<{MIN_SCORE:.2f}")
+    if candidate["rr_ratio"] < candidate["required_min_rr"]:
+        blockers.append(f"rr<{candidate['required_min_rr']:.2f}")
+
+    blocker_text = "ok" if not blockers else ",".join(blockers)
 
     print(
         f"🔍 {symbol} {side}: 1D={bool_icon(candidate['macro_ok'])}, "
         f"4H={bool_icon(candidate['setup_ok'])}, "
         f"15m={bool_icon(candidate['timing_ok'])}, "
-        f"score={candidate['score']:.2f}, rr={candidate['rr_ratio']:.2f}, alert={candidate['alert']}"
+        f"score={candidate['score']:.2f}, "
+        f"rr={candidate['rr_ratio']:.2f}/{candidate['required_min_rr']:.2f}, "
+        f"alert={candidate['alert']} | blockers={blocker_text}"
     )
     return candidate
 

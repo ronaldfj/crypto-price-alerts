@@ -83,6 +83,17 @@ TACTICAL_MIN_SCORE = float(os.getenv("TACTICAL_MIN_SCORE", "8.0"))
 TACTICAL_MIN_TIMING_POINTS = float(os.getenv("TACTICAL_MIN_TIMING_POINTS", "3.0"))
 TACTICAL_RISK_MULTIPLIER_CAP = float(os.getenv("TACTICAL_RISK_MULTIPLIER_CAP", "0.75"))
 
+# Capa de calidad de ejecución: evita alertas técnicamente válidas pero tardías.
+ENABLE_EXECUTION_QUALITY_GATE = os.getenv("ENABLE_EXECUTION_QUALITY_GATE", "true").lower() == "true"
+EXECUTION_MIN_CURRENT_RR = float(os.getenv("EXECUTION_MIN_CURRENT_RR", "1.00"))
+EXECUTION_CAUTION_CURRENT_RR = float(os.getenv("EXECUTION_CAUTION_CURRENT_RR", "1.30"))
+EXECUTION_CAUTION_TP1_PROGRESS = float(os.getenv("EXECUTION_CAUTION_TP1_PROGRESS", "0.25"))
+EXECUTION_MAX_TP1_PROGRESS = float(os.getenv("EXECUTION_MAX_TP1_PROGRESS", "0.45"))
+EXECUTION_HARD_MAX_TP1_PROGRESS = float(os.getenv("EXECUTION_HARD_MAX_TP1_PROGRESS", "0.60"))
+EXECUTION_HIGH_CAUTION_MAX_PROGRESS = float(os.getenv("EXECUTION_HIGH_CAUTION_MAX_PROGRESS", "0.30"))
+EXECUTION_TACTICAL_RISK_CAP = float(os.getenv("EXECUTION_TACTICAL_RISK_CAP", "0.65"))
+
+
 SIDE_LONG = "LONG"
 SIDE_SHORT = "SHORT"
 VALID_SIDES = (SIDE_LONG, SIDE_SHORT)
@@ -1500,6 +1511,143 @@ def compute_required_min_rr(candidate: Dict[str, Any], macro_eval: Dict[str, Any
 
 
 
+def latest_price_from_df(price_df: Optional[pd.DataFrame]) -> Optional[float]:
+    if price_df is None or price_df.empty or "price" not in price_df.columns:
+        return None
+    try:
+        value = float(price_df.dropna(subset=["price"]).iloc[-1]["price"])
+        return value if math.isfinite(value) and value > 0 else None
+    except Exception:
+        return None
+
+
+def execution_metrics_for_candidate(candidate: Dict[str, Any], current_price: Optional[float]) -> Dict[str, Any]:
+    side = candidate["side"]
+    signal_price = float(candidate["entry_price"])
+    current = float(current_price if current_price is not None else signal_price)
+    stop = float(candidate["stop_loss"])
+    tp1 = float(candidate.get("tp1", candidate.get("take_profit", signal_price)))
+    tp2 = float(candidate.get("tp2", candidate.get("take_profit", tp1)))
+
+    if side == SIDE_LONG:
+        current_risk = current - stop
+        original_tp1_distance = max(tp1 - signal_price, 1e-9)
+        favorable_move = current - signal_price
+        valid_side = current > stop
+        tp1_remaining = tp1 - current
+        tp2_remaining = tp2 - current
+    else:
+        current_risk = stop - current
+        original_tp1_distance = max(signal_price - tp1, 1e-9)
+        favorable_move = signal_price - current
+        valid_side = current < stop
+        tp1_remaining = current - tp1
+        tp2_remaining = current - tp2
+
+    progress_to_tp1 = favorable_move / original_tp1_distance
+    current_rr_tp1 = tp1_remaining / max(current_risk, 1e-9) if valid_side else -99.0
+    current_rr_tp2 = tp2_remaining / max(current_risk, 1e-9) if valid_side else -99.0
+    price_drift_pct = ((current - signal_price) / max(signal_price, 1e-9)) * 100
+    favorable_drift_pct = (favorable_move / max(signal_price, 1e-9)) * 100
+
+    return {
+        "signal_price": round(signal_price, 8),
+        "current_price": round(current, 8),
+        "original_rr": round(float(candidate.get("rr_ratio", 0.0)), 2),
+        "current_rr_tp1": round(current_rr_tp1, 2),
+        "current_rr_tp2": round(current_rr_tp2, 2),
+        "progress_to_tp1": round(progress_to_tp1, 4),
+        "progress_to_tp1_pct": round(progress_to_tp1 * 100, 1),
+        "price_drift_pct": round(price_drift_pct, 2),
+        "favorable_drift_pct": round(favorable_drift_pct, 2),
+        "current_risk": round(current_risk, 8),
+        "valid_side": bool(valid_side),
+        "tp1_remaining": round(tp1_remaining, 8),
+        "tp2_remaining": round(tp2_remaining, 8),
+    }
+
+
+def apply_execution_quality_gate(candidate: Dict[str, Any], current_price: Optional[float]) -> Dict[str, Any]:
+    """
+    Clasifica si una señal sigue siendo ejecutable al precio actual.
+    Evita convertir en alerta una señal válida que ya corrió demasiado hacia TP1
+    o cuyo R:R real se deterioró por llegar tarde.
+    """
+    metrics = execution_metrics_for_candidate(candidate, current_price)
+    candidate["execution"] = metrics
+    candidate["execution_state"] = "NOT_CHECKED"
+    candidate["execution_decision"] = "Filtro de ejecución desactivado"
+
+    if not ENABLE_EXECUTION_QUALITY_GATE:
+        return candidate
+
+    current_rr = float(metrics["current_rr_tp2"])
+    progress = float(metrics["progress_to_tp1"])
+    progress_pct = float(metrics["progress_to_tp1_pct"])
+    caution_level = str(candidate.get("macro", {}).get("caution_level", "NORMAL")).upper()
+    state = "EXECUTABLE"
+    decision = "Entrada ejecutable al precio actual"
+    blockers: List[str] = []
+    warnings: List[str] = []
+
+    if not metrics["valid_side"]:
+        state = "INVALID_NOW"
+        blockers.append("precio actual ya vulneró el stop")
+    elif current_rr < EXECUTION_MIN_CURRENT_RR:
+        state = "INVALID_NOW"
+        blockers.append(f"R:R actual {current_rr:.2f}R < mínimo {EXECUTION_MIN_CURRENT_RR:.2f}R")
+    elif progress >= EXECUTION_HARD_MAX_TP1_PROGRESS:
+        state = "LATE"
+        blockers.append(f"ya recorrió {progress_pct:.1f}% hacia TP1")
+    elif progress >= EXECUTION_MAX_TP1_PROGRESS:
+        state = "LATE"
+        blockers.append(f"entrada tardía: {progress_pct:.1f}% hacia TP1")
+    elif caution_level in {"HIGH", "EXTREME"} and progress >= EXECUTION_HIGH_CAUTION_MAX_PROGRESS:
+        state = "LATE"
+        blockers.append(f"cautela {caution_level} y avance {progress_pct:.1f}% hacia TP1")
+    else:
+        if progress >= EXECUTION_CAUTION_TP1_PROGRESS:
+            state = "CAUTION"
+            warnings.append(f"avance {progress_pct:.1f}% hacia TP1")
+        if current_rr < EXECUTION_CAUTION_CURRENT_RR:
+            state = "CAUTION"
+            warnings.append(f"R:R actual moderado {current_rr:.2f}R")
+
+    if state in {"INVALID_NOW", "LATE"}:
+        candidate["alert"] = False
+        decision = "; ".join(blockers) if blockers else "Entrada no ejecutable al precio actual"
+        candidate["reasons"].append(f"Execution gate: {decision}")
+    elif state == "CAUTION":
+        decision = "; ".join(warnings) if warnings else "Entrada ejecutable con cautela"
+        candidate["risk_multiplier"] = round(
+            min(float(candidate.get("risk_multiplier", 1.0)), EXECUTION_TACTICAL_RISK_CAP),
+            2,
+        )
+        candidate["reasons"].append(f"Execution gate: ejecutar con cautela ({decision})")
+    else:
+        decision = "Entrada ejecutable: precio aún no ha perseguido el movimiento"
+
+    candidate["execution_state"] = state
+    candidate["execution_decision"] = decision
+
+    if state in {"EXECUTABLE", "CAUTION"}:
+        # Si el usuario ejecuta ahora, el R:R real debe reflejar el precio actual, no solo la vela 4H.
+        candidate["signal_price"] = float(metrics["signal_price"])
+        candidate["entry_price"] = float(metrics["current_price"])
+        candidate["rr_ratio"] = round(float(metrics["current_rr_tp2"]), 2)
+        candidate["tp1_rr"] = round(float(metrics["current_rr_tp1"]), 2)
+        candidate["tp2_rr"] = round(float(metrics["current_rr_tp2"]), 2)
+        if candidate["side"] == SIDE_LONG:
+            risk = max(candidate["entry_price"] - candidate["stop_loss"], 1e-9)
+            candidate["breakeven_trigger"] = float(candidate["entry_price"] + risk * min(float(candidate.get("move_to_be_rr", 0.8)), max(float(metrics["current_rr_tp1"]), 0.1)))
+        else:
+            risk = max(candidate["stop_loss"] - candidate["entry_price"], 1e-9)
+            candidate["breakeven_trigger"] = float(candidate["entry_price"] - risk * min(float(candidate.get("move_to_be_rr", 0.8)), max(float(metrics["current_rr_tp1"]), 0.1)))
+
+    return candidate
+
+
+
 def compute_tactical_eligibility(
     candidate: Dict[str, Any],
     macro_eval: Dict[str, Any],
@@ -1919,6 +2067,15 @@ def build_human_signal_summary(candidate: Dict[str, Any]) -> Dict[str, str]:
     timing_points = float(candidate.get("timing", {}).get("points", 0.0))
     final_score = float(candidate.get("score", 0.0))
     adx = float(candidate.get("adx", 0.0))
+    exec_state = str(candidate.get("execution_state", "NOT_CHECKED"))
+    if candidate.get("alert") and exec_state == "CAUTION":
+        action = "compra" if side == SIDE_LONG else "venta"
+        return {
+            "label": f"{side_label(side)} EJECUTABLE CON CAUTELA",
+            "reading": "La señal técnica existe, pero la calidad de entrada ya no es perfecta al precio actual.",
+            "main_risk": str(candidate.get("execution_decision", "El precio ya avanzó o el R:R se redujo.")),
+            "recommendation": f"Considerar {action} solo con tamaño reducido y gestión rápida; no perseguir si sigue alejándose.",
+        }
 
     if candidate.get("alert") and candidate.get("alert_profile") == "TACTICAL":
         if side == SIDE_LONG:
@@ -2404,7 +2561,23 @@ def format_message(candidate: Dict[str, Any], decision_reason: str) -> str:
         caution_line += f"📝 <b>Nota macro:</b> {esc(str(macro_eval['note']))}\n"
 
     risk_multiplier = float(candidate.get("risk_multiplier", 1.0))
+    exec_data = candidate.get("execution", {})
+    exec_state = str(candidate.get("execution_state", "NOT_CHECKED"))
+    exec_icon = "🟢" if exec_state == "EXECUTABLE" else ("🟡" if exec_state == "CAUTION" else "🔴")
+    signal_price_line = ""
+    if exec_data and abs(float(exec_data.get("signal_price", candidate["entry_price"])) - float(candidate["entry_price"])) > max(candidate["entry_price"] * 0.0001, 1e-9):
+        signal_price_line = f"📍 <b>Precio señal:</b> ${float(exec_data.get('signal_price', candidate['entry_price'])):.4f} | "
+    execution_quality_line = ""
+    if exec_data:
+        execution_quality_line = (
+            f"{exec_icon} <b>Decisión ejecución:</b> {esc(exec_state)} | {esc(str(candidate.get('execution_decision', '')))}\n"
+            f"{signal_price_line}<b>Precio actual usado:</b> ${float(exec_data.get('current_price', candidate['entry_price'])):.4f}\n"
+            f"⚖️ <b>R:R actual:</b> TP1 {float(exec_data.get('current_rr_tp1', candidate.get('tp1_rr', 0))):.2f}R | "
+            f"TP2 {float(exec_data.get('current_rr_tp2', candidate.get('tp2_rr', candidate['rr_ratio']))):.2f}R | "
+            f"avance TP1 {float(exec_data.get('progress_to_tp1_pct', 0.0)):.1f}%\n"
+        )
     execution_line = (
+        f"{execution_quality_line}"
         f"🧪 <b>Plan de salida:</b> TP1 ${candidate.get('tp1', 0):.4f} ({candidate.get('tp1_rr', 0):.2f}R) | "
         f"TP2 ${candidate.get('tp2', candidate['take_profit']):.4f} ({candidate.get('tp2_rr', candidate['rr_ratio']):.2f}R)\n"
         f"🛟 <b>Breakeven:</b> mover SL al tocar ${candidate.get('breakeven_trigger', 0):.4f} "
@@ -2480,7 +2653,7 @@ def format_run_summary(
             profile = str(item.get("alert_profile", "FULL"))
             lines.append(
                 f"• {esc(item['symbol'])} {esc(item['side'])} | {esc(human['label'])} | "
-                f"{esc(profile)} | prioridad {item['rank_score']:.2f}"
+                f"{esc(profile)} | {esc(str(item.get('execution_state', '')))} | prioridad {item['rank_score']:.2f}"
             )
     else:
         lines.append("🏆 <b>Enviadas:</b> 0")
@@ -2547,6 +2720,7 @@ def main() -> None:
         daily_prices = get_market_prices(cg_id, DAILY_LOOKBACK_DAYS, interval=None)
         fourh_prices = get_market_prices(cg_id, HOURLY_LOOKBACK_DAYS, interval=HOURLY_INTERVAL)
         intraday_prices = get_market_prices(cg_id, INTRADAY_LOOKBACK_DAYS, interval=None)
+        current_price = latest_price_from_df(intraday_prices)
 
         daily_df = build_ohlc_from_prices(daily_prices, "1D", 220) if daily_prices is not None else None
         fourh_df = build_ohlc_from_prices(fourh_prices, TRADING_TIMEFRAME, 220) if fourh_prices is not None else None
@@ -2572,12 +2746,16 @@ def main() -> None:
                 continue
 
             candidate = build_candidate(symbol, cg_id, macro_eval, setup_eval, timing_eval)
+            candidate = apply_execution_quality_gate(candidate, current_price)
             invalidate_old_alerts(conn, candidate)
 
             if not candidate["alert"]:
+                exec_suffix = ""
+                if candidate.get("execution_state") in {"INVALID_NOW", "LATE"}:
+                    exec_suffix = f" | ejecución {candidate.get('execution_state')}: {candidate.get('execution_decision')}"
                 reason = (
                     f"{symbol} {side}: confirmaciones {candidate['confirmations_passed']}/3 | "
-                    f"score {candidate['score']:.2f} | rr {candidate['rr_ratio']:.2f}"
+                    f"score {candidate['score']:.2f} | rr {candidate['rr_ratio']:.2f}{exec_suffix}"
                 )
                 blocked_messages.append(reason)
                 if candidate.get("macro_ok") or candidate.get("setup_ok"):

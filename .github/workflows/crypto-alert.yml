@@ -2,7 +2,7 @@ name: Crypto Alert Bot
 
 on:
   schedule:
-    - cron: '0 * * * *'   # cada hora
+    - cron: '0 */2 * * *'   # cada hora
   workflow_dispatch:
 
 permissions:

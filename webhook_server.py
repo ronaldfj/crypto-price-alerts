@@ -5,7 +5,7 @@ import logging
 from flask import Flask, request, Response
 from telegram import Update, Bot
 from telegram.ext import Dispatcher, CallbackQueryHandler
-from mt5_executor import execute_order
+from deriv_executor import execute_order  # Cambiamos a deriv_executor
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
@@ -55,7 +55,7 @@ def handle_callback(update, context):
         conn.commit()
         conn.close()
 
-        # Ejecutar orden en MT5
+        # Ejecutar orden en Deriv
         result = execute_order(dict(alert))
         conn = get_db_connection()
         if result["success"]:
@@ -64,9 +64,9 @@ def handle_callback(update, context):
                 (int(time.time()), result["order_id"], alert_id)
             )
             conn.commit()
-            query.answer(f"✅ Orden ejecutada: {result['order_id']}")
+            query.answer(f"✅ Orden ejecutada en Deriv: {result['order_id']}")
             query.edit_message_text(
-                text=query.message.text + f"\n\n✅ **ORDEN ENVIADA A MT5**\nOrden: {result['order_id']} | Symbol: {alert['symbol']} | Side: {alert['side']}",
+                text=query.message.text + f"\n\n✅ **ORDEN ENVIADA A DERIV**\nOrden: {result['order_id']} | Symbol: {alert['symbol']} | Side: {alert['side']}",
                 parse_mode="HTML"
             )
         else:
@@ -75,7 +75,7 @@ def handle_callback(update, context):
                 (int(time.time()), result["error"], alert_id)
             )
             conn.commit()
-            query.answer(f"❌ Error: {result['error']}", show_alert=True)
+            query.answer(f"❌ Error en Deriv: {result['error']}", show_alert=True)
         conn.close()
 
     elif data.startswith("reject:"):

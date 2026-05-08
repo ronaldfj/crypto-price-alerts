@@ -1,15 +1,25 @@
 """
 backtester.py — Backtesting histórico del Crypto Sentinel Bot
 
-Reutiliza la lógica exacta de alert.py para simular señales pasadas
-y calcular métricas reales: win rate, profit factor, max drawdown.
+Reutiliza la lógica de alert.py para simular señales pasadas.
+
+⚠️  ADVERTENCIA — VERSIÓN v3.0 (migración a Binance):
+Esta versión migra la fuente de datos a Binance Spot klines, lo cual ELIMINA el
+sesgo de fuente (CG agregado vs OHLCV real de exchange). Sin embargo, todavía
+queda un look-ahead leve en el slide histórico: `daily_full` y `entry_full` se
+descargan completos al inicio y luego se truncan por timestamp, pero su última
+vela "cerrada" ya refleja datos del momento de descarga, no del momento simulado.
+
+Para análisis preliminar es aceptable. NO usar como prueba de expectancy real
+para decisiones de capital. El arreglo definitivo (point-in-time correcto +
+fees + slippage) está en backlog v3.1.
 
 Uso:
-    python backtester.py                        # todos los activos, 90 días
+    python backtester.py                        # todos los activos
     python backtester.py --symbol BTC --days 60
     python backtester.py --symbol SOL --min-score 7.0
 
-Requiere las mismas variables de entorno que alert.py.
+Requiere acceso público a https://api.binance.com (sin API key).
 """
 
 import argparse
@@ -26,24 +36,25 @@ sys.path.insert(0, os.path.dirname(__file__))
 from alert import (
     CRYPTO_IDS,
     DAILY_LOOKBACK_DAYS,
+    ENTRY_TIMEFRAME,
     HOURLY_LOOKBACK_DAYS,
-    HOURLY_INTERVAL,
     INTRADAY_LOOKBACK_DAYS,
     MARKET_CONTEXT_FILE,
     MIN_SCORE,
     MIN_RR,
     SLEEP_BETWEEN_ASSETS,
     TRADING_TIMEFRAME,
+    apply_context_execution_policy,
     build_candidate,
-    build_ohlc_from_prices,
     evaluate_macro_confirmation,
     evaluate_setup_confirmation,
     evaluate_timing_confirmation,
     fetch_btc_dominance,
-    get_market_prices,
+    fetch_ohlc_for_symbol,
     load_market_context,
     normalize_context,
 )
+import data_source
 
 
 # ── Configuración del backtester ──────────────────────────────────────────────
@@ -133,20 +144,13 @@ def backtest_symbol(
     """
     print(f"  [{symbol}] Descargando datos...")
 
-    daily_prices = get_market_prices(cg_id, DAILY_LOOKBACK_DAYS, interval=None)
-    fourh_prices = get_market_prices(cg_id, HOURLY_LOOKBACK_DAYS, interval=HOURLY_INTERVAL)
-    intraday_prices = get_market_prices(cg_id, INTRADAY_LOOKBACK_DAYS, interval=None)
-
-    if daily_prices is None or fourh_prices is None or intraday_prices is None:
-        print(f"  [{symbol}] Datos insuficientes — saltando.")
-        return []
-
-    daily_full = build_ohlc_from_prices(daily_prices, "1D", 220)
-    fourh_full = build_ohlc_from_prices(fourh_prices, TRADING_TIMEFRAME, 220)
-    entry_full = build_ohlc_from_prices(intraday_prices, INTRADAY_LOOKBACK_DAYS * 96, 30)
+    # Fuente única: Binance Spot. Pedimos ventana amplia para slide histórico.
+    daily_full = fetch_ohlc_for_symbol(symbol, "1d", min(DAILY_LOOKBACK_DAYS, 500))
+    fourh_full = fetch_ohlc_for_symbol(symbol, TRADING_TIMEFRAME, min(HOURLY_LOOKBACK_DAYS * 6, 1000))
+    entry_full = fetch_ohlc_for_symbol(symbol, ENTRY_TIMEFRAME, min(INTRADAY_LOOKBACK_DAYS * 96, 1000))
 
     if daily_full is None or fourh_full is None or entry_full is None:
-        print(f"  [{symbol}] OHLC insuficiente — saltando.")
+        print(f"  [{symbol}] Datos insuficientes — saltando.")
         return []
 
     total_4h = len(fourh_full)

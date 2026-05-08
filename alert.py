@@ -106,7 +106,45 @@ CLOSED = "CLOSED"
 VALIDATION_PENDING = "PENDING"
 VALIDATION_RESOLVED = "RESOLVED"
 
-
+def binance_deeplink(symbol: str, side: str, price: float, quantity: float = 10.0) -> str:
+    """
+    Genera un enlace para abrir la app de Binance (o web) con la orden preconfigurada.
+    - symbol: ejemplo 'BTCUSDT'
+    - side: 'BUY' o 'SELL'
+    - price: precio límite
+    - quantity: cantidad en la moneda base (BTC, ETH, etc.) o quote (USDT) según tipo.
+    Para spot, quantity es la cantidad de la moneda base (ej: 0.0005 BTC).
+    Por simplicidad, usaremos cantidad fija en USDT: quantity_in_usdt = 10.
+    Calculamos la cantidad real = 10 / price.
+    """
+    try:
+        # Asumimos que el símbolo termina en USDT (ej: BTCUSDT)
+        qty = quantity / price  # cantidad de la moneda base (BTC, ETH, etc.)
+        qty = round(qty, 6)  # Binance suele permitir hasta 6 decimales
+        # Para evitar órdenes muy pequeñas, redondeamos sensatamente
+        if qty < 1e-6:
+            qty = 0.000001
+        # Construir URL para la app (esquema binance://)
+        # Formato aproximado: binance://trade?symbol=BTCUSDT&side=BUY&type=LIMIT&price=50000&quantity=0.0002
+        side_up = side.upper()
+        side_param = "BUY" if side_up == "LONG" else "SELL"
+        # Si es SHORT, en spot sería VENTA
+        # Nota: En spot solo se puede comprar o vender, no "SHORT". Por tanto mapeamos LONG->BUY, SHORT->SELL
+        # En tu alerta, side puede ser "LONG" o "SHORT". Para spot, SHORT significa vender.
+        binance_url = (
+            f"binance://trade?symbol={symbol}&side={side_param}"
+            f"&type=LIMIT&price={price}&quantity={qty}"
+        )
+        # También generamos un enlace web como respaldo (si la app no está instalada)
+        web_url = (
+            f"https://www.binance.com/en/trade/{symbol}?type=spot"
+            f"&side={side_param.lower()}&price={price}&quantity={qty}"
+        )
+        # Devolvemos ambos: primero el deep link, luego el web
+        return f"<a href='{binance_url}'>📱 Abrir en app Binance</a> | <a href='{web_url}'>🌐 Abrir en web</a>"
+    except Exception as e:
+        return f"⚠️ Error generando enlace: {e}"
+        
 def send_telegram(message: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Telegram no configurado. Se omite el envío.")

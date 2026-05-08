@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import hashlib
@@ -13,6 +12,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 import requests
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 CRYPTO_IDS = {
     "bitcoin": "BTC",
@@ -83,7 +83,6 @@ TACTICAL_MIN_SCORE = float(os.getenv("TACTICAL_MIN_SCORE", "8.0"))
 TACTICAL_MIN_TIMING_POINTS = float(os.getenv("TACTICAL_MIN_TIMING_POINTS", "3.0"))
 TACTICAL_RISK_MULTIPLIER_CAP = float(os.getenv("TACTICAL_RISK_MULTIPLIER_CAP", "0.75"))
 
-# Capa de calidad de ejecución: evita alertas técnicamente válidas pero tardías.
 ENABLE_EXECUTION_QUALITY_GATE = os.getenv("ENABLE_EXECUTION_QUALITY_GATE", "true").lower() == "true"
 EXECUTION_MIN_CURRENT_RR = float(os.getenv("EXECUTION_MIN_CURRENT_RR", "1.00"))
 EXECUTION_CAUTION_CURRENT_RR = float(os.getenv("EXECUTION_CAUTION_CURRENT_RR", "1.30"))
@@ -92,7 +91,6 @@ EXECUTION_MAX_TP1_PROGRESS = float(os.getenv("EXECUTION_MAX_TP1_PROGRESS", "0.45
 EXECUTION_HARD_MAX_TP1_PROGRESS = float(os.getenv("EXECUTION_HARD_MAX_TP1_PROGRESS", "0.60"))
 EXECUTION_HIGH_CAUTION_MAX_PROGRESS = float(os.getenv("EXECUTION_HIGH_CAUTION_MAX_PROGRESS", "0.30"))
 EXECUTION_TACTICAL_RISK_CAP = float(os.getenv("EXECUTION_TACTICAL_RISK_CAP", "0.65"))
-
 
 SIDE_LONG = "LONG"
 SIDE_SHORT = "SHORT"
@@ -107,7 +105,7 @@ VALIDATION_PENDING = "PENDING"
 VALIDATION_RESOLVED = "RESOLVED"
 
 
-def send_telegram(message: str) -> bool:
+def send_telegram(message: str, reply_markup=None) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Telegram no configurado. Se omite el envío.")
         return False
@@ -119,6 +117,11 @@ def send_telegram(message: str) -> bool:
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
+    if reply_markup:
+        if hasattr(reply_markup, 'to_dict'):
+            payload["reply_markup"] = reply_markup.to_dict()
+        else:
+            payload["reply_markup"] = reply_markup
     try:
         response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
         if response.status_code != 200:
@@ -132,6 +135,18 @@ def send_telegram(message: str) -> bool:
     except Exception as exc:
         print(f"❌ Error enviando a Telegram: {exc}")
         return False
+
+
+def send_alert_with_buttons(alert_id: int, candidate: Dict[str, Any]) -> bool:
+    """Envía la alerta con botones ENTRAR / RECHAZAR."""
+    text = format_message(candidate, candidate.get("decision_reason", ""))
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ ENTRAR", callback_data=f"enter:{alert_id}"),
+            InlineKeyboardButton("❌ RECHAZAR", callback_data=f"reject:{alert_id}"),
+        ]
+    ])
+    return send_telegram(text, reply_markup=keyboard)
 
 
 # ── Persistencia SQLite ───────────────────────────────────────────────────────
@@ -233,6 +248,23 @@ def init_db(conn: sqlite3.Connection) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_alerts_validation
         ON alerts(validation_status, status, symbol, sent_at)
+        """
+    )
+    # Nueva tabla para solicitudes de ejecución
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS execution_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alert_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            requested_at INTEGER NOT NULL,
+            processed_at INTEGER,
+            order_id TEXT,
+            error_message TEXT,
+            FOREIGN KEY(alert_id) REFERENCES alerts(id)
+        )
         """
     )
     conn.commit()
@@ -1498,17 +1530,11 @@ def apply_context_execution_policy(candidate: Dict[str, Any], macro_eval: Dict[s
 # ── Integración multi-timeframe ───────────────────────────────────────────────
 
 def compute_required_min_rr(candidate: Dict[str, Any], macro_eval: Dict[str, Any]) -> float:
-    """
-    Evita contradicciones entre el filtro global MIN_RR y los caps tácticos del contexto.
-    Si el contexto recorta el target máximo a 1.20R / 1.55R, no tiene sentido exigir 2.0R.
-    Conserva el umbral más estricto que siga siendo alcanzable por la política vigente.
-    """
     rr_policy_cap = max(
         float(candidate.get("tp2_rr", candidate.get("rr_ratio", MIN_RR))),
         float(macro_eval.get("min_structural_room_rr", 1.0)),
     )
     return round(max(1.0, min(float(MIN_RR), rr_policy_cap)), 2)
-
 
 
 def latest_price_from_df(price_df: Optional[pd.DataFrame]) -> Optional[float]:
@@ -1568,11 +1594,6 @@ def execution_metrics_for_candidate(candidate: Dict[str, Any], current_price: Op
 
 
 def apply_execution_quality_gate(candidate: Dict[str, Any], current_price: Optional[float]) -> Dict[str, Any]:
-    """
-    Clasifica si una señal sigue siendo ejecutable al precio actual.
-    Evita convertir en alerta una señal válida que ya corrió demasiado hacia TP1
-    o cuyo R:R real se deterioró por llegar tarde.
-    """
     metrics = execution_metrics_for_candidate(candidate, current_price)
     candidate["execution"] = metrics
     candidate["execution_state"] = "NOT_CHECKED"
@@ -1631,7 +1652,6 @@ def apply_execution_quality_gate(candidate: Dict[str, Any], current_price: Optio
     candidate["execution_decision"] = decision
 
     if state in {"EXECUTABLE", "CAUTION"}:
-        # Si el usuario ejecuta ahora, el R:R real debe reflejar el precio actual, no solo la vela 4H.
         candidate["signal_price"] = float(metrics["signal_price"])
         candidate["entry_price"] = float(metrics["current_price"])
         candidate["rr_ratio"] = round(float(metrics["current_rr_tp2"]), 2)
@@ -1647,16 +1667,11 @@ def apply_execution_quality_gate(candidate: Dict[str, Any], current_price: Optio
     return candidate
 
 
-
 def compute_tactical_eligibility(
     candidate: Dict[str, Any],
     macro_eval: Dict[str, Any],
     timing_eval: Dict[str, Any],
 ) -> Tuple[bool, str]:
-    """
-    Ruta táctica para setups muy limpios en 4H + 15m, aun cuando el 1D no esté totalmente alineado.
-    Mantiene sesgo "láser": exige score alto, timing válido y no permite hard blocks ni lados prohibidos.
-    """
     if not ENABLE_TACTICAL_ALERTS:
         return False, ""
     if candidate.get("macro_ok"):
@@ -1763,7 +1778,6 @@ def build_candidate(
         f"alert={candidate['alert']} | blockers={blocker_text}"
     )
     return candidate
-
 
 
 # ── Invalidación / deduplicación ──────────────────────────────────────────────
@@ -2452,7 +2466,6 @@ def validate_open_alerts(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     return resolved
 
 
-
 def format_outcome_message(row: sqlite3.Row) -> str:
     esc = html.escape
     side = str(row["side"])
@@ -2477,6 +2490,7 @@ def format_outcome_message(row: sqlite3.Row) -> str:
         f"📍 <b>Entrada:</b> ${float(row['entry_price']):.4f} | "
         f"SL ${float(row['stop_loss']):.4f} | TP ${float(row['take_profit']):.4f}"
     )
+
 
 def maybe_notify_validated_alerts(conn: sqlite3.Connection) -> int:
     if not SEND_OUTCOME_UPDATES:
@@ -2619,6 +2633,7 @@ def format_message(candidate: Dict[str, Any], decision_reason: str) -> str:
         f"📝 <b>Análisis:</b> {reasons_text}\n"
         f"🧠 <b>Motivo de envío:</b> {esc(decision_reason)}"
     )
+
 
 def format_run_summary(
     selected: List[Dict[str, Any]],
@@ -2800,12 +2815,15 @@ def main() -> None:
             print(f"   - {item['symbol']} {item['side']}: {human['label']}")
 
     for candidate in selected_candidates:
-        sent_ok = send_telegram(format_message(candidate, candidate["decision_reason"]))
+        # Guardar alerta ANTES de enviar para obtener ID
+        save_alert(conn, candidate, candidate.get("improved_from_alert_id"))
+        alert_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        sent_ok = send_alert_with_buttons(alert_id, candidate)
         if sent_ok:
-            save_alert(conn, candidate, candidate.get("improved_from_alert_id"))
             sent_count += 1
+            print(f"📨 Alerta guardada (ID={alert_id}) y enviada: {candidate['symbol']} {candidate['side']}")
         else:
-            print(f"⚠️ {candidate['symbol']} {candidate['side']}: alerta no guardada porque Telegram no confirmó el envío.")
+            print(f"⚠️ {candidate['symbol']} {candidate['side']}: alerta guardada pero Telegram falló en el envío.")
 
     if SEND_RUN_SUMMARY and (selected_candidates or deferred_candidates or blocked_messages or resolved_alerts):
         summary_sent = send_telegram(

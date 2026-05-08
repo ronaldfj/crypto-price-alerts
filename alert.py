@@ -61,7 +61,7 @@ TRADING_TIMEFRAME = os.getenv("TRADING_TIMEFRAME", "4h")
 ENTRY_TIMEFRAME = os.getenv("ENTRY_TIMEFRAME", "15min")
 
 COOLDOWN_HOURS = int(os.getenv("COOLDOWN_HOURS", "24"))
-MIN_SCORE = float(os.getenv("MIN_SCORE", "6.0"))
+MIN_SCORE = float(os.getenv("MIN_SCORE", "3.0"))
 MIN_RR = float(os.getenv("MIN_RR", "2.0"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
 SLEEP_BETWEEN_ASSETS = float(os.getenv("SLEEP_BETWEEN_ASSETS", "1.0"))

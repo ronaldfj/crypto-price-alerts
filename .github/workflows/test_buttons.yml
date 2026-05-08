@@ -1,25 +1,55 @@
-name: Enviar mensaje de prueba con botones
+import os
+import json
+import urllib.request
 
-on:
-  workflow_dispatch:
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-jobs:
-  test-buttons:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+if not TOKEN or not CHAT_ID:
+    raise ValueError("Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID")
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
+alert_id = 999
+side = "LONG"
+entry_price = 50000.0
+stop_loss = 49500.0
+take_profit = 51000.0
 
-      - name: Instalar dependencias
-        run: pip install python-telegram-bot
+payload = json.dumps({
+    "id": alert_id,
+    "side": side,
+    "entry": entry_price,
+    "sl": stop_loss,
+    "tp": take_profit
+})
+if len(payload) > 64:
+    payload = json.dumps({"id": alert_id})
 
-      - name: Ejecutar script de prueba
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python test_buttons.py
+keyboard = {
+    "inline_keyboard": [[
+        {"text": "✅ ENTRAR", "callback_data": f"enter:{payload}"},
+        {"text": "❌ RECHAZAR", "callback_data": f"reject:{payload}"}
+    ]]
+}
+
+text = (
+    "🔔 <b>ALERTA DE PRUEBA</b>\n"
+    f"Lado: {side}\n"
+    f"Entry: {entry_price}\n"
+    f"SL: {stop_loss}\n"
+    f"TP: {take_profit}\n"
+    "Pulsa botón para probar integración con Deriv."
+)
+
+url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+data = {
+    "chat_id": CHAT_ID,
+    "text": text,
+    "reply_markup": keyboard,
+    "parse_mode": "HTML"
+}
+req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers={'Content-Type': 'application/json'})
+try:
+    with urllib.request.urlopen(req) as response:
+        print("Mensaje enviado. Código:", response.getcode())
+except Exception as e:
+    print("Error:", e)

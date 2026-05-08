@@ -32,9 +32,9 @@ import requests
 BYBIT_BASE_URL = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com")
 OKX_BASE_URL = os.getenv("OKX_BASE_URL", "https://www.okx.com")
 
-HTTP_TIMEOUT = int(os.getenv("DATA_HTTP_TIMEOUT", "15"))
-HTTP_RETRIES = int(os.getenv("DATA_HTTP_RETRIES", "3"))
-HTTP_BACKOFF = float(os.getenv("DATA_HTTP_BACKOFF", "1.5"))
+HTTP_TIMEOUT = int(os.getenv("DATA_HTTP_TIMEOUT", "8"))
+HTTP_RETRIES = int(os.getenv("DATA_HTTP_RETRIES", "2"))
+HTTP_BACKOFF = float(os.getenv("DATA_HTTP_BACKOFF", "1.0"))
 
 BYBIT_MAX_LIMIT = 1000
 OKX_MAX_LIMIT = 300

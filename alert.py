@@ -42,6 +42,27 @@ ASSET_GROUPS = {
     "LTC": "Legacy",
 }
 
+# ── Integración Binance (deeplink spot) ───────────────────────────────────────
+BINANCE_QUOTE = os.getenv("BINANCE_QUOTE", "USDT")
+
+BINANCE_PAIRS = {
+    "BTC": "BTCUSDT",
+    "ETH": "ETHUSDT",
+    "DOT": "DOTUSDT",
+    "TON": "TONUSDT",
+    "LTC": "LTCUSDT",
+    "XRP": "XRPUSDT",
+    "TRX": "TRXUSDT",
+    "XLM": "XLMUSDT",
+    "SOL": "SOLUSDT",
+    "LINK": "LINKUSDT",
+    "BNB": "BNBUSDT",
+}
+
+DEFAULT_TRADE_USD = float(os.getenv("DEFAULT_TRADE_USD", "10"))
+ENABLE_BINANCE_DEEPLINK = os.getenv("ENABLE_BINANCE_DEEPLINK", "true").lower() == "true"
+ENABLE_TRADINGVIEW_LINK = os.getenv("ENABLE_TRADINGVIEW_LINK", "true").lower() == "true"
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 CG_API_KEY = os.getenv("COINGECKO_API_KEY", "")
@@ -106,46 +127,8 @@ CLOSED = "CLOSED"
 VALIDATION_PENDING = "PENDING"
 VALIDATION_RESOLVED = "RESOLVED"
 
-def binance_deeplink(symbol: str, side: str, price: float, quantity: float = 10.0) -> str:
-    """
-    Genera un enlace para abrir la app de Binance (o web) con la orden preconfigurada.
-    - symbol: ejemplo 'BTCUSDT'
-    - side: 'BUY' o 'SELL'
-    - price: precio límite
-    - quantity: cantidad en la moneda base (BTC, ETH, etc.) o quote (USDT) según tipo.
-    Para spot, quantity es la cantidad de la moneda base (ej: 0.0005 BTC).
-    Por simplicidad, usaremos cantidad fija en USDT: quantity_in_usdt = 10.
-    Calculamos la cantidad real = 10 / price.
-    """
-    try:
-        # Asumimos que el símbolo termina en USDT (ej: BTCUSDT)
-        qty = quantity / price  # cantidad de la moneda base (BTC, ETH, etc.)
-        qty = round(qty, 6)  # Binance suele permitir hasta 6 decimales
-        # Para evitar órdenes muy pequeñas, redondeamos sensatamente
-        if qty < 1e-6:
-            qty = 0.000001
-        # Construir URL para la app (esquema binance://)
-        # Formato aproximado: binance://trade?symbol=BTCUSDT&side=BUY&type=LIMIT&price=50000&quantity=0.0002
-        side_up = side.upper()
-        side_param = "BUY" if side_up == "LONG" else "SELL"
-        # Si es SHORT, en spot sería VENTA
-        # Nota: En spot solo se puede comprar o vender, no "SHORT". Por tanto mapeamos LONG->BUY, SHORT->SELL
-        # En tu alerta, side puede ser "LONG" o "SHORT". Para spot, SHORT significa vender.
-        binance_url = (
-            f"binance://trade?symbol={symbol}&side={side_param}"
-            f"&type=LIMIT&price={price}&quantity={qty}"
-        )
-        # También generamos un enlace web como respaldo (si la app no está instalada)
-        web_url = (
-            f"https://www.binance.com/en/trade/{symbol}?type=spot"
-            f"&side={side_param.lower()}&price={price}&quantity={qty}"
-        )
-        # Devolvemos ambos: primero el deep link, luego el web
-        return f"<a href='{binance_url}'>📱 Abrir en app Binance</a> | <a href='{web_url}'>🌐 Abrir en web</a>"
-    except Exception as e:
-        return f"⚠️ Error generando enlace: {e}"
-        
-def send_telegram(message: str) -> bool:
+
+def send_telegram(message: str, reply_markup: Optional[Dict[str, Any]] = None) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Telegram no configurado. Se omite el envío.")
         return False
@@ -157,6 +140,8 @@ def send_telegram(message: str) -> bool:
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
+    if reply_markup:
+        payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
     try:
         response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
         if response.status_code != 200:
@@ -170,6 +155,55 @@ def send_telegram(message: str) -> bool:
     except Exception as exc:
         print(f"❌ Error enviando a Telegram: {exc}")
         return False
+
+
+# ── Helpers Binance / TradingView ─────────────────────────────────────────────
+def binance_spot_url(symbol: str) -> Optional[str]:
+    """Deeplink universal a Binance Spot. iOS resuelve a la app si está instalada."""
+    pair = BINANCE_PAIRS.get(symbol)
+    if not pair:
+        return None
+    base = pair.replace(BINANCE_QUOTE, "")
+    return f"https://www.binance.com/en/trade/{base}_{BINANCE_QUOTE}?type=spot"
+
+
+def tradingview_url(symbol: str) -> str:
+    pair = BINANCE_PAIRS.get(symbol, f"{symbol}{BINANCE_QUOTE}")
+    return f"https://www.tradingview.com/chart/?symbol=BINANCE:{pair}"
+
+
+def estimate_qty(price: float, usd_amount: float = DEFAULT_TRADE_USD) -> str:
+    """Cantidad estimada con precisión adaptativa por magnitud de precio."""
+    if price <= 0 or not math.isfinite(price):
+        return "0"
+    qty = usd_amount / price
+    if price >= 1000:
+        return f"{qty:.6f}"
+    if price >= 1:
+        return f"{qty:.4f}"
+    if price >= 0.01:
+        return f"{qty:.2f}"
+    return f"{qty:.0f}"
+
+
+def build_inline_keyboard(candidate: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Botones inline para Telegram. Solo URLs (no callback_data) para evitar
+    requerir un bot que escuche getUpdates/webhook.
+    """
+    if not ENABLE_BINANCE_DEEPLINK:
+        return None
+    symbol = candidate["symbol"]
+    spot_url = binance_spot_url(symbol)
+    if not spot_url:
+        return None
+
+    rows: List[List[Dict[str, str]]] = [
+        [{"text": f"💱 Binance Spot {symbol}/{BINANCE_QUOTE}", "url": spot_url}]
+    ]
+    if ENABLE_TRADINGVIEW_LINK:
+        rows[0].append({"text": "📈 TradingView", "url": tradingview_url(symbol)})
+    return {"inline_keyboard": rows}
 
 
 # ── Persistencia SQLite ───────────────────────────────────────────────────────
@@ -2627,6 +2661,16 @@ def format_message(candidate: Dict[str, Any], decision_reason: str) -> str:
         f"{'resistencia' if side == SIDE_LONG else 'soporte'} estructural\n"
     )
 
+    ticket_line = ""
+    pair = BINANCE_PAIRS.get(candidate["symbol"])
+    if pair and ENABLE_BINANCE_DEEPLINK:
+        ref_price = float(candidate.get("execution", {}).get("current_price", candidate["entry_price"]))
+        qty_str = estimate_qty(ref_price, DEFAULT_TRADE_USD)
+        ticket_line = (
+            f"💵 <b>Ticket ${DEFAULT_TRADE_USD:.0f}:</b> ~{qty_str} {esc(candidate['symbol'])} "
+            f"| par {esc(pair)} (toca el botón abajo)\n"
+        )
+
     profile_label = "LÁSER" if candidate.get("alert_profile") == "FULL" else ("TÁCTICA" if candidate.get("alert_profile") == "TACTICAL" else "WATCH")
     return (
         f"{side_icon(side)} <b>ALERTA {esc(side)} {esc(profile_label)}: {esc(candidate['symbol'])}</b>\n"
@@ -2647,6 +2691,7 @@ def format_message(candidate: Dict[str, Any], decision_reason: str) -> str:
         f"🛑 <b>STOP (SL):</b> ${candidate['stop_loss']:.4f}\n"
         f"{execution_line}"
         f"{barrier_line}"
+        f"{ticket_line}"
         f"{vwap_icon} <b>VWAP:</b> {esc(vwap_label)}\n"
         f"📦 <b>Volumen:</b> {esc(vol_label)}\n"
         f"{macro_line}"
@@ -2838,7 +2883,11 @@ def main() -> None:
             print(f"   - {item['symbol']} {item['side']}: {human['label']}")
 
     for candidate in selected_candidates:
-        sent_ok = send_telegram(format_message(candidate, candidate["decision_reason"]))
+        keyboard = build_inline_keyboard(candidate)
+        sent_ok = send_telegram(
+            format_message(candidate, candidate["decision_reason"]),
+            reply_markup=keyboard,
+        )
         if sent_ok:
             save_alert(conn, candidate, candidate.get("improved_from_alert_id"))
             sent_count += 1

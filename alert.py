@@ -14,6 +14,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import pandas as pd
 import requests
 
+import data_source
+
 CRYPTO_IDS = {
     "bitcoin": "BTC",
     "ethereum": "ETH",
@@ -414,54 +416,83 @@ def normalize_context(context: Dict[str, Any], symbol: str) -> Dict[str, Any]:
 
 # ── Datos de mercado ──────────────────────────────────────────────────────────
 def get_market_prices(cg_id: str, days: int, interval: Optional[str] = None) -> Optional[pd.DataFrame]:
-    url = f"https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart"
-    headers = {"accept": "application/json"}
-    if CG_API_KEY:
-        headers["x-cg-demo-api-key"] = CG_API_KEY
+    """
+    [DEPRECATED] Wrapper de compatibilidad. La fuente real ahora es Binance klines
+    vía data_source.py. Se mantiene la firma para no romper callers, pero el
+    parámetro `cg_id` se traduce a símbolo y `days+interval` a un número de velas.
 
-    params = {
-        "vs_currency": VS_CURRENCY,
-        "days": str(days),
-        "precision": "full",
-    }
-    if interval:
-        params["interval"] = interval
-
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
-        if response.status_code != 200:
-            print(f"⚠️ {cg_id}: CoinGecko respondió {response.status_code}: {response.text[:180]}")
-            return None
-
-        payload = response.json()
-        prices = payload.get("prices", []) if isinstance(payload, dict) else []
-        if len(prices) < 50:
-            print(f"⚠️ {cg_id}: datos insuficientes ({len(prices)} puntos).")
-            return None
-
-        df = pd.DataFrame(prices, columns=["ts", "price"])
-        df["price"] = pd.to_numeric(df["price"], errors="coerce")
-        df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-        df = df.dropna().sort_values("ts").drop_duplicates(subset=["ts"]).reset_index(drop=True)
-        return df
-    except Exception as exc:
-        print(f"❌ Error obteniendo datos para {cg_id}: {exc}")
+    Devuelve un DataFrame con columna 'price' simulada para no romper el legacy
+    flow del backtester antiguo, pero los nuevos callers deben usar
+    `fetch_ohlc_for_symbol` directamente.
+    """
+    symbol = CRYPTO_IDS.get(cg_id)
+    if symbol is None:
+        print(f"⚠️ {cg_id}: no mapeado a símbolo lógico.")
         return None
+
+    if interval == "hourly":
+        timeframe = "1h"
+        candles = max(int(days) * 24, 50)
+    elif interval is None:
+        # Resolución diaria histórica.
+        timeframe = "1d"
+        candles = max(int(days), 50)
+    else:
+        timeframe = "1h"
+        candles = max(int(days) * 24, 50)
+
+    df = data_source.fetch_klines(symbol, timeframe, candles, drop_unclosed=True)
+    if df is None or df.empty:
+        return None
+    out = df[["ts", "Close"]].rename(columns={"Close": "price"}).copy()
+    return out
+
+
+def fetch_ohlc_for_symbol(
+    symbol: str,
+    timeframe: str,
+    candles_needed: int,
+) -> Optional[pd.DataFrame]:
+    """
+    Devuelve OHLCV nativo de Binance, listo para indicadores.
+    Última fila es siempre la última vela cerrada.
+    Columnas: ts, Open, High, Low, Close, Volume, QuoteVolume, Trades.
+    """
+    return data_source.fetch_klines(symbol, timeframe, candles_needed, drop_unclosed=True)
 
 
 def build_ohlc_from_prices(price_df: pd.DataFrame, timeframe: str, min_candles: int) -> Optional[pd.DataFrame]:
+    """
+    [DEPRECATED] Solo se conserva para callers que aún pasen un DataFrame de
+    'prices' (columna `price`). Si el DataFrame ya viene con OHLCV nativo,
+    lo retorna casi tal cual (validando vela cerrada por longitud).
+
+    Para nuevos callers usar `fetch_ohlc_for_symbol` directamente.
+    """
     if price_df is None or price_df.empty:
+        return None
+
+    # Caso A: DataFrame ya es OHLCV (columna 'Close' presente).
+    if "Close" in price_df.columns and "Open" in price_df.columns:
+        df = price_df.copy()
+        if len(df) < min_candles:
+            print(f"⚠️ OHLC nativo insuficiente ({len(df)} velas {timeframe}).")
+            return None
+        return df.reset_index(drop=True)
+
+    # Caso B: DataFrame con columna 'price' (legacy CG). Resampleamos como antes,
+    # pero esto es ya solo fallback histórico — no se usa en producción tras la
+    # migración. La última vela se descarta por seguridad.
+    if "price" not in price_df.columns:
         return None
 
     df = price_df.copy().set_index("ts")
     ohlc = df["price"].resample(timeframe, label="right", closed="right").ohlc()
     ohlc.columns = ["Open", "High", "Low", "Close"]
     ohlc = ohlc.dropna().reset_index()
-
     if len(ohlc) <= min_candles:
-        print(f"⚠️ OHLC insuficiente ({len(ohlc)} velas {timeframe}).")
+        print(f"⚠️ OHLC reconstruido insuficiente ({len(ohlc)} velas {timeframe}).")
         return None
-
     closed = ohlc.iloc[:-1].reset_index(drop=True)
     if len(closed) < min_candles:
         print(f"⚠️ Velas cerradas insuficientes ({len(closed)} velas {timeframe}).")
@@ -2439,19 +2470,28 @@ def validate_open_alerts(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     tf_seconds = timeframe_to_seconds(TRADING_TIMEFRAME)
 
     for cg_id, group in grouped.items():
-        oldest_ts = min(int(r["candle_ts"]) for r in group)
-        days_needed = max(2, math.ceil((now_ts - oldest_ts) / 86400) + 2)
-        days_needed = min(days_needed, VALIDATION_FETCH_MAX_DAYS)
-        prices = get_market_prices(cg_id, days_needed, interval=HOURLY_INTERVAL)
-        if prices is None:
+        symbol = CRYPTO_IDS.get(cg_id)
+        if symbol is None:
             continue
 
-        candles = build_ohlc_from_prices(prices, TRADING_TIMEFRAME, 10)
+        oldest_ts = min(int(r["candle_ts"]) for r in group)
+        latest_expiry = max(int(r["expiry_ts"] or (int(r["candle_ts"]) + ALERT_FORWARD_BARS * tf_seconds)) for r in group)
+        # Margen: pedir desde la vela inmediatamente posterior al candle_ts más antiguo
+        # hasta el expiry más lejano (cap en now).
+        end_range = min(latest_expiry, now_ts)
+        candles = data_source.fetch_klines_range(
+            symbol,
+            TRADING_TIMEFRAME,
+            start_ts=oldest_ts + 1,
+            end_ts=end_range,
+        )
         if candles is None or candles.empty:
             continue
 
         candles = candles.copy()
-        candles["ts_epoch"] = candles["ts"].astype("int64") // 10**9
+        candles["ts_epoch"] = (
+            candles["ts"].astype("datetime64[ns, UTC]").astype("int64") // 10**9
+        )
 
         for row in group:
             candle_ts = int(row["candle_ts"])
@@ -2800,19 +2840,21 @@ def main() -> None:
     blocked_messages: List[str] = []
 
     for cg_id, symbol in CRYPTO_IDS.items():
-        daily_prices = get_market_prices(cg_id, DAILY_LOOKBACK_DAYS, interval=None)
-        fourh_prices = get_market_prices(cg_id, HOURLY_LOOKBACK_DAYS, interval=HOURLY_INTERVAL)
-        intraday_prices = get_market_prices(cg_id, INTRADAY_LOOKBACK_DAYS, interval=None)
-        current_price = latest_price_from_df(intraday_prices)
-
-        daily_df = build_ohlc_from_prices(daily_prices, "1D", 220) if daily_prices is not None else None
-        fourh_df = build_ohlc_from_prices(fourh_prices, TRADING_TIMEFRAME, 220) if fourh_prices is not None else None
-        entry_df = build_ohlc_from_prices(intraday_prices, ENTRY_TIMEFRAME, 60) if intraday_prices is not None else None
+        # Fuente única: Binance Spot klines. Pedimos exactamente las velas que
+        # necesitan los indicadores (220 mínimas para EMA200 + warmup).
+        daily_df = fetch_ohlc_for_symbol(symbol, "1d", 260)
+        fourh_df = fetch_ohlc_for_symbol(symbol, TRADING_TIMEFRAME, 260)
+        entry_df = fetch_ohlc_for_symbol(symbol, ENTRY_TIMEFRAME, 200)
+        current_price = data_source.fetch_latest_price(symbol)
 
         if daily_df is None or fourh_df is None or entry_df is None:
             blocked_messages.append(f"{symbol}: datos insuficientes para 1D/4H/15m")
             time.sleep(SLEEP_BETWEEN_ASSETS)
             continue
+
+        # Fallback duro: si Binance ticker falló, usar el último Close 15m.
+        if current_price is None and not entry_df.empty:
+            current_price = float(entry_df.iloc[-1]["Close"])
 
         normalized_context = normalize_context(market_context, symbol)
         if btc_dominance is not None:

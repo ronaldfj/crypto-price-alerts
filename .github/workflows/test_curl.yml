@@ -1,0 +1,27 @@
+name: Enviar mensaje con curl
+
+on:
+  workflow_dispatch:
+
+jobs:
+  send-curl:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enviar mensaje a Telegram
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          curl -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"chat_id\": \"${CHAT_ID}\",
+              \"text\": \"🔔 Prueba de botón con curl\",
+              \"reply_markup\": {
+                \"inline_keyboard\": [[
+                  {\"text\": \"✅ ENTRAR\", \"callback_data\": \"enter:{\\\"id\\\":999}\"},
+                  {\"text\": \"❌ RECHAZAR\", \"callback_data\": \"reject:{\\\"id\\\":999}\"}
+                ]]
+              },
+              \"parse_mode\": \"HTML\"
+            }"

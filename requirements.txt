@@ -3,4 +3,4 @@ pandas
 numpy
 python-telegram-bot==20.7
 Flask
-MetaTrader5
+websockets   # Nueva dependencia para Deriv

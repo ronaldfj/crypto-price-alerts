@@ -2,7 +2,7 @@ name: Crypto Alert Bot
 
 on:
   schedule:
-    - cron: '0 */2 * * *'   # cada 2 horas
+    - cron: '0 */2 * * *'
   workflow_dispatch:
 
 permissions:
@@ -14,6 +14,14 @@ jobs:
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
       DATA_SOURCE_ORDER: okx,bybit
+      MIN_SCORE: '5.2'
+      MIN_RR: '1.35'
+      COOLDOWN_HOURS: '12'
+      MAX_ALERTS_PER_RUN: '3'
+      MAX_ALERTS_PER_GROUP: '2'
+      SEND_RUN_SUMMARY: 'false'
+      DEFAULT_ALLOWED_SIDES: 'LONG,SHORT'
+      ENABLE_SHORT_ALERTS: 'true'
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -42,8 +50,6 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # COINGECKO_API_KEY ya no es necesaria para OHLCV (migrado a Binance Spot
-          # en v3.0). Solo se sigue usando para BTC dominance.
           COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
         run: python alert.py
 

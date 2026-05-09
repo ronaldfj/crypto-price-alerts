@@ -42,7 +42,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # COINGECKO_API_KEY ya no es necesaria para OHLCV (migrado a Binance Spot
+          # COINGECKO_API_KEY ya no es necesaria para OHLCV (migrado a Bybit/OKX
           # en v3.0). Solo se sigue usando para BTC dominance.
           COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
         run: python alert.py

@@ -409,89 +409,18 @@ def normalize_context(context: Dict[str, Any], symbol: str) -> Dict[str, Any]:
 
 
 # ── Datos de mercado ──────────────────────────────────────────────────────────
-def get_market_prices(cg_id: str, days: int, interval: Optional[str] = None) -> Optional[pd.DataFrame]:
-    """
-    [DEPRECATED] Wrapper de compatibilidad. La fuente real ahora es Binance klines
-    vía data_source.py. Se mantiene la firma para no romper callers, pero el
-    parámetro `cg_id` se traduce a símbolo y `days+interval` a un número de velas.
-
-    Devuelve un DataFrame con columna 'price' simulada para no romper el legacy
-    flow del backtester antiguo, pero los nuevos callers deben usar
-    `fetch_ohlc_for_symbol` directamente.
-    """
-    symbol = CRYPTO_IDS.get(cg_id)
-    if symbol is None:
-        print(f"⚠️ {cg_id}: no mapeado a símbolo lógico.")
-        return None
-
-    if interval == "hourly":
-        timeframe = "1h"
-        candles = max(int(days) * 24, 50)
-    elif interval is None:
-        # Resolución diaria histórica.
-        timeframe = "1d"
-        candles = max(int(days), 50)
-    else:
-        timeframe = "1h"
-        candles = max(int(days) * 24, 50)
-
-    df = data_source.fetch_klines(symbol, timeframe, candles, drop_unclosed=True)
-    if df is None or df.empty:
-        return None
-    out = df[["ts", "Close"]].rename(columns={"Close": "price"}).copy()
-    return out
-
-
 def fetch_ohlc_for_symbol(
     symbol: str,
     timeframe: str,
     candles_needed: int,
 ) -> Optional[pd.DataFrame]:
     """
-    Devuelve OHLCV nativo de Binance, listo para indicadores.
+    Devuelve OHLCV nativo (Bybit/OKX), listo para indicadores.
     Última fila es siempre la última vela cerrada.
     Columnas: ts, Open, High, Low, Close, Volume, QuoteVolume, Trades.
     """
     return data_source.fetch_klines(symbol, timeframe, candles_needed, drop_unclosed=True)
 
-
-def build_ohlc_from_prices(price_df: pd.DataFrame, timeframe: str, min_candles: int) -> Optional[pd.DataFrame]:
-    """
-    [DEPRECATED] Solo se conserva para callers que aún pasen un DataFrame de
-    'prices' (columna `price`). Si el DataFrame ya viene con OHLCV nativo,
-    lo retorna casi tal cual (validando vela cerrada por longitud).
-
-    Para nuevos callers usar `fetch_ohlc_for_symbol` directamente.
-    """
-    if price_df is None or price_df.empty:
-        return None
-
-    # Caso A: DataFrame ya es OHLCV (columna 'Close' presente).
-    if "Close" in price_df.columns and "Open" in price_df.columns:
-        df = price_df.copy()
-        if len(df) < min_candles:
-            print(f"⚠️ OHLC nativo insuficiente ({len(df)} velas {timeframe}).")
-            return None
-        return df.reset_index(drop=True)
-
-    # Caso B: DataFrame con columna 'price' (legacy CG). Resampleamos como antes,
-    # pero esto es ya solo fallback histórico — no se usa en producción tras la
-    # migración. La última vela se descarta por seguridad.
-    if "price" not in price_df.columns:
-        return None
-
-    df = price_df.copy().set_index("ts")
-    ohlc = df["price"].resample(timeframe, label="right", closed="right").ohlc()
-    ohlc.columns = ["Open", "High", "Low", "Close"]
-    ohlc = ohlc.dropna().reset_index()
-    if len(ohlc) <= min_candles:
-        print(f"⚠️ OHLC reconstruido insuficiente ({len(ohlc)} velas {timeframe}).")
-        return None
-    closed = ohlc.iloc[:-1].reset_index(drop=True)
-    if len(closed) < min_candles:
-        print(f"⚠️ Velas cerradas insuficientes ({len(closed)} velas {timeframe}).")
-        return None
-    return closed
 
 
 # ── Indicadores ───────────────────────────────────────────────────────────────
@@ -1608,16 +1537,6 @@ def compute_required_min_rr(candidate: Dict[str, Any], macro_eval: Dict[str, Any
 
 
 
-def latest_price_from_df(price_df: Optional[pd.DataFrame]) -> Optional[float]:
-    if price_df is None or price_df.empty or "price" not in price_df.columns:
-        return None
-    try:
-        value = float(price_df.dropna(subset=["price"]).iloc[-1]["price"])
-        return value if math.isfinite(value) and value > 0 else None
-    except Exception:
-        return None
-
-
 def execution_metrics_for_candidate(candidate: Dict[str, Any], current_price: Optional[float]) -> Dict[str, Any]:
     side = candidate["side"]
     signal_price = float(candidate["entry_price"])
@@ -2470,13 +2389,12 @@ def validate_open_alerts(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
 
         oldest_ts = min(int(r["candle_ts"]) for r in group)
         latest_expiry = max(int(r["expiry_ts"] or (int(r["candle_ts"]) + ALERT_FORWARD_BARS * tf_seconds)) for r in group)
-        # Margen: pedir desde la vela inmediatamente posterior al candle_ts más antiguo
-        # hasta el expiry más lejano (cap en now).
+        # Pedir desde la vela inmediatamente posterior al cierre de la señal más antigua.
         end_range = min(latest_expiry, now_ts)
         candles = data_source.fetch_klines_range(
             symbol,
             TRADING_TIMEFRAME,
-            start_ts=oldest_ts + 1,
+            start_ts=oldest_ts + tf_seconds,
             end_ts=end_range,
         )
         if candles is None or candles.empty:

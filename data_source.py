@@ -302,7 +302,7 @@ def _okx_fetch(
     chunks: List[pd.DataFrame] = []
     cursor_after: Optional[int] = None
     safety = 0
-    while needed > 0 and safety < 10:
+    while needed > 0 and safety < 20:
         block = min(needed, OKX_MAX_LIMIT)
         raw = _okx_request(pair, interval, block, after_ms=cursor_after)
         if not raw:
@@ -426,7 +426,7 @@ def _bybit_fetch_range(
     cursor_end_ms = int(end_ts * 1000)
     remaining = candles_needed
     safety = 0
-    while remaining > 0 and safety < 10:
+    while remaining > 0 and safety < 20:
         block = min(remaining, BYBIT_MAX_LIMIT)
         raw = _bybit_request(pair, interval, block, end_ms=cursor_end_ms)
         if not raw:
@@ -470,7 +470,7 @@ def _okx_fetch_range(
     cursor_after = int(end_ts * 1000)
     remaining = candles_needed
     safety = 0
-    while remaining > 0 and safety < 12:
+    while remaining > 0 and safety < 20:
         block = min(remaining, OKX_MAX_LIMIT)
         raw = _okx_request(pair, interval, block, after_ms=cursor_after)
         if not raw:

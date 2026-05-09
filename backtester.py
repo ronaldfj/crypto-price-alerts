@@ -14,7 +14,7 @@ Cambios vs v2:
 Uso:
     python backtester.py                              # 12m, todos los activos
     python backtester.py --symbol BTC --months 6
-    python backtester.py --min-score 5.0 --fees 0.001 --slippage 0.0005
+    python backtester.py --fees 0.001 --slippage 0.0005
     python backtester.py --output results.json --report-only winners
 
 Requiere acceso a Bybit/OKX vía data_source.py.
@@ -237,7 +237,7 @@ def backtest_symbol(
     months: int,
     fee_per_side: float,
     slippage: float,
-    min_score_filter: Optional[float] = None,
+    min_score_filter: Optional[float] = None,  # DEPRECATED: usar MIN_SCORE env var
 ) -> Tuple[List[TradeOutcome], Dict[str, int]]:
     """
     Devuelve (lista_de_trades, contadores_de_filtros).
@@ -659,7 +659,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Backtester v3.0 — Crypto Sentinel Bot")
     parser.add_argument("--symbol", type=str, default=None, help="Símbolo específico (ej: BTC)")
     parser.add_argument("--months", type=int, default=DEFAULT_MONTHS, help="Meses de histórico (default 12)")
-    parser.add_argument("--min-score", type=float, default=None, help="Filtro adicional de score")
     parser.add_argument("--fees", type=float, default=DEFAULT_FEE_PER_SIDE, help="Fees por lado (0.001 = 0.1%%)")
     parser.add_argument("--slippage", type=float, default=DEFAULT_SLIPPAGE, help="Slippage (0.0005 = 0.05%%)")
     parser.add_argument("--output", type=str, default=None, help="Guardar trades a JSON")
@@ -680,10 +679,7 @@ def main() -> None:
         symbols = CRYPTO_IDS
 
     print(f"\nBacktest {len(symbols)} activo(s) | {args.months}m | "
-          f"fees={args.fees*100:.3f}% | slippage={args.slippage*100:.3f}%")
-    if args.min_score is not None:
-        print(f"Filtro adicional: score >= {args.min_score}")
-    print()
+          f"fees={args.fees*100:.3f}% | slippage={args.slippage*100:.3f}%\n")
 
     all_trades: List[TradeOutcome] = []
     counters_total: Dict[str, int] = {}
@@ -697,7 +693,6 @@ def main() -> None:
             months=args.months,
             fee_per_side=args.fees,
             slippage=args.slippage,
-            min_score_filter=args.min_score,
         )
         all_trades.extend(trades)
         for k, v in counters.items():

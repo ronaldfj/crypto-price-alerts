@@ -1,0 +1,43 @@
+name: Backtest Manual
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: 'Símbolo (vacío = todos)'
+        required: false
+        default: ''
+      months:
+        description: 'Meses de histórico'
+        required: false
+        default: '24'
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+      DATA_SOURCE_ORDER: okx,bybit
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Backtest
+        env:
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+        run: |
+          ARGS=""
+          [ -n "${{ github.event.inputs.symbol }}" ] && ARGS="$ARGS --symbol ${{ github.event.inputs.symbol }}"
+          ARGS="$ARGS --months ${{ github.event.inputs.months }}"
+          python backtester.py $ARGS

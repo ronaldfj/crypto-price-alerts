@@ -19,9 +19,10 @@ env/
 pyrightconfig.json
 
 # Database / state
-*.db
 *.sqlite
 *.sqlite3
+alerts_state.db-shm
+alerts_state.db-wal
 
 # Secrets / env
 .env

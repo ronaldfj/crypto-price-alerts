@@ -14,14 +14,18 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import pandas as pd
 import requests
 
-import data_source
-
 CRYPTO_IDS = {
     "bitcoin": "BTC",
     "ethereum": "ETH",
+    "polkadot": "DOT",
     "the-open-network": "TON",
+    "litecoin": "LTC",
+    "ripple": "XRP",
     "tron": "TRX",
+    "stellar": "XLM",
+    "solana": "SOL",
     "chainlink": "LINK",
+    "binancecoin": "BNB",
 }
 
 ASSET_GROUPS = {
@@ -37,27 +41,6 @@ ASSET_GROUPS = {
     "XLM": "Payments",
     "LTC": "Legacy",
 }
-
-# ── Integración Binance (deeplink spot) ───────────────────────────────────────
-BINANCE_QUOTE = os.getenv("BINANCE_QUOTE", "USDT")
-
-BINANCE_PAIRS = {
-    "BTC": "BTCUSDT",
-    "ETH": "ETHUSDT",
-    "DOT": "DOTUSDT",
-    "TON": "TONUSDT",
-    "LTC": "LTCUSDT",
-    "XRP": "XRPUSDT",
-    "TRX": "TRXUSDT",
-    "XLM": "XLMUSDT",
-    "SOL": "SOLUSDT",
-    "LINK": "LINKUSDT",
-    "BNB": "BNBUSDT",
-}
-
-DEFAULT_TRADE_USD = float(os.getenv("DEFAULT_TRADE_USD", "10"))
-ENABLE_BINANCE_DEEPLINK = os.getenv("ENABLE_BINANCE_DEEPLINK", "true").lower() == "true"
-ENABLE_TRADINGVIEW_LINK = os.getenv("ENABLE_TRADINGVIEW_LINK", "true").lower() == "true"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -89,8 +72,8 @@ MAX_ALERTS_PER_RUN = int(os.getenv("MAX_ALERTS_PER_RUN", "2"))
 MAX_ALERTS_PER_GROUP = int(os.getenv("MAX_ALERTS_PER_GROUP", "1"))
 SEND_RUN_SUMMARY = os.getenv("SEND_RUN_SUMMARY", "true").lower() == "true"
 
-DEFAULT_ALLOWED_SIDES = os.getenv("DEFAULT_ALLOWED_SIDES", "LONG")
-ENABLE_SHORT_ALERTS = os.getenv("ENABLE_SHORT_ALERTS", "false").lower() == "true"
+DEFAULT_ALLOWED_SIDES = os.getenv("DEFAULT_ALLOWED_SIDES", "LONG,SHORT")
+ENABLE_SHORT_ALERTS = os.getenv("ENABLE_SHORT_ALERTS", "true").lower() == "true"
 ALERT_FORWARD_BARS = int(os.getenv("ALERT_FORWARD_BARS", "24"))
 VALIDATION_FETCH_MAX_DAYS = int(os.getenv("VALIDATION_FETCH_MAX_DAYS", "90"))
 SEND_OUTCOME_UPDATES = os.getenv("SEND_OUTCOME_UPDATES", "false").lower() == "true"
@@ -111,6 +94,14 @@ EXECUTION_HIGH_CAUTION_MAX_PROGRESS = float(os.getenv("EXECUTION_HIGH_CAUTION_MA
 EXECUTION_TACTICAL_RISK_CAP = float(os.getenv("EXECUTION_TACTICAL_RISK_CAP", "0.65"))
 
 
+# ── Position sizing basado en riesgo fijo por trade ──────────────────────────
+# RISK_PER_TRADE_USD: USD que estás dispuesto a perder si el SL se activa.
+# La cantidad se calcula como:
+#   cantidad = (RISK_PER_TRADE_USD × risk_multiplier) / distancia_sl_usd
+# Ejemplo: risk=50, entry=95000, stop=91200, rm=0.90
+#   cantidad = (50 × 0.90) / (95000 - 91200) = 0.01184 BTC
+RISK_PER_TRADE_USD = float(os.getenv("RISK_PER_TRADE_USD", "50.0"))
+
 SIDE_LONG = "LONG"
 SIDE_SHORT = "SHORT"
 VALID_SIDES = (SIDE_LONG, SIDE_SHORT)
@@ -124,20 +115,109 @@ VALIDATION_PENDING = "PENDING"
 VALIDATION_RESOLVED = "RESOLVED"
 
 
+def _compute_qty(entry: float, stop_loss: float, risk_multiplier: float) -> str:
+    """
+    Calcula la cantidad de moneda base usando riesgo fijo en USD:
+
+        cantidad = (RISK_PER_TRADE_USD × risk_multiplier) / |entry - stop_loss|
+
+    Formateado sin notación científica, sin ceros finales.
+    """
+    distancia_sl = abs(entry - stop_loss)
+    if distancia_sl <= 0:
+        return "0"
+    riesgo_ajustado = RISK_PER_TRADE_USD * max(risk_multiplier, 0.01)
+    qty = riesgo_ajustado / distancia_sl
+    # Precisión adaptativa: más decimales para precios altos (BTC), menos para alts baratas
+    if entry >= 1000:
+        formatted = f"{qty:.5f}"
+    elif entry >= 1:
+        formatted = f"{qty:.4f}"
+    else:
+        formatted = f"{qty:.2f}"
+    return formatted.rstrip("0").rstrip(".")
+
+
+def build_order_string(candidate: Dict[str, Any]) -> str:
+    """
+    String de orden exacto que parse_signal espera:
+        LONG BTCUSDT 0.01184 4.11% TP 4.00% SL
+
+    - Cantidad calculada por riesgo fijo: RISK_PER_TRADE_USD × risk_multiplier / distancia_SL
+    - TP usa tp1 (objetivo parcial, el más conservador)
+    - SL usa stop_loss
+    - Porcentajes relativos al entry_price
+    """
+    side      = candidate["side"]
+    symbol    = candidate["symbol"]
+    usdt_pair = symbol if symbol.endswith("USDT") else f"{symbol}USDT"
+
+    entry     = float(candidate["entry_price"])
+    stop      = float(candidate["stop_loss"])
+    tp1       = float(candidate.get("tp1", candidate["take_profit"]))
+    risk_mult = float(candidate.get("risk_multiplier", 1.0))
+
+    if entry <= 0:
+        return ""
+
+    tp_pct = abs((tp1  - entry) / entry * 100)
+    sl_pct = abs((stop - entry) / entry * 100)
+    tp_str = f"{max(tp_pct, 0.01):.2f}"
+    sl_str = f"{max(sl_pct, 0.01):.2f}"
+    qty_str = _compute_qty(entry, stop, risk_mult)
+
+    return f"{side} {usdt_pair} {qty_str} {tp_str}% TP {sl_str}% SL"
+
+
+def build_alert_inline_keyboard(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    InlineKeyboardMarkup con botones de acción.
+
+    callback_data:
+        "ENTER:<order_string>"    → listener llama parse_signal directamente
+        "REJECT:<symbol>|<side>"  → listener registra rechazo
+
+    Fallback si supera 64 bytes: "ENTER_RAW:<sym>|<side>|<entry>|<stop>|<tp1>|<rm>"
+    El listener reconstruye qty con: (RISK_PER_TRADE_USD × rm) / |entry - stop|
+    """
+    order_str   = build_order_string(candidate)
+    enter_data  = f"ENTER:{order_str}"
+    reject_data = f"REJECT:{candidate['symbol']}|{candidate['side']}"
+
+    if len(enter_data.encode()) > 64:
+        sym   = candidate["symbol"]
+        side  = candidate["side"]
+        entry = f"{candidate['entry_price']:.6g}"
+        stop  = f"{candidate['stop_loss']:.6g}"
+        tp1   = f"{candidate.get('tp1', candidate['take_profit']):.6g}"
+        rm    = f"{candidate.get('risk_multiplier', 1.0):.2f}"
+        enter_data = f"ENTER_RAW:{sym}|{side}|{entry}|{stop}|{tp1}|{rm}"
+
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "✅ Entrar en posición", "callback_data": enter_data},
+                {"text": "❌ Rechazar",           "callback_data": reject_data},
+            ]
+        ]
+    }
+
+
 def send_telegram(message: str, reply_markup: Optional[Dict[str, Any]] = None) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Telegram no configurado. Se omite el envío.")
         return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
+    payload: Dict[str, Any] = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
-    if reply_markup:
-        payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+
     try:
         response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
         if response.status_code != 200:
@@ -151,55 +231,6 @@ def send_telegram(message: str, reply_markup: Optional[Dict[str, Any]] = None) -
     except Exception as exc:
         print(f"❌ Error enviando a Telegram: {exc}")
         return False
-
-
-# ── Helpers Binance / TradingView ─────────────────────────────────────────────
-def binance_spot_url(symbol: str) -> Optional[str]:
-    """Deeplink universal a Binance Spot. iOS resuelve a la app si está instalada."""
-    pair = BINANCE_PAIRS.get(symbol)
-    if not pair:
-        return None
-    base = pair.replace(BINANCE_QUOTE, "")
-    return f"https://www.binance.com/en/trade/{base}_{BINANCE_QUOTE}?type=spot"
-
-
-def tradingview_url(symbol: str) -> str:
-    pair = BINANCE_PAIRS.get(symbol, f"{symbol}{BINANCE_QUOTE}")
-    return f"https://www.tradingview.com/chart/?symbol=BINANCE:{pair}"
-
-
-def estimate_qty(price: float, usd_amount: float = DEFAULT_TRADE_USD) -> str:
-    """Cantidad estimada con precisión adaptativa por magnitud de precio."""
-    if price <= 0 or not math.isfinite(price):
-        return "0"
-    qty = usd_amount / price
-    if price >= 1000:
-        return f"{qty:.6f}"
-    if price >= 1:
-        return f"{qty:.4f}"
-    if price >= 0.01:
-        return f"{qty:.2f}"
-    return f"{qty:.0f}"
-
-
-def build_inline_keyboard(candidate: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Botones inline para Telegram. Solo URLs (no callback_data) para evitar
-    requerir un bot que escuche getUpdates/webhook.
-    """
-    if not ENABLE_BINANCE_DEEPLINK:
-        return None
-    symbol = candidate["symbol"]
-    spot_url = binance_spot_url(symbol)
-    if not spot_url:
-        return None
-
-    rows: List[List[Dict[str, str]]] = [
-        [{"text": f"💱 Binance Spot {symbol}/{BINANCE_QUOTE}", "url": spot_url}]
-    ]
-    if ENABLE_TRADINGVIEW_LINK:
-        rows[0].append({"text": "📈 TradingView", "url": tradingview_url(symbol)})
-    return {"inline_keyboard": rows}
 
 
 # ── Persistencia SQLite ───────────────────────────────────────────────────────
@@ -409,18 +440,60 @@ def normalize_context(context: Dict[str, Any], symbol: str) -> Dict[str, Any]:
 
 
 # ── Datos de mercado ──────────────────────────────────────────────────────────
-def fetch_ohlc_for_symbol(
-    symbol: str,
-    timeframe: str,
-    candles_needed: int,
-) -> Optional[pd.DataFrame]:
-    """
-    Devuelve OHLCV nativo (Bybit/OKX), listo para indicadores.
-    Última fila es siempre la última vela cerrada.
-    Columnas: ts, Open, High, Low, Close, Volume, QuoteVolume, Trades.
-    """
-    return data_source.fetch_klines(symbol, timeframe, candles_needed, drop_unclosed=True)
+def get_market_prices(cg_id: str, days: int, interval: Optional[str] = None) -> Optional[pd.DataFrame]:
+    url = f"https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart"
+    headers = {"accept": "application/json"}
+    if CG_API_KEY:
+        headers["x-cg-demo-api-key"] = CG_API_KEY
 
+    params = {
+        "vs_currency": VS_CURRENCY,
+        "days": str(days),
+        "precision": "full",
+    }
+    if interval:
+        params["interval"] = interval
+
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
+        if response.status_code != 200:
+            print(f"⚠️ {cg_id}: CoinGecko respondió {response.status_code}: {response.text[:180]}")
+            return None
+
+        payload = response.json()
+        prices = payload.get("prices", []) if isinstance(payload, dict) else []
+        if len(prices) < 50:
+            print(f"⚠️ {cg_id}: datos insuficientes ({len(prices)} puntos).")
+            return None
+
+        df = pd.DataFrame(prices, columns=["ts", "price"])
+        df["price"] = pd.to_numeric(df["price"], errors="coerce")
+        df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+        df = df.dropna().sort_values("ts").drop_duplicates(subset=["ts"]).reset_index(drop=True)
+        return df
+    except Exception as exc:
+        print(f"❌ Error obteniendo datos para {cg_id}: {exc}")
+        return None
+
+
+def build_ohlc_from_prices(price_df: pd.DataFrame, timeframe: str, min_candles: int) -> Optional[pd.DataFrame]:
+    if price_df is None or price_df.empty:
+        return None
+
+    df = price_df.copy().set_index("ts")
+    ohlc = df["price"].resample(timeframe, label="right", closed="right").ohlc()
+    ohlc.columns = ["Open", "High", "Low", "Close"]
+    ohlc = ohlc.dropna().reset_index()
+
+    if len(ohlc) <= min_candles:
+        print(f"⚠️ OHLC insuficiente ({len(ohlc)} velas {timeframe}).")
+        return None
+
+    closed = ohlc.iloc[:-1].reset_index(drop=True)
+    if len(closed) < min_candles:
+        print(f"⚠️ Velas cerradas insuficientes ({len(closed)} velas {timeframe}).")
+        return None
+    return closed
 
 
 # ── Indicadores ───────────────────────────────────────────────────────────────
@@ -1537,6 +1610,16 @@ def compute_required_min_rr(candidate: Dict[str, Any], macro_eval: Dict[str, Any
 
 
 
+def latest_price_from_df(price_df: Optional[pd.DataFrame]) -> Optional[float]:
+    if price_df is None or price_df.empty or "price" not in price_df.columns:
+        return None
+    try:
+        value = float(price_df.dropna(subset=["price"]).iloc[-1]["price"])
+        return value if math.isfinite(value) and value > 0 else None
+    except Exception:
+        return None
+
+
 def execution_metrics_for_candidate(candidate: Dict[str, Any], current_price: Optional[float]) -> Dict[str, Any]:
     side = candidate["side"]
     signal_price = float(candidate["entry_price"])
@@ -2383,27 +2466,19 @@ def validate_open_alerts(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     tf_seconds = timeframe_to_seconds(TRADING_TIMEFRAME)
 
     for cg_id, group in grouped.items():
-        symbol = CRYPTO_IDS.get(cg_id)
-        if symbol is None:
+        oldest_ts = min(int(r["candle_ts"]) for r in group)
+        days_needed = max(2, math.ceil((now_ts - oldest_ts) / 86400) + 2)
+        days_needed = min(days_needed, VALIDATION_FETCH_MAX_DAYS)
+        prices = get_market_prices(cg_id, days_needed, interval=HOURLY_INTERVAL)
+        if prices is None:
             continue
 
-        oldest_ts = min(int(r["candle_ts"]) for r in group)
-        latest_expiry = max(int(r["expiry_ts"] or (int(r["candle_ts"]) + ALERT_FORWARD_BARS * tf_seconds)) for r in group)
-        # Pedir desde la vela inmediatamente posterior al cierre de la señal más antigua.
-        end_range = min(latest_expiry, now_ts)
-        candles = data_source.fetch_klines_range(
-            symbol,
-            TRADING_TIMEFRAME,
-            start_ts=oldest_ts + tf_seconds,
-            end_ts=end_range,
-        )
+        candles = build_ohlc_from_prices(prices, TRADING_TIMEFRAME, 10)
         if candles is None or candles.empty:
             continue
 
         candles = candles.copy()
-        candles["ts_epoch"] = (
-            candles["ts"].astype("datetime64[ns, UTC]").astype("int64") // 10**9
-        )
+        candles["ts_epoch"] = candles["ts"].astype("int64") // 10**9
 
         for row in group:
             candle_ts = int(row["candle_ts"])
@@ -2613,16 +2688,6 @@ def format_message(candidate: Dict[str, Any], decision_reason: str) -> str:
         f"{'resistencia' if side == SIDE_LONG else 'soporte'} estructural\n"
     )
 
-    ticket_line = ""
-    pair = BINANCE_PAIRS.get(candidate["symbol"])
-    if pair and ENABLE_BINANCE_DEEPLINK:
-        ref_price = float(candidate.get("execution", {}).get("current_price", candidate["entry_price"]))
-        qty_str = estimate_qty(ref_price, DEFAULT_TRADE_USD)
-        ticket_line = (
-            f"💵 <b>Ticket ${DEFAULT_TRADE_USD:.0f}:</b> ~{qty_str} {esc(candidate['symbol'])} "
-            f"| par {esc(pair)} (toca el botón abajo)\n"
-        )
-
     profile_label = "LÁSER" if candidate.get("alert_profile") == "FULL" else ("TÁCTICA" if candidate.get("alert_profile") == "TACTICAL" else "WATCH")
     return (
         f"{side_icon(side)} <b>ALERTA {esc(side)} {esc(profile_label)}: {esc(candidate['symbol'])}</b>\n"
@@ -2643,7 +2708,6 @@ def format_message(candidate: Dict[str, Any], decision_reason: str) -> str:
         f"🛑 <b>STOP (SL):</b> ${candidate['stop_loss']:.4f}\n"
         f"{execution_line}"
         f"{barrier_line}"
-        f"{ticket_line}"
         f"{vwap_icon} <b>VWAP:</b> {esc(vwap_label)}\n"
         f"📦 <b>Volumen:</b> {esc(vol_label)}\n"
         f"{macro_line}"
@@ -2652,7 +2716,8 @@ def format_message(candidate: Dict[str, Any], decision_reason: str) -> str:
         f"{rank_line}"
         f"{caution_line}\n"
         f"📝 <b>Análisis:</b> {reasons_text}\n"
-        f"🧠 <b>Motivo de envío:</b> {esc(decision_reason)}"
+        f"🧠 <b>Motivo de envío:</b> {esc(decision_reason)}\n\n"
+        f"<code>{esc(build_order_string(candidate))}</code>"
     )
 
 def format_run_summary(
@@ -2752,21 +2817,19 @@ def main() -> None:
     blocked_messages: List[str] = []
 
     for cg_id, symbol in CRYPTO_IDS.items():
-        # Fuente única: Binance Spot klines. Pedimos exactamente las velas que
-        # necesitan los indicadores (220 mínimas para EMA200 + warmup).
-        daily_df = fetch_ohlc_for_symbol(symbol, "1d", 260)
-        fourh_df = fetch_ohlc_for_symbol(symbol, TRADING_TIMEFRAME, 260)
-        entry_df = fetch_ohlc_for_symbol(symbol, ENTRY_TIMEFRAME, 200)
-        current_price = data_source.fetch_latest_price(symbol)
+        daily_prices = get_market_prices(cg_id, DAILY_LOOKBACK_DAYS, interval=None)
+        fourh_prices = get_market_prices(cg_id, HOURLY_LOOKBACK_DAYS, interval=HOURLY_INTERVAL)
+        intraday_prices = get_market_prices(cg_id, INTRADAY_LOOKBACK_DAYS, interval=None)
+        current_price = latest_price_from_df(intraday_prices)
+
+        daily_df = build_ohlc_from_prices(daily_prices, "1D", 220) if daily_prices is not None else None
+        fourh_df = build_ohlc_from_prices(fourh_prices, TRADING_TIMEFRAME, 220) if fourh_prices is not None else None
+        entry_df = build_ohlc_from_prices(intraday_prices, ENTRY_TIMEFRAME, 60) if intraday_prices is not None else None
 
         if daily_df is None or fourh_df is None or entry_df is None:
             blocked_messages.append(f"{symbol}: datos insuficientes para 1D/4H/15m")
             time.sleep(SLEEP_BETWEEN_ASSETS)
             continue
-
-        # Fallback duro: si Binance ticker falló, usar el último Close 15m.
-        if current_price is None and not entry_df.empty:
-            current_price = float(entry_df.iloc[-1]["Close"])
 
         normalized_context = normalize_context(market_context, symbol)
         if btc_dominance is not None:
@@ -2837,11 +2900,8 @@ def main() -> None:
             print(f"   - {item['symbol']} {item['side']}: {human['label']}")
 
     for candidate in selected_candidates:
-        keyboard = build_inline_keyboard(candidate)
-        sent_ok = send_telegram(
-            format_message(candidate, candidate["decision_reason"]),
-            reply_markup=keyboard,
-        )
+        markup = build_alert_inline_keyboard(candidate)
+        sent_ok = send_telegram(format_message(candidate, candidate["decision_reason"]), reply_markup=markup)
         if sent_ok:
             save_alert(conn, candidate, candidate.get("improved_from_alert_id"))
             sent_count += 1

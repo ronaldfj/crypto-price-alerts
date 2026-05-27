@@ -2145,6 +2145,37 @@ def validate_regime_filter(regime: str) -> Tuple[bool, str]:
     return True, ""
 
 
+def validate_entry_window(
+    current_price: float,
+    entry_price: float,
+    max_slip_pct: float = MAX_ENTRY_SLIP_PCT
+) -> Tuple[bool, str]:
+    """
+    PHASE 2 CHANGE 6: Entry Window Gate
+    Valida que entry sea alcanzable (precio actual cerca del entry planificado).
+    Previene alertas donde el timing ya pasó.
+    
+    Args:
+        current_price: Precio actual del mercado
+        entry_price: Precio de entry planificado
+        max_slip_pct: % máximo de slip permitido (default 2%)
+    
+    Returns:
+        (is_valid, reason_if_invalid)
+    """
+    if current_price <= 0 or entry_price <= 0:
+        return True, ""  # Sin validación si datos incompletos
+    
+    # Distancia al entry (%)
+    entry_distance = abs(current_price - entry_price) / entry_price * 100
+    
+    # Si ya se pasó mucho del entry, rechazar
+    if entry_distance > max_slip_pct:
+        return False, f"Ventana de entrada cerrada (slip {entry_distance:.2f}% > {max_slip_pct}%)"
+    
+    return True, ""
+
+
 def compute_rank_score(candidate: Dict[str, Any]) -> Tuple[float, List[str]]:
     notes: List[str] = []
     rank = 0.0
@@ -3002,6 +3033,21 @@ def main() -> None:
             print(f"   - {item['symbol']} {item['side']}: {human['label']}")
 
     for candidate in selected_candidates:
+        # PHASE 2 CHANGE 6: Entry Window Gate
+        # Get current price (optional, can be None if data source unavailable)
+        current_price = candidate.get("current_price")
+        
+        if ENABLE_ENTRY_WINDOW_GATE and current_price:
+            entry_valid, entry_reason = validate_entry_window(
+                current_price,
+                candidate["entry_price"],
+                MAX_ENTRY_SLIP_PCT
+            )
+            if not entry_valid:
+                print(f"⚠️ {candidate['symbol']} {candidate['side']}: {entry_reason} (alerta descartada)")
+                blocked_messages.append(f"{candidate['symbol']}: {entry_reason}")
+                continue
+        
         markup = build_alert_inline_keyboard(candidate)
         sent_ok = send_telegram(format_message(candidate, candidate["decision_reason"]), reply_markup=markup)
         if sent_ok:

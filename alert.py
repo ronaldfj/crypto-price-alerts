@@ -3077,3 +3077,27 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# ── PHASE 3: Outcome Validation ───────────────────────────────────────────────
+ENABLE_OUTCOME_VALIDATION = os.getenv("ENABLE_OUTCOME_VALIDATION", "true").lower() == "true"
+OUTCOME_LOOKBACK_BARS = int(os.getenv("OUTCOME_LOOKBACK_BARS", "24"))  # 24 × 4H = 96h
+
+def update_alert_with_outcome(
+    conn: sqlite3.Connection,
+    alert_id: int,
+    outcome_rr: float,
+    exit_price: float,
+    bars_to_outcome: int
+) -> None:
+    """Update alert with real outcome (Phase 3)"""
+    now_ts = int(time.time())
+    conn.execute("""
+    UPDATE alerts
+    SET outcome_rr = ?,
+        outcome_price = ?,
+        bars_to_outcome = ?,
+        validation_status = 'COMPLETED',
+        validated_at = ?
+    WHERE id = ?
+    """, (outcome_rr, exit_price, bars_to_outcome, now_ts, alert_id))
+    conn.commit()

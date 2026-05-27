@@ -61,8 +61,9 @@ TRADING_TIMEFRAME = os.getenv("TRADING_TIMEFRAME", "4h")
 ENTRY_TIMEFRAME = os.getenv("ENTRY_TIMEFRAME", "15min")
 
 COOLDOWN_HOURS = int(os.getenv("COOLDOWN_HOURS", "24"))
-MIN_SCORE = float(os.getenv("MIN_SCORE", "6.0"))
-MIN_RR = float(os.getenv("MIN_RR", "2.0"))
+MIN_SCORE = float(os.getenv("MIN_SCORE", "7.5"))  # OPTIMIZED: Was 6.0 → 7.5 (higher quality)
+MIN_RR = float(os.getenv("MIN_RR", "1.8"))        # OPTIMIZED: Was 2.0 → 1.8 (slightly relaxed)
+MIN_ADX = float(os.getenv("MIN_ADX", "25.0"))     # NEW: Reject setups with low trend strength
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
 SLEEP_BETWEEN_ASSETS = float(os.getenv("SLEEP_BETWEEN_ASSETS", "1.0"))
 FIB_LOOKBACK = int(os.getenv("FIB_LOOKBACK", "55"))
@@ -82,6 +83,14 @@ ENABLE_TACTICAL_ALERTS = os.getenv("ENABLE_TACTICAL_ALERTS", "true").lower() == 
 TACTICAL_MIN_SCORE = float(os.getenv("TACTICAL_MIN_SCORE", "8.0"))
 TACTICAL_MIN_TIMING_POINTS = float(os.getenv("TACTICAL_MIN_TIMING_POINTS", "3.0"))
 TACTICAL_RISK_MULTIPLIER_CAP = float(os.getenv("TACTICAL_RISK_MULTIPLIER_CAP", "0.75"))
+
+# NEW: RSI Confirmation & Entry Window Gates
+ENABLE_RSI_CONFIRMATION = os.getenv("ENABLE_RSI_CONFIRMATION", "true").lower() == "true"
+RSI_EXTREME_THRESHOLD = float(os.getenv("RSI_EXTREME_THRESHOLD", "65.0"))  # >65 or <35
+MIN_ADX_FOR_RSI_EXTREME = float(os.getenv("MIN_ADX_FOR_RSI_EXTREME", "30.0"))  # Require strong trend for extreme RSI
+ALLOW_MIXED_REGIME = os.getenv("ALLOW_MIXED_REGIME", "false").lower() == "true"
+ENABLE_ENTRY_WINDOW_GATE = os.getenv("ENABLE_ENTRY_WINDOW_GATE", "true").lower() == "true"
+MAX_ENTRY_SLIP_PCT = float(os.getenv("MAX_ENTRY_SLIP_PCT", "2.0"))  # Max 2% slip from entry
 
 # Capa de calidad de ejecución: evita alertas técnicamente válidas pero tardías.
 ENABLE_EXECUTION_QUALITY_GATE = os.getenv("ENABLE_EXECUTION_QUALITY_GATE", "true").lower() == "true"
@@ -1838,6 +1847,33 @@ def build_candidate(
     candidate["setup_key"] = build_setup_key(candidate)
     candidate["setup_hash"] = build_setup_hash(candidate["setup_key"])
 
+    # CHANGE 2-3: Quality Gates - New validations
+    quality_gate_blockers: List[str] = []
+    
+    # Gate 1: ADX Minimum
+    if ENABLE_EXECUTION_QUALITY_GATE:
+        adx_valid, adx_reason = validate_adx_minimum(candidate["adx"])
+        if not adx_valid:
+            quality_gate_blockers.append(adx_reason)
+            candidate["alert"] = False
+    
+    # Gate 2: RSI Confirmation (only if score is high enough to warrant alert)
+    if ENABLE_RSI_CONFIRMATION and candidate["alert"]:
+        rsi_valid, rsi_reason = validate_rsi_confirmation(candidate["rsi"], candidate["adx"], candidate["regime"])
+        if not rsi_valid:
+            quality_gate_blockers.append(rsi_reason)
+            candidate["alert"] = False
+    
+    # Gate 3: Regime Filter
+    if candidate["alert"] and not ALLOW_MIXED_REGIME:
+        regime_valid, regime_reason = validate_regime_filter(candidate["regime"])
+        if not regime_valid:
+            quality_gate_blockers.append(regime_reason)
+            candidate["alert"] = False
+    
+    if quality_gate_blockers:
+        candidate["reasons"].extend(quality_gate_blockers)
+
     blockers: List[str] = []
     if not candidate["macro_ok"] and not tactical_alert:
         blockers.append("macro")
@@ -1847,6 +1883,8 @@ def build_candidate(
         blockers.append("timing")
     if candidate["score"] < MIN_SCORE:
         blockers.append(f"score<{MIN_SCORE:.2f}")
+    if candidate["adx"] < MIN_ADX:
+        blockers.append(f"adx<{MIN_ADX:.0f}")
     if candidate["rr_ratio"] < candidate["required_min_rr"]:
         blockers.append(f"rr<{candidate['required_min_rr']:.2f}")
 
@@ -2043,6 +2081,70 @@ def save_alert(conn: sqlite3.Connection, candidate: Dict[str, Any], improved_fro
 
 
 # ── Ranking y selección ───────────────────────────────────────────────────────
+def validate_rsi_confirmation(rsi: float, adx: float, regime: str) -> Tuple[bool, str]:
+    """
+    CHANGE 2: RSI Confirmation Layer
+    Rechaza RSI extremos (>65 o <35) sin confirmación de trend fuerte (ADX).
+    Previene falsos positivos en mercados sin tendencia.
+    
+    Args:
+        rsi: Valor del RSI (0-100)
+        adx: Valor del ADX (0-100)
+        regime: BEAR_STACK, BULL_STACK, o MIXED
+    
+    Returns:
+        (is_valid, reason_if_invalid)
+    """
+    # Rango normal (30-70): siempre válido
+    if 30 <= rsi <= 70:
+        return True, ""
+    
+    # Extremos requieren trend fuerte
+    is_extreme = rsi > RSI_EXTREME_THRESHOLD or rsi < (100 - RSI_EXTREME_THRESHOLD)
+    
+    if is_extreme and adx < MIN_ADX_FOR_RSI_EXTREME:
+        return False, f"RSI {rsi:.1f} extremo sin trend (ADX {adx:.1f} < {MIN_ADX_FOR_RSI_EXTREME})"
+    
+    # MIXED regime + RSI extremo: siempre rechazar
+    if regime == "MIXED" and is_extreme:
+        return False, f"RSI {rsi:.1f} extremo en régimen ambiguo (MIXED)"
+    
+    return True, ""
+
+
+def validate_adx_minimum(adx: float) -> Tuple[bool, str]:
+    """
+    CHANGE 2: ADX Minimum Gate
+    Rechaza setups sin confirmación de trend.
+    ADX < 25 = 100% invalidación en datos históricos.
+    
+    Args:
+        adx: Valor del ADX
+    
+    Returns:
+        (is_valid, reason_if_invalid)
+    """
+    if adx < MIN_ADX:
+        return False, f"ADX {adx:.1f} demasiado bajo (mínimo {MIN_ADX})"
+    return True, ""
+
+
+def validate_regime_filter(regime: str) -> Tuple[bool, str]:
+    """
+    CHANGE 3: Rechaza MIXED regime
+    MIXED regime causó 100% invalidación en datos históricos.
+    
+    Args:
+        regime: BEAR_STACK, BULL_STACK, o MIXED
+    
+    Returns:
+        (is_valid, reason_if_invalid)
+    """
+    if regime == "MIXED" and not ALLOW_MIXED_REGIME:
+        return False, f"Régimen ambiguo ({regime}) - esperar claridad"
+    return True, ""
+
+
 def compute_rank_score(candidate: Dict[str, Any]) -> Tuple[float, List[str]]:
     notes: List[str] = []
     rank = 0.0

@@ -14,6 +14,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import pandas as pd
 import requests
 
+from data_source import symbol_to_pair
+
 CRYPTO_IDS = {
     "bitcoin": "BTC",
     "ethereum": "ETH",
@@ -145,6 +147,19 @@ def _compute_qty(entry: float, stop_loss: float, risk_multiplier: float) -> str:
     else:
         formatted = f"{qty:.2f}"
     return formatted.rstrip("0").rstrip(".")
+
+
+def estimate_qty(price: float, risk_multiplier: float = 1.0) -> str:
+    if price <= 0 or risk_multiplier <= 0:
+        return "0"
+    qty = risk_multiplier / price
+    if price >= 1000:
+        return f"{qty:.6f}"
+    if price >= 1:
+        return f"{qty:.4f}"
+    if price < 0.01:
+        return f"{qty:.0f}"
+    return f"{qty:.2f}"
 
 
 def build_order_string(candidate: Dict[str, Any]) -> str:
@@ -765,6 +780,20 @@ def timeframe_to_seconds(timeframe: str) -> int:
         "1w": 7 * 86400,
     }
     return mapping.get(tf, 4 * 3600)
+
+
+def binance_spot_url(symbol: str) -> Optional[str]:
+    pair = symbol_to_pair(symbol)
+    if not pair:
+        return None
+    return f"https://www.binance.com/en/trade/{pair}?type=spot"
+
+
+def tradingview_url(symbol: str) -> str:
+    pair = symbol_to_pair(symbol)
+    if pair:
+        return f"https://www.tradingview.com/chart/?symbol=BINANCE:{pair}"
+    return "https://www.tradingview.com/"
 
 
 def row_side_distance(candidate: Dict[str, Any]) -> float:

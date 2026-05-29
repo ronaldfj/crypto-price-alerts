@@ -67,6 +67,8 @@ MIN_SCORE = float(os.getenv("MIN_SCORE", "7.5"))  # OPTIMIZED: Was 6.0 → 7.5 (
 MIN_RR = float(os.getenv("MIN_RR", "1.8"))        # OPTIMIZED: Was 2.0 → 1.8 (slightly relaxed)
 MIN_ADX = float(os.getenv("MIN_ADX", "25.0"))     # NEW: Reject setups with low trend strength
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
+CG_HTTP_RETRIES = int(os.getenv("CG_HTTP_RETRIES", "3"))
+CG_HTTP_BACKOFF = float(os.getenv("CG_HTTP_BACKOFF", "1.5"))
 SLEEP_BETWEEN_ASSETS = float(os.getenv("SLEEP_BETWEEN_ASSETS", "1.0"))
 FIB_LOOKBACK = int(os.getenv("FIB_LOOKBACK", "55"))
 
@@ -478,26 +480,49 @@ def get_market_prices(cg_id: str, days: int, interval: Optional[str] = None) -> 
     if interval:
         params["interval"] = interval
 
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
-        if response.status_code != 200:
+    backoff = CG_HTTP_BACKOFF
+    for attempt in range(CG_HTTP_RETRIES):
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
+            if response.status_code == 200:
+                payload = response.json()
+                prices = payload.get("prices", []) if isinstance(payload, dict) else []
+                if len(prices) < 50:
+                    print(f"⚠️ {cg_id}: datos insuficientes ({len(prices)} puntos).")
+                    return None
+
+                df = pd.DataFrame(prices, columns=["ts", "price"])
+                df["price"] = pd.to_numeric(df["price"], errors="coerce")
+                df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+                df = df.dropna().sort_values("ts").drop_duplicates(subset=["ts"]).reset_index(drop=True)
+                return df
+
+            if response.status_code in (429, 418, 403):
+                retry_after = response.headers.get("Retry-After")
+                wait = float(retry_after) if retry_after and retry_after.isdigit() else backoff
+                print(f"⚠️ {cg_id}: CoinGecko rate limit {response.status_code}, retrying in {wait}s...")
+                time.sleep(wait)
+                backoff *= 2
+                continue
+
+            if response.status_code >= 500:
+                print(f"⚠️ {cg_id}: CoinGecko servidor {response.status_code}, retrying in {backoff}s...")
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+
             print(f"⚠️ {cg_id}: CoinGecko respondió {response.status_code}: {response.text[:180]}")
             return None
-
-        payload = response.json()
-        prices = payload.get("prices", []) if isinstance(payload, dict) else []
-        if len(prices) < 50:
-            print(f"⚠️ {cg_id}: datos insuficientes ({len(prices)} puntos).")
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            print(f"⚠️ {cg_id}: CoinGecko network error {exc}, retrying in {backoff}s...")
+            time.sleep(backoff)
+            backoff *= 2
+        except Exception as exc:
+            print(f"❌ Error obteniendo datos para {cg_id}: {exc}")
             return None
 
-        df = pd.DataFrame(prices, columns=["ts", "price"])
-        df["price"] = pd.to_numeric(df["price"], errors="coerce")
-        df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-        df = df.dropna().sort_values("ts").drop_duplicates(subset=["ts"]).reset_index(drop=True)
-        return df
-    except Exception as exc:
-        print(f"❌ Error obteniendo datos para {cg_id}: {exc}")
-        return None
+    print(f"⚠️ {cg_id}: no se pudo obtener datos de CoinGecko tras {CG_HTTP_RETRIES} intentos.")
+    return None
 
 
 def build_ohlc_from_prices(price_df: pd.DataFrame, timeframe: str, min_candles: int) -> Optional[pd.DataFrame]:
@@ -2890,28 +2915,24 @@ def format_run_summary(
     watch_candidates: Optional[List[Dict[str, Any]]] = None,
     resolved_alerts: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
-    """
-    ULTRA-MINIMAL SUMMARY: 3 líneas, máxima claridad
-    Reduce noise 89% vs original
-    """
     esc = html.escape
-    
-    # Count watch symbols
-    watch_symbols = [f"{item['symbol']}" for item in (watch_candidates or [])]
-    watch_str = ", ".join(watch_symbols[:5]) if watch_symbols else "Ninguno"
-    
-    # Count blocked items
-    blocked_count = len(blocked) if blocked else 0
-    
-    # Build minimal summary
-    lines = [
-        "📋 <b>RESUMEN EJECUCIÓN</b>",
-        "",
-        f"✅ <b>Enviadas:</b> {len(selected)}",
-        f"👀 <b>En watch:</b> {watch_str}",
-        f"⏸️ <b>Bloqueadas:</b> {blocked_count}",
-    ]
-    
+
+    lines = ["📋 <b>RESUMEN EJECUCIÓN</b>", ""]
+    lines.append(f"✅ <b>Enviadas:</b> {len(selected)}")
+
+    if selected:
+        for item in selected:
+            lines.append(f"  • {esc(item['symbol'])} {esc(item['side'])} | score {item['score']:.2f}")
+
+    if watch_candidates:
+        watch_symbols = [item["symbol"] for item in watch_candidates[:5]]
+        lines.append(f"👀 <b>Watch:</b> {esc(', '.join(watch_symbols))}")
+
+    if blocked:
+        lines.append(f"⏸️ <b>Bloqueadas ({len(blocked)}):</b>")
+        for text in blocked[:10]:
+            lines.append(f"• {esc(text)}")
+
     return "\n".join(lines)
 
 
@@ -2980,9 +3001,15 @@ def main() -> None:
                 exec_suffix = ""
                 if candidate.get("execution_state") in {"INVALID_NOW", "LATE"}:
                     exec_suffix = f" | ejecución {candidate.get('execution_state')}: {candidate.get('execution_decision')}"
+                gate_reasons = [
+                    r for r in candidate.get("reasons", [])
+                    if any(kw in r for kw in ["ADX", "RSI", "Régimen", "Execution gate", "gate"])
+                ]
+                gate_suffix = f" | {gate_reasons[0]}" if gate_reasons else ""
                 reason = (
-                    f"{symbol} {side}: confirmaciones {candidate['confirmations_passed']}/3 | "
-                    f"score {candidate['score']:.2f} | rr {candidate['rr_ratio']:.2f}{exec_suffix}"
+                    f"{symbol} {side}: {candidate['confirmations_passed']}/3 | "
+                    f"score {candidate['score']:.2f} | adx {candidate.get('adx', 0):.0f} | "
+                    f"regime {candidate.get('regime', '?')}{exec_suffix}{gate_suffix}"
                 )
                 blocked_messages.append(reason)
                 if candidate.get("macro_ok") or candidate.get("setup_ok"):

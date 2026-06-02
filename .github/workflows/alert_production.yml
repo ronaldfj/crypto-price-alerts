@@ -30,8 +30,8 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           ENABLE_TELEGRAM: 'true'
-          MIN_SCORE: '7.5'
-          MIN_ADX: '25.0'
+          MIN_SCORE: '7.0'
+          MIN_ADX: '20.0'
           ENABLE_EXECUTION_QUALITY_GATE: 'true'
           ENABLE_RSI_CONFIRMATION: 'true'
           ENABLE_ENTRY_WINDOW_GATE: 'true'

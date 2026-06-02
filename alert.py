@@ -63,9 +63,9 @@ TRADING_TIMEFRAME = os.getenv("TRADING_TIMEFRAME", "4h")
 ENTRY_TIMEFRAME = os.getenv("ENTRY_TIMEFRAME", "15min")
 
 COOLDOWN_HOURS = int(os.getenv("COOLDOWN_HOURS", "24"))
-MIN_SCORE = float(os.getenv("MIN_SCORE", "7.5"))  # OPTIMIZED: Was 6.0 → 7.5 (higher quality)
+MIN_SCORE = float(os.getenv("MIN_SCORE", "7.0"))  # OPTIMIZED: Was 6.0 → 7.5 → 7.0
 MIN_RR = float(os.getenv("MIN_RR", "1.8"))        # OPTIMIZED: Was 2.0 → 1.8 (slightly relaxed)
-MIN_ADX = float(os.getenv("MIN_ADX", "25.0"))     # NEW: Reject setups with low trend strength
+MIN_ADX = float(os.getenv("MIN_ADX", "20.0"))     # Was 25.0 → 20.0 (relaxed)
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
 CG_HTTP_RETRIES = int(os.getenv("CG_HTTP_RETRIES", "3"))
 CG_HTTP_BACKOFF = float(os.getenv("CG_HTTP_BACKOFF", "1.5"))

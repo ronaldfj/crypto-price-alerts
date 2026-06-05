@@ -2,7 +2,8 @@
   "GLOBAL": {
     "caution_level": "NORMAL",
     "allowed_sides": [
-      "LONG"
+      "LONG",
+      "SHORT"
     ],
     "min_adx": 25.0,
     "min_score": 7.5,
@@ -22,7 +23,8 @@
     "macro_bias": "BEARISH",
     "short_term_bias": "BULLISH",
     "allowed_sides": [
-      "LONG"
+      "LONG",
+      "SHORT"
     ],
     "caution_level": "HIGH",
     "min_adx": 30.0,

@@ -144,3 +144,46 @@ Archivos: `tests/test_alert.py`, `tests/test_data_source.py`, `tests/test_backte
 - Infra: LINK
 - Payments: XRP, TRX, XLM
 - Legacy: LTC
+
+## Workflows de GitHub Actions
+
+| Archivo | Qué hace | Frecuencia |
+|---------|----------|------------|
+| `alert_production.yml` | Escaneo completo + alertas Telegram | Cada 4h (0,4,8,12,16,20 UTC) |
+| `daily_summary.yml` | Resumen diario vía `daily_summary.py` | 21:00 UTC (4pm UTC-5) |
+| `backtest.yml` | Backtest manual | `workflow_dispatch` |
+
+`alerts_state.db` se commitea automáticamente después de cada ejecución del bot con `[skip ci]`.
+
+## Observaciones de producción (Jun 8 – Jul 1, 2026)
+
+Estos patrones surgieron del análisis de las primeras 3 semanas en producción. Útiles para calibrar ajustes futuros.
+
+**Patrón de invalidaciones (26 alertas, todas SHORT):**
+- 92% invalidación — promedio 4.9h hasta invalidar
+- "Confirmación macro perdida" (54%): el 1D oscilaba porque el mercado estaba en rango choppy, no en bajista limpio. Afecta principalmente BTC, DOT, SOL, ETH, LTC.
+- "Timing de entrada perdido" (46%): la ventana 15m revertía en horas. Especialmente LINK (3/3 alertas con este patrón) y TRX (2/2).
+
+**Por activo:**
+- **BNB**: mejor desempeño — 2 de 3 alertas cerraron en TP1. Activo a priorizar cuando hay señal.
+- **LINK**: 3/3 timing invalidations — 15m extremadamente inestable. Señales de LINK requieren mayor escepticismo.
+- **BTC/DOT/SOL**: mayoría de invalidaciones por macro — sensibles a contexto 1D cambiante.
+
+**Sobre los targets:**
+- Los 2 únicos trades cerrados llegaron a TP1 pero no a TP2. El mercado en rango da movimientos cortos, no extensiones. Confirma que `fast_exit_mode=true` y TP1 conservador (≤1R) es la estrategia correcta en este tipo de mercado.
+
+**Causa raíz del problema de invalidaciones:**
+El contexto tenía `caution_level: HIGH` + `long_score_adjustment: -0.8` + `long_rank_adjustment: -3.0` en BTC, pensado para un bajista limpio desde 84k. Al entrar en rango (~57k–65k), el 1D empezó a oscilar y las señales SHORT se disparaban con soporte a solo 5% de distancia — sin recorrido real. La resistencia de referencia (84k) también estaba obsoleta.
+
+**Señal de alerta para contexto desactualizado:**
+Si más del 50% de las invalidaciones son "Confirmación macro perdida" en múltiples activos simultáneamente, el `market_context.json` probablemente no refleja la fase actual del mercado y hay que revisarlo.
+
+## Cuándo actualizar CLAUDE.md
+
+Actualizar cuando cambie algo **estructural** (no thresholds temporales):
+- Se agrega/quita un activo de `CRYPTO_IDS`
+- Se agrega un nuevo timeframe o tipo de confirmación
+- Se crean scripts/workflows nuevos
+- Hay learnings de producción que cambian cómo calibrar el sistema
+
+No actualizar por cambios en `market_context.json` — ese archivo se lee directo y cambia frecuentemente.

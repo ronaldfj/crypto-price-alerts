@@ -75,7 +75,11 @@ FIB_LOOKBACK = int(os.getenv("FIB_LOOKBACK", "55"))
 ENABLE_RANKING = os.getenv("ENABLE_RANKING", "true").lower() == "true"
 MAX_ALERTS_PER_RUN = int(os.getenv("MAX_ALERTS_PER_RUN", "2"))
 MAX_ALERTS_PER_GROUP = int(os.getenv("MAX_ALERTS_PER_GROUP", "1"))
-SEND_RUN_SUMMARY = os.getenv("SEND_RUN_SUMMARY", "true").lower() == "true"
+# Desactivado por default: daily_summary.py + su workflow (21:00 UTC) ya cubren
+# el resumen "una vez al día" pedido por el usuario. Con esto en true, el bot
+# mandaba un resumen extra en cada corrida (6x/día vía alert_production.yml)
+# aunque no hubiera alertas, porque casi siempre hay algún candidato bloqueado.
+SEND_RUN_SUMMARY = os.getenv("SEND_RUN_SUMMARY", "false").lower() == "true"
 
 DEFAULT_ALLOWED_SIDES = os.getenv("DEFAULT_ALLOWED_SIDES", "LONG,SHORT")
 ENABLE_SHORT_ALERTS = os.getenv("ENABLE_SHORT_ALERTS", "true").lower() == "true"

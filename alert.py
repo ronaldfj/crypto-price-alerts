@@ -83,10 +83,22 @@ ALERT_FORWARD_BARS = int(os.getenv("ALERT_FORWARD_BARS", "24"))
 VALIDATION_FETCH_MAX_DAYS = int(os.getenv("VALIDATION_FETCH_MAX_DAYS", "90"))
 SEND_OUTCOME_UPDATES = os.getenv("SEND_OUTCOME_UPDATES", "false").lower() == "true"
 
-ENABLE_TACTICAL_ALERTS = os.getenv("ENABLE_TACTICAL_ALERTS", "true").lower() == "true"
+# Desactivado por default: backtest walk-forward (12m, 994 señales) muestra que
+# el perfil TACTICAL no generaliza (+0.289R in-sample vs -0.137R out-of-sample),
+# mientras que FULL sí sostiene expectancy positiva fuera de muestra.
+ENABLE_TACTICAL_ALERTS = os.getenv("ENABLE_TACTICAL_ALERTS", "false").lower() == "true"
 TACTICAL_MIN_SCORE = float(os.getenv("TACTICAL_MIN_SCORE", "8.0"))
 TACTICAL_MIN_TIMING_POINTS = float(os.getenv("TACTICAL_MIN_TIMING_POINTS", "3.0"))
 TACTICAL_RISK_MULTIPLIER_CAP = float(os.getenv("TACTICAL_RISK_MULTIPLIER_CAP", "0.75"))
+
+# Gates de generalización (validados por walk-forward 70/30 sobre 12m de backtest):
+# RSI 35-50 y fuera de zona Fibonacci sostienen expectancy positiva out-of-sample
+# para SHORT; fuera de ese rango, el out-of-sample se vuelve negativo. Solo aplica
+# a SHORT porque es el único lado con muestra suficiente (887 de 994 señales).
+REQUIRE_RSI_BAND_SHORT = os.getenv("REQUIRE_RSI_BAND_SHORT", "true").lower() == "true"
+RSI_BAND_SHORT_MIN = float(os.getenv("RSI_BAND_SHORT_MIN", "35.0"))
+RSI_BAND_SHORT_MAX = float(os.getenv("RSI_BAND_SHORT_MAX", "50.0"))
+REQUIRE_FIB_OUTSIDE_SHORT = os.getenv("REQUIRE_FIB_OUTSIDE_SHORT", "true").lower() == "true"
 
 # NEW: RSI Confirmation & Entry Window Gates
 ENABLE_RSI_CONFIRMATION = os.getenv("ENABLE_RSI_CONFIRMATION", "true").lower() == "true"
@@ -1924,7 +1936,21 @@ def build_candidate(
         if not regime_valid:
             quality_gate_blockers.append(regime_reason)
             candidate["alert"] = False
-    
+
+    # Gate 4: Banda de RSI validada por walk-forward (solo SHORT)
+    if REQUIRE_RSI_BAND_SHORT and candidate["alert"]:
+        rsi_band_valid, rsi_band_reason = validate_rsi_band_short(candidate["rsi"], side)
+        if not rsi_band_valid:
+            quality_gate_blockers.append(rsi_band_reason)
+            candidate["alert"] = False
+
+    # Gate 5: Fuera de zona Fibonacci validado por walk-forward (solo SHORT)
+    if REQUIRE_FIB_OUTSIDE_SHORT and candidate["alert"]:
+        fib_gate_valid, fib_gate_reason = validate_fib_outside_short(candidate["fib_zone"], side)
+        if not fib_gate_valid:
+            quality_gate_blockers.append(fib_gate_reason)
+            candidate["alert"] = False
+
     if quality_gate_blockers:
         candidate["reasons"].extend(quality_gate_blockers)
 
@@ -2307,6 +2333,32 @@ def validate_adx_minimum(adx: float) -> Tuple[bool, str]:
     if adx < MIN_ADX:
         return False, f"ADX {adx:.1f} demasiado bajo (mínimo {MIN_ADX})"
     return True, ""
+
+
+def validate_rsi_band_short(rsi: float, side: str) -> Tuple[bool, str]:
+    """
+    Gate validado por walk-forward: para SHORT, RSI fuera de [RSI_BAND_SHORT_MIN,
+    RSI_BAND_SHORT_MAX) tiene expectancy negativa out-of-sample (backtest 12m).
+    No aplica a LONG por falta de muestra (solo 107/994 señales del backtest).
+    """
+    if side != SIDE_SHORT:
+        return True, ""
+    if RSI_BAND_SHORT_MIN <= rsi < RSI_BAND_SHORT_MAX:
+        return True, ""
+    return False, f"RSI {rsi:.1f} fuera de banda validada [{RSI_BAND_SHORT_MIN:.0f}-{RSI_BAND_SHORT_MAX:.0f}) para short"
+
+
+def validate_fib_outside_short(fib_zone_value: str, side: str) -> Tuple[bool, str]:
+    """
+    Gate validado por walk-forward: para SHORT, entradas dentro de zona Fibonacci
+    (0.382-0.786) tienen expectancy negativa out-of-sample (backtest 12m), aunque
+    con muestra chica. La mayoría de señales ya caen en OUTSIDE.
+    """
+    if side != SIDE_SHORT:
+        return True, ""
+    if fib_zone_value == "OUTSIDE":
+        return True, ""
+    return False, f"Entrada dentro de zona Fibonacci ({fib_zone_value}) para short"
 
 
 def validate_regime_filter(regime: str) -> Tuple[bool, str]:

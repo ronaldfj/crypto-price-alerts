@@ -41,7 +41,7 @@ BTC, ETH, SOL, BNB, XRP, TRX, XLM, DOT, TON, LTC, LINK — todos vs USDT, en Byb
 ## Tipos de alerta
 
 - **FULL**: 3/3 confirmaciones + score ≥ MIN_SCORE + RR ≥ MIN_RR
-- **TACTICAL**: 4H+15m alineados, 1D no perfecto pero `soft_ok`=true, score alto (≥ TACTICAL_MIN_SCORE)
+- **TACTICAL**: 4H+15m alineados, 1D no perfecto pero `soft_ok`=true, score alto (≥ TACTICAL_MIN_SCORE). **Desactivado por default** (`ENABLE_TACTICAL_ALERTS=false`) desde jul 2026: backtest walk-forward de 12m mostró que no generaliza out-of-sample (+0.289R in-sample vs -0.137R out-sample).
 
 ## Thresholds clave (env vars + defaults)
 
@@ -53,6 +53,11 @@ COOLDOWN_HOURS=24      # Cooldown por símbolo+lado
 MAX_ALERTS_PER_RUN=2   # Máximo alertas por ejecución
 MAX_ALERTS_PER_GROUP=1 # Máximo por grupo de activos
 TACTICAL_MIN_SCORE=8.0
+ENABLE_TACTICAL_ALERTS=false      # Ver nota arriba
+REQUIRE_RSI_BAND_SHORT=true       # Solo SHORT: exige RSI en [RSI_BAND_SHORT_MIN, RSI_BAND_SHORT_MAX)
+RSI_BAND_SHORT_MIN=35.0
+RSI_BAND_SHORT_MAX=50.0
+REQUIRE_FIB_OUTSIDE_SHORT=true    # Solo SHORT: exige fib_zone == OUTSIDE
 RISK_PER_TRADE_USD=50.0  # USD en riesgo por trade
 ```
 
@@ -66,7 +71,7 @@ RISK_PER_TRADE_USD=50.0  # USD en riesgo por trade
    - `evaluate_timing_confirmation()` → timing 15m
    - `build_candidate()` → combina scores, aplica policy
    - `apply_execution_quality_gate()` → descarta entradas tardías
-5. Quality gates: ADX, RSI extremo, régimen MIXED
+5. Quality gates: ADX, RSI extremo, régimen MIXED, banda RSI [35,50) y fuera de zona Fibonacci (solo SHORT, validados por walk-forward)
 6. Ranking y deduplicación → max 2 alertas por run
 7. `format_alert_message()` → HTML para Telegram
 8. `send_telegram()` + persistencia en SQLite
@@ -165,9 +170,9 @@ Estos patrones surgieron del análisis de las primeras 3 semanas en producción.
 - "Timing de entrada perdido" (46%): la ventana 15m revertía en horas. Especialmente LINK (3/3 alertas con este patrón) y TRX (2/2).
 
 **Por activo:**
-- **BNB**: mejor desempeño — 2 de 3 alertas cerraron en TP1. Activo a priorizar cuando hay señal.
+- **BNB**: en esta muestra de 3 semanas parecía el mejor (2/3 en TP1), pero el backtest de 12 meses (96 señales) lo muestra como el **peor** activo del set (43.8% WR, -0.179R) — la muestra corta de producción era ruido, no señal. No priorizar BNB por esta observación temprana.
 - **LINK**: 3/3 timing invalidations — 15m extremadamente inestable. Señales de LINK requieren mayor escepticismo.
-- **BTC/DOT/SOL**: mayoría de invalidaciones por macro — sensibles a contexto 1D cambiante.
+- **BTC/DOT/SOL**: mayoría de invalidaciones por macro — sensibles a contexto 1D cambiante. En el backtest de 12m, BTC también rinde negativo (-0.182R); DOT y SOL sí generalizan positivo.
 
 **Sobre los targets:**
 - Los 2 únicos trades cerrados llegaron a TP1 pero no a TP2. El mercado en rango da movimientos cortos, no extensiones. Confirma que `fast_exit_mode=true` y TP1 conservador (≤1R) es la estrategia correcta en este tipo de mercado.
@@ -177,6 +182,14 @@ El contexto tenía `caution_level: HIGH` + `long_score_adjustment: -0.8` + `long
 
 **Señal de alerta para contexto desactualizado:**
 Si más del 50% de las invalidaciones son "Confirmación macro perdida" en múltiples activos simultáneamente, el `market_context.json` probablemente no refleja la fase actual del mercado y hay que revisarlo.
+
+## Calibración validada por walk-forward (jul 2026)
+
+Backtest de 12 meses (994 señales, todos los activos) mostró que el sistema completo apenas generalizaba fuera de muestra (walk-forward out-sample E[R]=+0.023R, degradación 0.08 = overfit — veredicto del backtester: EDGE MARGINAL). Se probó cada componente por separado, comparando expectancy in-sample vs out-sample, y solo 3 condiciones sostuvieron out-of-sample positivo para SHORT: perfil FULL (no TACTICAL), RSI en [35,50), y entrada fuera de zona Fibonacci 0.382-0.786. Con esos 3 gates aplicados, el out-of-sample sube a +0.110R y el veredicto pasa a EDGE POSITIVO NETO (ver `ENABLE_TACTICAL_ALERTS`, `REQUIRE_RSI_BAND_SHORT`, `REQUIRE_FIB_OUTSIDE_SHORT` arriba).
+
+**Importante:** subir `MIN_ADX` parecía mejorar el agregado global (hasta +0.56R en ADX≥45), pero al separar in/out-sample cada corte de ADX más alto **empeoraba** el out-of-sample (llegaba a -0.115R en ADX≥38) — era overfitting puro. No se tocó `MIN_ADX`. Lección para futuras calibraciones: nunca decidir un threshold solo por el agregado global; siempre partir in-sample vs out-sample antes de tocar producción.
+
+BTC y BNB siguen negativos incluso con los 3 gates aplicados, pero no se excluyeron para evitar seleccionar símbolos ganadores sobre el mismo dataset donde se descubrieron — pendiente de validar con datos frescos.
 
 ## Cuándo actualizar CLAUDE.md
 

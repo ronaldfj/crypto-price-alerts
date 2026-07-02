@@ -1958,6 +1958,69 @@ def build_candidate(
 
 
 # ── Invalidación / deduplicación ──────────────────────────────────────────────
+def resolve_price_outcome_since_alert(row: sqlite3.Row, now_ts: int) -> Optional[Dict[str, Any]]:
+    """
+    Antes de descartar una alerta por cambio de tesis (macro/timing), comprueba
+    qué hizo el precio realmente desde que se envió: si ya tocó SL/TP1/TP2 de
+    forma orgánica, o si sigue "viva" y solo la estamos cerrando por criterio.
+    Sin esto, toda alerta INVALIDATED queda sin outcome_rr y es imposible medir
+    si la invalidación temprana ahorra pérdidas o corta ganadores a tiempo.
+    """
+    candle_ts = int(row["candle_ts"])
+    days_needed = max(2, math.ceil((now_ts - candle_ts) / 86400) + 2)
+    days_needed = min(days_needed, VALIDATION_FETCH_MAX_DAYS)
+
+    prices = get_market_prices(str(row["cg_id"]), days_needed, interval=HOURLY_INTERVAL)
+    if prices is None:
+        return None
+
+    candles = build_ohlc_from_prices(prices, TRADING_TIMEFRAME, 10)
+    if candles is None or candles.empty:
+        return None
+
+    candles = candles.copy()
+    candles["ts_epoch"] = candles["ts"].astype("int64") // 10**9
+    future = candles[candles["ts_epoch"] > candle_ts].copy()
+    if future.empty:
+        return None
+
+    entry_price = float(row["entry_price"])
+    stop_loss = float(row["stop_loss"])
+    tp1 = float(row["tp1"] if row["tp1"] is not None else row["take_profit"])
+    tp2 = float(row["tp2"] if row["tp2"] is not None else row["take_profit"])
+    side = str(row["side"])
+
+    outcome = simulate_alert_outcome(
+        future_candles=future,
+        entry_price=entry_price,
+        stop_loss=stop_loss,
+        tp1=tp1,
+        tp2=tp2,
+        side=side,
+        expired=False,
+    )
+    if outcome is not None:
+        # SL o TP ya se tocaron de forma real: esto es un cierre, no una
+        # invalidación discrecional por tesis rota.
+        outcome["outcome_rr"] = _outcome_rr(side, entry_price, float(outcome["outcome_price"]), stop_loss)
+        return outcome
+
+    # Ni SL ni TP tocados todavía: la cerramos por criterio, así que el
+    # outcome_rr queda a mercado (mark-to-market) en el momento del cierre.
+    last_close = float(future.iloc[-1]["Close"])
+    return {
+        "result": "INVALIDATED_EARLY",
+        "status": INVALIDATED,
+        "outcome_price": last_close,
+        "bars_to_outcome": len(future),
+        "tp1_hit": 0,
+        "tp2_hit": 0,
+        "close_at_expiry": None,
+        "outcome_note": "Tesis invalidada antes de tocar SL/TP; R a mercado en el cierre discrecional",
+        "outcome_rr": _outcome_rr(side, entry_price, last_close, stop_loss),
+    }
+
+
 def invalidate_old_alerts(conn: sqlite3.Connection, candidate: Dict[str, Any]) -> None:
     rows = conn.execute(
         """
@@ -1997,7 +2060,13 @@ def invalidate_old_alerts(conn: sqlite3.Connection, candidate: Dict[str, Any]) -
         elif side == SIDE_SHORT and candidate["entry_price"] > float(row["entry_price"]) + max(candidate["atr"], candidate["entry_price"] * 0.01):
             reason = "Precio deteriorado"
 
-        if reason:
+        if not reason:
+            continue
+
+        outcome = resolve_price_outcome_since_alert(row, now_ts)
+        if outcome is None:
+            # No se pudo reconstruir el precio real (fallo de red/API): cae al
+            # comportamiento anterior, sin outcome_rr, en vez de bloquear la invalidación.
             conn.execute(
                 """
                 UPDATE alerts
@@ -2005,6 +2074,63 @@ def invalidate_old_alerts(conn: sqlite3.Connection, candidate: Dict[str, Any]) -
                 WHERE id = ?
                 """,
                 (INVALIDATED, now_ts, reason, row["id"]),
+            )
+            continue
+
+        if outcome["status"] == CLOSED:
+            # El precio ya había tocado SL/TP antes de que detectáramos el
+            # cambio de tesis: es un cierre real, no una invalidación discrecional.
+            conn.execute(
+                """
+                UPDATE alerts
+                SET status = ?,
+                    invalidated_at = ?,
+                    invalidation_reason = ?,
+                    validation_status = ?,
+                    validation_result = ?,
+                    validated_at = ?,
+                    outcome_price = ?,
+                    outcome_rr = ?,
+                    bars_to_outcome = ?,
+                    tp1_hit = ?,
+                    tp2_hit = ?,
+                    close_at_expiry = ?,
+                    outcome_note = ?
+                WHERE id = ?
+                """,
+                (
+                    CLOSED, now_ts, reason,
+                    VALIDATION_RESOLVED, outcome["result"], now_ts,
+                    outcome["outcome_price"], outcome["outcome_rr"], outcome["bars_to_outcome"],
+                    outcome["tp1_hit"], outcome["tp2_hit"], outcome["close_at_expiry"], outcome["outcome_note"],
+                    row["id"],
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE alerts
+                SET status = ?,
+                    invalidated_at = ?,
+                    invalidation_reason = ?,
+                    validation_status = ?,
+                    validation_result = ?,
+                    validated_at = ?,
+                    outcome_price = ?,
+                    outcome_rr = ?,
+                    bars_to_outcome = ?,
+                    tp1_hit = ?,
+                    tp2_hit = ?,
+                    outcome_note = ?
+                WHERE id = ?
+                """,
+                (
+                    INVALIDATED, now_ts, reason,
+                    VALIDATION_RESOLVED, outcome["result"], now_ts,
+                    outcome["outcome_price"], outcome["outcome_rr"], outcome["bars_to_outcome"],
+                    outcome["tp1_hit"], outcome["tp2_hit"], outcome["outcome_note"],
+                    row["id"],
+                ),
             )
     conn.commit()
 
@@ -2750,7 +2876,9 @@ def format_outcome_message(row: sqlite3.Row) -> str:
     elif result == "TP1_HIT":
         headline = "🟡 Parcial cumplida"
     elif result == "SL_HIT":
-        headline = "❌ Setup invalidado"
+        headline = "❌ Setup invalidado (stop tocado)"
+    elif result == "INVALIDATED_EARLY":
+        headline = "🔄 Cerrado por cambio de tesis (mark-to-market)"
     else:
         headline = "⌛ Horizonte expirado"
 

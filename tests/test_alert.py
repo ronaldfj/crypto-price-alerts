@@ -476,3 +476,116 @@ class TestShouldSendAlert:
         ok, _, reason = should_send_alert(conn, cand)
         assert ok is False
         assert reason != ""
+
+
+# ── invalidate_old_alerts / resolve_price_outcome_since_alert ─────────────────
+
+class TestInvalidateOldAlerts:
+    """
+    invalidate_old_alerts() solía marcar INVALIDATED sin nunca comprobar qué
+    hizo el precio, dejando outcome_rr=NULL en el ~90% de las alertas y
+    haciendo imposible medir si la invalidación temprana ahorra pérdidas o
+    corta ganadores a tiempo. Estos tests cubren el fix: reconstruir el
+    outcome real (o mark-to-market) antes de cerrar la fila.
+    """
+
+    def _insert_active_alert(self, conn, side=SIDE_LONG, entry=30000.0, stop=29000.0,
+                              tp1=30600.0, tp2=31200.0, candle_ts=None):
+        import time
+        now = int(time.time())
+        candle_ts = candle_ts if candle_ts is not None else now - 3600 * 6
+        key = f"BTC|{side}|4h|BULL_STACK|50-54|0.500-0.618|1234"
+        conn.execute(
+            """INSERT INTO alerts
+               (symbol, cg_id, side, timeframe, setup_key, setup_hash, regime,
+                rsi_bucket, fib_zone, price_bucket, candle_ts, entry_price,
+                stop_loss, take_profit, tp1, tp2, rr_ratio, score, adx, rsi, atr,
+                reasons_json, status, sent_at, validation_status)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "BTC", "bitcoin", side, "4h", key, build_setup_hash(key), "BULL_STACK",
+                "50-54", "0.500-0.618", "1234",
+                candle_ts, entry, stop, tp2, tp1, tp2, 2.0, 8.0, 30.0, 50.0, 300.0,
+                "[]", alert.ACTIVE, candle_ts, alert.VALIDATION_PENDING,
+            ),
+        )
+        conn.commit()
+        return conn.execute("SELECT * FROM alerts ORDER BY id DESC LIMIT 1").fetchone()
+
+    def _candidate_breaking_thesis(self, side=SIDE_LONG):
+        # macro_ok=False es motivo suficiente para que invalidate_old_alerts
+        # dispare "Confirmación macro perdida" sin importar el resto de campos.
+        return {
+            "symbol": "BTC", "side": side, "timeframe": "4h",
+            "regime": "BULL_STACK" if side == SIDE_LONG else "BEAR_STACK",
+            "macro_ok": False, "timing_ok": True,
+            "entry_price": 30000.0, "rsi": 50.0, "atr": 300.0,
+        }
+
+    def _fake_candles(self, rows):
+        """rows: list of (ts_epoch, open, high, low, close)"""
+        return pd.DataFrame({
+            "ts": pd.to_datetime([r[0] for r in rows], unit="s", utc=True),
+            "Open": [r[1] for r in rows],
+            "High": [r[2] for r in rows],
+            "Low": [r[3] for r in rows],
+            "Close": [r[4] for r in rows],
+        })
+
+    def test_invalidation_records_sl_hit_as_closed(self):
+        """Si el precio ya tocó el stop antes de invalidar, debe cerrarse como
+        CLOSED/SL_HIT con outcome_rr real (~ -1R), no como invalidación ciega."""
+        conn = _in_memory_db()
+        row = self._insert_active_alert(conn, side=SIDE_LONG, entry=30000.0, stop=29000.0)
+        candle_ts = int(row["candle_ts"])
+
+        candles = self._fake_candles([
+            (candle_ts + 3600, 30000, 30100, 28900, 28950),  # low <= stop
+        ])
+        with patch.object(alert, "get_market_prices", return_value=pd.DataFrame({"ts": [1], "price": [1.0]})), \
+             patch.object(alert, "build_ohlc_from_prices", return_value=candles):
+            alert.invalidate_old_alerts(conn, self._candidate_breaking_thesis(SIDE_LONG))
+
+        updated = conn.execute("SELECT * FROM alerts WHERE id = ?", (row["id"],)).fetchone()
+        assert updated["status"] == alert.CLOSED
+        assert updated["validation_result"] == "SL_HIT"
+        assert updated["outcome_rr"] == pytest.approx(-1.0, abs=0.01)
+        assert updated["validation_status"] == alert.VALIDATION_RESOLVED
+
+    def test_invalidation_without_sl_tp_marks_to_market(self):
+        """Si nunca tocó SL/TP, debe seguir INVALIDATED pero con outcome_rr
+        a mercado (mark-to-market) en vez de NULL."""
+        conn = _in_memory_db()
+        row = self._insert_active_alert(conn, side=SIDE_LONG, entry=30000.0, stop=29000.0,
+                                         tp1=30600.0, tp2=31200.0)
+        candle_ts = int(row["candle_ts"])
+
+        # Precio se mueve a favor pero sin tocar TP1 (30600) ni el stop (29000)
+        candles = self._fake_candles([
+            (candle_ts + 3600, 30000, 30400, 29900, 30300),
+        ])
+        with patch.object(alert, "get_market_prices", return_value=pd.DataFrame({"ts": [1], "price": [1.0]})), \
+             patch.object(alert, "build_ohlc_from_prices", return_value=candles):
+            alert.invalidate_old_alerts(conn, self._candidate_breaking_thesis(SIDE_LONG))
+
+        updated = conn.execute("SELECT * FROM alerts WHERE id = ?", (row["id"],)).fetchone()
+        assert updated["status"] == alert.INVALIDATED
+        assert updated["validation_result"] == "INVALIDATED_EARLY"
+        assert updated["outcome_rr"] is not None
+        expected_rr = (30300.0 - 30000.0) / (30000.0 - 29000.0)
+        assert updated["outcome_rr"] == pytest.approx(expected_rr, abs=0.01)
+        assert updated["validation_status"] == alert.VALIDATION_RESOLVED
+
+    def test_invalidation_falls_back_when_price_fetch_fails(self):
+        """Si no se puede reconstruir el precio (API caída), no debe romper la
+        invalidación: cae al comportamiento anterior sin outcome_rr."""
+        conn = _in_memory_db()
+        row = self._insert_active_alert(conn, side=SIDE_LONG)
+
+        with patch.object(alert, "get_market_prices", return_value=None):
+            alert.invalidate_old_alerts(conn, self._candidate_breaking_thesis(SIDE_LONG))
+
+        updated = conn.execute("SELECT * FROM alerts WHERE id = ?", (row["id"],)).fetchone()
+        assert updated["status"] == alert.INVALIDATED
+        assert updated["outcome_rr"] is None
+        assert updated["validation_status"] == alert.VALIDATION_PENDING

@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m pytest tests/test_alert.py -q -k \"InvalidateOldAlerts\")",
+      "Bash(env)",
+      "Bash(python3 -)",
+      "Bash(gh run *)",
+      "Bash(python3 -c ' *)"
+    ]
+  }
+}

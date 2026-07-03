@@ -104,6 +104,13 @@ RSI_BAND_SHORT_MIN = float(os.getenv("RSI_BAND_SHORT_MIN", "35.0"))
 RSI_BAND_SHORT_MAX = float(os.getenv("RSI_BAND_SHORT_MAX", "50.0"))
 REQUIRE_FIB_OUTSIDE_SHORT = os.getenv("REQUIRE_FIB_OUTSIDE_SHORT", "true").lower() == "true"
 
+# Gate validado por walk-forward (12m, 569 señales): entradas SHORT con
+# |vwap_distance_pct| > 3.5% rinden negativo en AMBAS mitades del split
+# (-0.705R in-sample, -0.266R out-sample) — no es overfitting, es consistente.
+# Muestra chica (n=21/29) pero coherente con evitar entradas sobreextendidas.
+REQUIRE_VWAP_PROXIMITY_SHORT = os.getenv("REQUIRE_VWAP_PROXIMITY_SHORT", "true").lower() == "true"
+MAX_VWAP_DISTANCE_SHORT_PCT = float(os.getenv("MAX_VWAP_DISTANCE_SHORT_PCT", "3.5"))
+
 # NEW: RSI Confirmation & Entry Window Gates
 ENABLE_RSI_CONFIRMATION = os.getenv("ENABLE_RSI_CONFIRMATION", "true").lower() == "true"
 RSI_EXTREME_THRESHOLD = float(os.getenv("RSI_EXTREME_THRESHOLD", "65.0"))  # >65 or <35
@@ -1298,12 +1305,11 @@ def evaluate_setup_confirmation(
             score -= 0.5
             reasons.append(f"Precio sobre VWAP ({vwap_dist:+.1f}%)")
 
-        if vol_data["divergence_down"]:
-            score -= 1.5
-            reasons.append("Divergencia volumen: precio cae, momentum cae demasiado")
-        elif vol_data["strong_momentum"] and vol_data["price_down"]:
-            score += 0.75
-            reasons.append("Momentum de volumen bajista fuerte")
+        # Momentum de volumen (4H) quitado del score para SHORT: walk-forward
+        # (12m, 569 señales) mostró que volume_strong=True/False generalizan
+        # casi igual out-of-sample (+0.110 vs +0.133) — no discrimina, es ruido.
+        # vol_data se sigue calculando para mostrar contexto informativo (ver
+        # candidate["volume_divergence"]/["volume_strong"] en el mensaje).
 
         distance_to_barrier_pct = ((close - fib["swing_low"]) / max(close, 1e-9)) * 100
         penalty, penalty_reasons = price_near_barrier_penalty(distance_to_barrier_pct)
@@ -1955,6 +1961,13 @@ def build_candidate(
             quality_gate_blockers.append(fib_gate_reason)
             candidate["alert"] = False
 
+    # Gate 6: Distancia a VWAP validada por walk-forward (solo SHORT)
+    if REQUIRE_VWAP_PROXIMITY_SHORT and candidate["alert"]:
+        vwap_gate_valid, vwap_gate_reason = validate_vwap_proximity_short(candidate.get("vwap_distance_pct", 0.0), side)
+        if not vwap_gate_valid:
+            quality_gate_blockers.append(vwap_gate_reason)
+            candidate["alert"] = False
+
     if quality_gate_blockers:
         candidate["reasons"].extend(quality_gate_blockers)
 
@@ -2363,6 +2376,19 @@ def validate_fib_outside_short(fib_zone_value: str, side: str) -> Tuple[bool, st
     if fib_zone_value == "OUTSIDE":
         return True, ""
     return False, f"Entrada dentro de zona Fibonacci ({fib_zone_value}) para short"
+
+
+def validate_vwap_proximity_short(vwap_distance_pct: float, side: str) -> Tuple[bool, str]:
+    """
+    Gate validado por walk-forward: para SHORT, entradas con |distancia a VWAP|
+    > MAX_VWAP_DISTANCE_SHORT_PCT rinden negativo en ambas mitades del split
+    (in-sample y out-of-sample) — evita perseguir precio ya sobreextendido.
+    """
+    if side != SIDE_SHORT:
+        return True, ""
+    if abs(vwap_distance_pct) <= MAX_VWAP_DISTANCE_SHORT_PCT:
+        return True, ""
+    return False, f"Distancia a VWAP {vwap_distance_pct:+.1f}% sobreextendida para short (máx {MAX_VWAP_DISTANCE_SHORT_PCT:.1f}%)"
 
 
 def validate_regime_filter(regime: str) -> Tuple[bool, str]:

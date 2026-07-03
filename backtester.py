@@ -90,6 +90,10 @@ class TradeOutcome:
     alert_profile: str
     macro_ok: bool
     timing_ok: bool
+    vwap_distance_pct: float = 0.0
+    above_vwap: bool = False
+    volume_strong: bool = False
+    volume_divergence: bool = False
 
     outcome: str = "PENDING"           # TP1_HIT | TP2_HIT | SL_HIT | EXPIRED
     exit_price: float = 0.0
@@ -399,6 +403,10 @@ def backtest_symbol(
                 alert_profile=str(candidate.get("alert_profile", "FULL")),
                 macro_ok=bool(candidate.get("macro_ok", False)),
                 timing_ok=bool(candidate.get("timing_ok", False)),
+                vwap_distance_pct=float(candidate.get("vwap_distance_pct", 0.0)),
+                above_vwap=bool(candidate.get("above_vwap", False)),
+                volume_strong=bool(candidate.get("volume_strong", False)),
+                volume_divergence=bool(candidate.get("volume_divergence", False)),
                 outcome=str(outcome_dict["outcome"]),
                 exit_price=float(outcome_dict.get("exit_price", entry_price)),
                 bars_to_exit=int(outcome_dict.get("bars_to_exit", 0)),

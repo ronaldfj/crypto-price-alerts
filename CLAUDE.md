@@ -58,6 +58,9 @@ REQUIRE_RSI_BAND_SHORT=true       # Solo SHORT: exige RSI en [RSI_BAND_SHORT_MIN
 RSI_BAND_SHORT_MIN=35.0
 RSI_BAND_SHORT_MAX=50.0
 REQUIRE_FIB_OUTSIDE_SHORT=true    # Solo SHORT: exige fib_zone == OUTSIDE
+REQUIRE_VWAP_PROXIMITY_SHORT=true # Solo SHORT: rechaza |vwap_distance_pct| > MAX_VWAP_DISTANCE_SHORT_PCT
+MAX_VWAP_DISTANCE_SHORT_PCT=3.5
+SEND_RUN_SUMMARY=false   # Resumen por-corrida desactivado; daily_summary.py cubre el "una vez al día"
 RISK_PER_TRADE_USD=50.0  # USD en riesgo por trade
 ```
 
@@ -71,7 +74,7 @@ RISK_PER_TRADE_USD=50.0  # USD en riesgo por trade
    - `evaluate_timing_confirmation()` → timing 15m
    - `build_candidate()` → combina scores, aplica policy
    - `apply_execution_quality_gate()` → descarta entradas tardías
-5. Quality gates: ADX, RSI extremo, régimen MIXED, banda RSI [35,50) y fuera de zona Fibonacci (solo SHORT, validados por walk-forward)
+5. Quality gates: ADX, RSI extremo, régimen MIXED, banda RSI [35,50), fuera de zona Fibonacci, distancia a VWAP ≤3.5% (últimos 3 solo SHORT, validados por walk-forward)
 6. Ranking y deduplicación → max 2 alertas por run
 7. `format_alert_message()` → HTML para Telegram
 8. `send_telegram()` + persistencia en SQLite
@@ -188,6 +191,8 @@ Si más del 50% de las invalidaciones son "Confirmación macro perdida" en múlt
 Backtest de 12 meses (994 señales, todos los activos) mostró que el sistema completo apenas generalizaba fuera de muestra (walk-forward out-sample E[R]=+0.023R, degradación 0.08 = overfit — veredicto del backtester: EDGE MARGINAL). Se probó cada componente por separado, comparando expectancy in-sample vs out-sample, y solo 3 condiciones sostuvieron out-of-sample positivo para SHORT: perfil FULL (no TACTICAL), RSI en [35,50), y entrada fuera de zona Fibonacci 0.382-0.786. Con esos 3 gates aplicados, el out-of-sample sube a +0.110R y el veredicto pasa a EDGE POSITIVO NETO (ver `ENABLE_TACTICAL_ALERTS`, `REQUIRE_RSI_BAND_SHORT`, `REQUIRE_FIB_OUTSIDE_SHORT` arriba).
 
 **Importante:** subir `MIN_ADX` parecía mejorar el agregado global (hasta +0.56R en ADX≥45), pero al separar in/out-sample cada corte de ADX más alto **empeoraba** el out-of-sample (llegaba a -0.115R en ADX≥38) — era overfitting puro. No se tocó `MIN_ADX`. Lección para futuras calibraciones: nunca decidir un threshold solo por el agregado global; siempre partir in-sample vs out-sample antes de tocar producción.
+
+**Segunda ronda — poda de componentes del score (jul 2026):** a pedido del usuario, se repitió el mismo ejercicio in/out-sample pero por componente del score (EMA stack, VWAP, momentum de volumen, Fibonacci), buscando simplificar en vez de solo agregar filtros. Resultados: EMA stack ya no tiene variación que podar (el gate de régimen MIXED lo satura); momentum de volumen 4H para SHORT (`volume_strong`/`divergence`) no discrimina out-of-sample (+0.110R con momentum fuerte vs +0.133R sin él) y se quitó del score; distancia a VWAP >3.5% rinde negativo en ambas mitades del split (no solo in-sample) y se agregó como gate nuevo (`REQUIRE_VWAP_PROXIMITY_SHORT`, `MAX_VWAP_DISTANCE_SHORT_PCT`). Resultado neto: out-of-sample sube de +0.110R a +0.122R — mejora modesta pero consistente, como anticipaba la evidencia por componente.
 
 BTC y BNB siguen negativos incluso con los 3 gates aplicados, pero no se excluyeron para evitar seleccionar símbolos ganadores sobre el mismo dataset donde se descubrieron — pendiente de validar con datos frescos.
 

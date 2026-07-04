@@ -24,7 +24,7 @@ BTC, ETH, SOL, BNB, XRP, TRX, XLM, DOT, TON, LTC, LINK — todos vs USDT, en Byb
 ### 1D — `evaluate_macro_confirmation()`
 - Determina si el sesgo macro permite el lado (LONG/SHORT)
 - Aplica ajustes de score/rank desde `market_context.json`
-- Fuente: CoinGecko API (`DAILY_LOOKBACK_DAYS=365`)
+- Fuente: Bybit/OKX klines via `data_source.fetch_klines()`
 - Resultado: `macro_ok` + `score_adjustment` + `rank_adjustment`
 
 ### 4H — `evaluate_setup_confirmation()`
@@ -66,8 +66,8 @@ RISK_PER_TRADE_USD=50.0  # USD en riesgo por trade
 
 ## Pipeline de una alerta
 
-1. `get_market_prices()` → CoinGecko (daily + hourly data)
-2. `build_ohlc_from_prices()` → resample a 1D, 4H, 15m
+1. `data_source.fetch_klines()` → velas 1D/4H/15m reales desde Bybit (primario) / OKX (fallback)
+2. `data_source.fetch_latest_price()` → precio actual para el execution gate
 3. `evaluate_macro_confirmation()` → sesgo 1D
 4. Para cada side (LONG, SHORT):
    - `evaluate_setup_confirmation()` → setup 4H
@@ -134,7 +134,7 @@ pytest>=8.0
 
 Variables de entorno requeridas para producción:
 - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
-- `COINGECKO_API_KEY` (demo key, rate limit generoso)
+- `COINGECKO_API_KEY` (demo key; solo se usa para BTC dominance, no para OHLCV — ver nota de jul 2026 abajo)
 
 ## Tests
 
@@ -195,6 +195,15 @@ Backtest de 12 meses (994 señales, todos los activos) mostró que el sistema co
 **Segunda ronda — poda de componentes del score (jul 2026):** a pedido del usuario, se repitió el mismo ejercicio in/out-sample pero por componente del score (EMA stack, VWAP, momentum de volumen, Fibonacci), buscando simplificar en vez de solo agregar filtros. Resultados: EMA stack ya no tiene variación que podar (el gate de régimen MIXED lo satura); momentum de volumen 4H para SHORT (`volume_strong`/`divergence`) no discrimina out-of-sample (+0.110R con momentum fuerte vs +0.133R sin él) y se quitó del score; distancia a VWAP >3.5% rinde negativo en ambas mitades del split (no solo in-sample) y se agregó como gate nuevo (`REQUIRE_VWAP_PROXIMITY_SHORT`, `MAX_VWAP_DISTANCE_SHORT_PCT`). Resultado neto: out-of-sample sube de +0.110R a +0.122R — mejora modesta pero consistente, como anticipaba la evidencia por componente.
 
 BTC y BNB siguen negativos incluso con los 3 gates aplicados, pero no se excluyeron para evitar seleccionar símbolos ganadores sobre el mismo dataset donde se descubrieron — pendiente de validar con datos frescos.
+
+## Auditoría de infraestructura y lógica (jul 2026)
+
+Una auditoría completa encontró y corrigió lo siguiente:
+
+- **Fuente de datos unificada**: hasta esta fecha, el escaneo en vivo (`alert.py`) armaba OHLC sintético desde CoinGecko (precio-only, sin volumen real) en las 3 capas, mientras `backtester.py` siempre usó velas reales de Bybit/OKX vía `data_source.fetch_klines_range()`. Es decir, la calibración walk-forward de este documento nunca se había probado contra los datos que el bot realmente operaba. Se migró `alert.py` (escaneo principal, invalidación de alertas, validación de outcomes) y `diagnose_scan.py` a `data_source.fetch_klines()`/`fetch_latest_price()`, alineando ambos procesos sobre la misma fuente. Efecto secundario esperado: con volumen real disponible, el componente de momentum de volumen 4H para LONG (ya validado en backtest, que siempre tuvo volumen real) empieza a contribuir al score en vivo por primera vez; el componente SHORT sigue podado del score (ver sección anterior), independientemente de la fuente de datos.
+- **Gate de RR roto**: `compute_required_min_rr` derivaba el techo de RR requerido del propio `candidate["tp2_rr"]`, que ya había sido capado por `apply_context_execution_policy` — el gate era tautológico y `MIN_RR=1.8` nunca bloqueaba nada para símbolos cuyo contexto cap por debajo de ese valor (BTC, GLOBAL). Corregido para derivar el techo de `macro_eval` (el contexto, antes del cap).
+- **Entry-window gate muerto**: `candidate["current_price"]` nunca se asignaba, por lo que `ENABLE_ENTRY_WINDOW_GATE` (activo por default en producción) nunca corría pese a estar "activado". Corregido.
+- **Workflow duplicado eliminado**: `crypto-alert.yml` (legado, cron cada 2h) ejecutaba el mismo `alert.py` que `alert_production.yml` (cada 4h) con configuración efectivamente idéntica, sin coordinación en el commit+push de `alerts_state.db` — riesgo de alerta Telegram duplicada y de pérdida de estado por push no-fast-forward. Se eliminó `crypto-alert.yml`; `alert_production.yml` es ahora el único workflow de escaneo.
 
 ## Cuándo actualizar CLAUDE.md
 

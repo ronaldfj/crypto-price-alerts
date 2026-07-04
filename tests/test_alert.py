@@ -104,6 +104,15 @@ class TestComputeRsi:
         rsi = compute_rsi(close).dropna()
         assert rsi.iloc[-1] < 50
 
+    def test_matches_hand_computed_reference_value(self):
+        # 14 variaciones alternadas +2/-1 (ganancia=2, pérdida=1 por vela).
+        # compute_rsi usa gain.ewm(alpha=1/14, adjust=False, min_periods=14): la recursión
+        # arranca en avg_1=2 (primera observación no nula) y sigue avg_t=avg_{t-1}+(x_t-avg_{t-1})/14.
+        # avg_gain final=1.330422, avg_loss final=0.334789 -> RSI=100*RS/(1+RS)=79.8951.
+        close = _make_close_series([100, 102, 101, 103, 102, 104, 103, 105, 104, 106, 105, 107, 106, 108, 107])
+        rsi = compute_rsi(close, period=14)
+        assert rsi.iloc[-1] == pytest.approx(79.8951, abs=0.01)
+
 
 # ── compute_atr ───────────────────────────────────────────────────────────────
 
@@ -127,6 +136,16 @@ class TestComputeAtr:
         high_vol = pd.DataFrame({"High": 100 + rng.uniform(0, 20, n), "Low": 100 - rng.uniform(0, 20, n), "Close": [100.0]*n})
         assert compute_atr(high_vol).dropna().mean() > compute_atr(low_vol).dropna().mean()
 
+    def test_matches_hand_computed_reference_value(self):
+        # 14 velas con True Range alterno 5/3 (Close=100 constante; High-Low=5 en pares, 3
+        # en impares). compute_atr aplica la misma recursión de Wilder arrancando en
+        # avg_0=TR_0=5 -> ATR final = 4.330422.
+        highs = [103.0 if t % 2 == 0 else 101.5 for t in range(14)]
+        lows = [98.0 if t % 2 == 0 else 98.5 for t in range(14)]
+        df = pd.DataFrame({"High": highs, "Low": lows, "Close": [100.0] * 14})
+        atr = compute_atr(df, period=14)
+        assert atr.iloc[-1] == pytest.approx(4.330422, abs=0.001)
+
 
 # ── compute_adx ───────────────────────────────────────────────────────────────
 
@@ -146,6 +165,20 @@ class TestComputeAdx:
         _, plus_di, minus_di = compute_adx(df)
         # In a strong uptrend, +DI should be >= -DI on average
         assert plus_di.dropna().mean() >= minus_di.dropna().mean()
+
+    def test_perfect_uptrend_channel_gives_adx_100(self):
+        # Canal alcista perfecto (High y Low suben +2/vela, ancho constante): Low nunca
+        # retrocede -> minus_dm ≡ 0 -> minus_di ≡ 0. Con plus_di>0, dx=100 en cada vela
+        # válida, y el EMA de una constante es esa constante -> ADX == 100.0 exacto.
+        # 27 velas: dos máscaras min_periods=14 en cascada (ATR/±DM, luego DX->ADX).
+        n = 27
+        closes = [100.0 + 2 * t for t in range(n)]
+        highs = [c + 1.0 for c in closes]
+        lows = [c - 1.0 for c in closes]
+        df = pd.DataFrame({"High": highs, "Low": lows, "Close": closes})
+        adx, plus_di, minus_di = compute_adx(df, period=14)
+        assert adx.iloc[-1] == pytest.approx(100.0, abs=1e-6)
+        assert minus_di.iloc[-1] == pytest.approx(0.0, abs=1e-9)
 
 
 # ── fibonacci_context ─────────────────────────────────────────────────────────
@@ -542,8 +575,7 @@ class TestInvalidateOldAlerts:
         candles = self._fake_candles([
             (candle_ts + 3600, 30000, 30100, 28900, 28950),  # low <= stop
         ])
-        with patch.object(alert, "get_market_prices", return_value=pd.DataFrame({"ts": [1], "price": [1.0]})), \
-             patch.object(alert, "build_ohlc_from_prices", return_value=candles):
+        with patch.object(alert, "fetch_klines", return_value=candles):
             alert.invalidate_old_alerts(conn, self._candidate_breaking_thesis(SIDE_LONG))
 
         updated = conn.execute("SELECT * FROM alerts WHERE id = ?", (row["id"],)).fetchone()
@@ -564,8 +596,7 @@ class TestInvalidateOldAlerts:
         candles = self._fake_candles([
             (candle_ts + 3600, 30000, 30400, 29900, 30300),
         ])
-        with patch.object(alert, "get_market_prices", return_value=pd.DataFrame({"ts": [1], "price": [1.0]})), \
-             patch.object(alert, "build_ohlc_from_prices", return_value=candles):
+        with patch.object(alert, "fetch_klines", return_value=candles):
             alert.invalidate_old_alerts(conn, self._candidate_breaking_thesis(SIDE_LONG))
 
         updated = conn.execute("SELECT * FROM alerts WHERE id = ?", (row["id"],)).fetchone()
@@ -582,7 +613,7 @@ class TestInvalidateOldAlerts:
         conn = _in_memory_db()
         row = self._insert_active_alert(conn, side=SIDE_LONG)
 
-        with patch.object(alert, "get_market_prices", return_value=None):
+        with patch.object(alert, "fetch_klines", return_value=None):
             alert.invalidate_old_alerts(conn, self._candidate_breaking_thesis(SIDE_LONG))
 
         updated = conn.execute("SELECT * FROM alerts WHERE id = ?", (row["id"],)).fetchone()

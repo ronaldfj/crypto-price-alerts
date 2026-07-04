@@ -13,20 +13,19 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from alert import (
     CRYPTO_IDS,
-    DAILY_LOOKBACK_DAYS, HOURLY_LOOKBACK_DAYS, INTRADAY_LOOKBACK_DAYS,
-    HOURLY_INTERVAL, TRADING_TIMEFRAME, ENTRY_TIMEFRAME,
+    TRADING_TIMEFRAME, ENTRY_TIMEFRAME,
     MIN_SCORE, MIN_RR, MIN_ADX,
     SLEEP_BETWEEN_ASSETS, MARKET_CONTEXT_FILE,
-    get_market_prices, build_ohlc_from_prices,
     evaluate_macro_confirmation, evaluate_setup_confirmation, evaluate_timing_confirmation,
     build_candidate, apply_execution_quality_gate,
     load_market_context, normalize_context, fetch_btc_dominance,
-    parse_allowed_sides, latest_price_from_df,
+    parse_allowed_sides,
     get_db_connection, init_db, import_legacy_state_if_needed, invalidate_old_alerts,
     should_send_alert, DB_FILE,
     ENABLE_RSI_CONFIRMATION, ENABLE_EXECUTION_QUALITY_GATE, ALLOW_MIXED_REGIME,
     validate_rsi_confirmation, validate_adx_minimum,
 )
+from data_source import fetch_klines, fetch_latest_price
 
 SEP = "─" * 100
 
@@ -54,14 +53,10 @@ def main():
     for cg_id, symbol in CRYPTO_IDS.items():
         print(f"  Descargando {symbol} ({cg_id})...", end="", flush=True)
 
-        daily_prices = get_market_prices(cg_id, DAILY_LOOKBACK_DAYS, interval=None)
-        fourh_prices  = get_market_prices(cg_id, HOURLY_LOOKBACK_DAYS, interval=HOURLY_INTERVAL)
-        intraday_prices = get_market_prices(cg_id, INTRADAY_LOOKBACK_DAYS, interval=None)
-        current_price = latest_price_from_df(intraday_prices)
-
-        daily_df  = build_ohlc_from_prices(daily_prices,  "1D",             220) if daily_prices is not None else None
-        fourh_df  = build_ohlc_from_prices(fourh_prices,  TRADING_TIMEFRAME, 220) if fourh_prices is not None else None
-        entry_df  = build_ohlc_from_prices(intraday_prices, ENTRY_TIMEFRAME,  60) if intraday_prices is not None else None
+        daily_df = fetch_klines(symbol, "1d", 300)
+        fourh_df = fetch_klines(symbol, TRADING_TIMEFRAME, 300)
+        entry_df = fetch_klines(symbol, ENTRY_TIMEFRAME, 100)
+        current_price = fetch_latest_price(symbol)
 
         if daily_df is None or fourh_df is None or entry_df is None:
             print(" datos insuficientes")
@@ -75,7 +70,8 @@ def main():
             normalized_context["btc_dominance"] = btc_dominance
 
         allowed_sides = parse_allowed_sides(normalized_context)
-        print(f" ok | precio={current_price:.4g} | sides={allowed_sides}")
+        price_str = f"{current_price:.4g}" if current_price is not None else "N/A"
+        print(f" ok | precio={price_str} | sides={allowed_sides}")
 
         for side in allowed_sides:
             macro_eval  = evaluate_macro_confirmation(daily_df, symbol, normalized_context, side=side)

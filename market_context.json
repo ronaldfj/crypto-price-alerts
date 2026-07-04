@@ -5,8 +5,6 @@
       "LONG",
       "SHORT"
     ],
-    "min_adx": 22.0,
-    "min_score": 7.0,
     "max_rsi_extreme_without_adx": false,
     "max_rsi_extreme_adx_threshold": 30.0,
     "tp1_rr": 0.85,
@@ -27,8 +25,6 @@
       "SHORT"
     ],
     "caution_level": "MEDIUM",
-    "min_adx": 25.0,
-    "min_score": 7.5,
     "long_resistance_near": true,
     "long_resistance_label": "~65k / swing alto de junio",
     "short_support_near": true,

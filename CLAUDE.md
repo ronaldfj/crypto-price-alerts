@@ -12,12 +12,15 @@ Bot de alertas de trading para crypto. Analiza activos en 3 timeframes (1D, 4H, 
 | `data_source.py` | Fetching OHLCV desde Bybit (primario) y OKX (fallback) |
 | `backtester.py` | Backtest histórico point-in-time, walk-forward 70/30, reporte de expectancy en R |
 | `diagnose_scan.py` | Diagnóstico detallado del scan actual sin enviar alertas |
+| `inspector.py` | Inspector interactivo (Streamlit): evalúa cualquier activo rastreado bajo demanda con el motor idéntico a `alert.py` (1D+4H+15m). Solo lectura — no envía Telegram ni escribe en `alerts_state.db`. `streamlit run inspector.py` |
 | `market_context.json` | Contexto macro manual por símbolo (sesgos, bloqueos, ajustes de RR) |
 | `alerts_state.db` | SQLite con tabla `alerts` y cooldowns |
 
 ## Activos rastreados
 
 BTC, ETH, SOL, BNB, XRP, TRX, XLM, DOT, TON, LTC, LINK — todos vs USDT, en Bybit Spot.
+
+**⚠️ TON sin cobertura de datos (detectado jul 2026 vía `inspector.py`):** ni Bybit ni OKX listan un par spot para TON (`TONUSDT` / `TON-USDT`) bajo ningún nombre — se confirmó contra `/v5/market/instruments-info` (Bybit, 598 símbolos) y `/api/v5/public/instruments` (OKX, 1278 símbolos), cero coincidencias. Desde la migración de `alert.py`/`diagnose_scan.py` a `data_source.fetch_klines()`, cada corrida falla silenciosamente para TON ("ningún proveedor devolvió datos") y nunca genera alertas para ese activo — sin crash, sin aviso visible salvo en logs. Pendiente decidir: quitar TON de `CRYPTO_IDS`/`SYMBOL_TO_BASE` o buscar un exchange/par alternativo.
 
 ## Arquitectura de 3 timeframes
 

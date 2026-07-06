@@ -14,10 +14,11 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+import plotly.graph_objects as go
 import streamlit as st
 
 st.set_page_config(
@@ -27,126 +28,28 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── CSS custom ────────────────────────────────────────────────────────────────
+from sentinel_shared import (
+    SYMBOLS,
+    pair_label,
+    fmt_price as _fmt_price,
+    get_btc_dominance as _get_btc_dominance,
+    get_context as _get_context,
+    get_klines as _get_klines,
+    evaluate_pair,
+    inject_css,
+    tip as _tip,
+    render_market_snapshot,
+)
 
-st.markdown("""
-<style>
-.card {
-    background: #f8f9fa;
-    border-radius: 10px;
-    padding: 1.2rem 1.4rem;
-    margin-bottom: 0.8rem;
-}
-.card-alert  { border-left: 5px solid #28a745; background: #f0fff4; }
-.card-block  { border-left: 5px solid #dc3545; background: #fff5f5; }
-.card-warn   { border-left: 5px solid #fd7e14; background: #fff8f0; }
-.card-neutral{ border-left: 5px solid #6c757d; background: #f8f9fa; }
-
-.score-big { font-size: 3rem; font-weight: 700; line-height: 1; margin: 0; }
-.score-label { font-size: 0.85rem; color: #666; margin-top: 2px; }
-
-.bar-wrap  { background: #e9ecef; border-radius: 6px; height: 14px; overflow: hidden; margin: 4px 0 2px; }
-.bar-fill  { height: 100%; border-radius: 6px; transition: width 0.3s; }
-.bar-green  { background: linear-gradient(90deg, #28a745, #5cb85c); }
-.bar-orange { background: linear-gradient(90deg, #fd7e14, #ffc107); }
-.bar-red    { background: linear-gradient(90deg, #dc3545, #e06c75); }
-.bar-blue   { background: linear-gradient(90deg, #0066cc, #4dabf7); }
-
-.trade-row { display: flex; justify-content: space-between; gap: 0.5rem; margin: 0.5rem 0; }
-.trade-cell { flex: 1; background: #fff; border-radius: 8px; padding: 0.7rem; text-align: center; border: 1px solid #dee2e6; }
-.trade-cell .val { font-size: 1.2rem; font-weight: 700; }
-.trade-cell .lbl { font-size: 0.75rem; color: #888; }
-.trade-cell .stop-val { color: #dc3545; }
-.trade-cell .tp-val   { color: #28a745; }
-
-.tf-badge {
-    display: inline-flex; align-items: center; gap: 0.35rem;
-    padding: 0.35rem 0.7rem; border-radius: 8px; margin-right: 0.5rem;
-    font-size: 0.85rem; font-weight: 600; border: 1px solid #dee2e6;
-}
-.tf-on  { background: #f0fff4; border-color: #c3e6cb; color: #1e7e34; }
-.tf-off { background: #fff5f5; border-color: #f5c6cb; color: #a71d2a; }
-
-.signal-item {
-    padding: 0.45rem 0.75rem;
-    border-radius: 6px;
-    margin-bottom: 0.4rem;
-    font-size: 0.9rem;
-    display: flex;
-    align-items: flex-start;
-    gap: 0.5rem;
-}
-.signal-ok   { background: #f0fff4; border: 1px solid #c3e6cb; }
-.signal-warn { background: #fff8f0; border: 1px solid #ffe0b2; }
-.signal-block{ background: #fff5f5; border: 1px solid #f5c6cb; }
-
-.formula {
-    font-family: monospace;
-    font-size: 0.9rem;
-    background: #272822;
-    color: #f8f8f2;
-    padding: 0.6rem 1rem;
-    border-radius: 6px;
-    margin: 0.5rem 0 1rem;
-}
-.formula .set  { color: #a9dc76; }
-.formula .mac  { color: #66d9e8; }
-.formula .tim  { color: #ffd866; }
-.formula .tot  { color: #fff; font-weight: bold; }
-
-.tooltip-wrap {
-    position: relative;
-    display: inline-block;
-    cursor: help;
-    border-bottom: 1px dotted #999;
-}
-.tooltip-icon { font-size: 0.72em; color: #888; margin-left: 2px; }
-.tooltip-wrap .tooltip-box {
-    visibility: hidden;
-    opacity: 0;
-    position: absolute;
-    top: 135%;
-    left: 50%;
-    transform: translateX(-50%);
-    background: #272822;
-    color: #f8f8f2;
-    text-align: left;
-    padding: 0.55rem 0.75rem;
-    border-radius: 6px;
-    font-size: 0.78rem;
-    font-weight: 400;
-    line-height: 1.35;
-    width: 240px;
-    z-index: 999;
-    transition: opacity 0.15s ease;
-    box-shadow: 0 2px 10px rgba(0,0,0,0.3);
-}
-.tooltip-wrap .tooltip-box::after {
-    content: "";
-    position: absolute;
-    bottom: 100%;
-    left: 50%;
-    margin-left: -5px;
-    border-width: 5px;
-    border-style: solid;
-    border-color: transparent transparent #272822 transparent;
-}
-.tooltip-wrap.tooltip-right .tooltip-box { left: auto; right: 0; transform: none; }
-.tooltip-wrap.tooltip-right .tooltip-box::after { left: auto; right: 10px; margin-left: 0; }
-.tooltip-wrap:hover .tooltip-box { visibility: visible; opacity: 1; }
-</style>
-""", unsafe_allow_html=True)
+inject_css()
 
 # ── Imports del bot ───────────────────────────────────────────────────────────
 
 from alert import (
-    CRYPTO_IDS,
     MIN_SCORE,
     MIN_RR,
     MIN_ADX,
     TRADING_TIMEFRAME,
-    ENTRY_TIMEFRAME,
-    MARKET_CONTEXT_FILE,
     DB_FILE,
     COOLDOWN_HOURS,
     RSI_BAND_SHORT_MIN,
@@ -162,15 +65,6 @@ from alert import (
     SIDE_LONG,
     SIDE_SHORT,
     ACTIVE,
-    evaluate_macro_confirmation,
-    evaluate_setup_confirmation,
-    evaluate_timing_confirmation,
-    build_candidate,
-    apply_execution_quality_gate,
-    load_market_context,
-    normalize_context,
-    fetch_btc_dominance,
-    parse_allowed_sides,
     validate_adx_minimum,
     validate_rsi_confirmation,
     validate_regime_filter,
@@ -181,16 +75,6 @@ from alert import (
     asset_group,
     side_label,
 )
-from data_source import fetch_klines, fetch_latest_price, SYMBOL_TO_BASE
-
-SYMBOLS = sorted(CRYPTO_IDS.values())
-SYMBOL_TO_CGID = {sym: cg for cg, sym in CRYPTO_IDS.items()}
-
-
-def pair_label(symbol: str) -> str:
-    """Todos los activos rastreados cotizan contra USDT en Bybit Spot (ver SYMBOL_TO_BASE)."""
-    base, quote = SYMBOL_TO_BASE.get(symbol, (symbol, "USDT"))
-    return f"{base}/{quote}"
 
 # ── Helpers de presentación ───────────────────────────────────────────────────
 
@@ -224,14 +108,6 @@ def _score_bar(label: str, value: float, vmin: float, vmax: float, color: str = 
     """, unsafe_allow_html=True)
 
 
-def _tip(label: str, explanation: str, align: str = "left") -> str:
-    cls = "tooltip-wrap tooltip-right" if align == "right" else "tooltip-wrap"
-    return (
-        f'<span class="{cls}">{label}<span class="tooltip-icon">ⓘ</span>'
-        f'<span class="tooltip-box">{explanation}</span></span>'
-    )
-
-
 def _signal_row(text: str, kind: str) -> None:
     icons = {"ok": "✅", "warn": "⚠️", "block": "🚫"}
     css = {"ok": "signal-ok", "warn": "signal-warn", "block": "signal-block"}
@@ -249,25 +125,89 @@ def _tf_badge(label: str, ok: bool) -> str:
     return f'<span class="tf-badge {css}">{icon} {label}</span>'
 
 
-# ── Cache ─────────────────────────────────────────────────────────────────────
+def _candlestick_chart(
+    df,
+    *,
+    ema_spans: Tuple[int, ...] = (20, 50),
+    entry: Optional[float] = None,
+    stop: Optional[float] = None,
+    tp1: Optional[float] = None,
+    tp2: Optional[float] = None,
+    height: int = 380,
+    tail_bars: Optional[int] = None,
+) -> go.Figure:
+    """Velas + EMAs de contexto y, si se pasan, niveles de trade (solo capa 4H).
 
-@st.cache_data(ttl=300, show_spinner=False)
-def _get_btc_dominance() -> Optional[float]:
-    return fetch_btc_dominance()
+    EMAs se calculan sobre el histórico completo (para que no arranquen "frías")
+    y recién después se recorta a `tail_bars` para mostrar solo el tramo reciente.
+    """
+    ema_full = {span: df["Close"].ewm(span=span, adjust=False).mean() for span in ema_spans}
 
+    plot_df = df
+    if tail_bars is not None and len(df) > tail_bars:
+        plot_df = df.tail(tail_bars)
+        ema_full = {span: ema.tail(tail_bars) for span, ema in ema_full.items()}
 
-@st.cache_data(ttl=120, show_spinner=False)
-def _get_context() -> Dict[str, Any]:
-    return load_market_context(MARKET_CONTEXT_FILE)
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=plot_df["ts"], open=plot_df["Open"], high=plot_df["High"], low=plot_df["Low"], close=plot_df["Close"],
+        name="Precio", increasing_line_color="#28a745", decreasing_line_color="#dc3545",
+        showlegend=False,
+    ))
+    ema_colors = {20: "#4dabf7", 50: "#fd7e14", 200: "#a371f7"}
+    for span, ema in ema_full.items():
+        fig.add_trace(go.Scatter(
+            x=plot_df["ts"], y=ema, name=f"EMA{span}", mode="lines",
+            line=dict(color=ema_colors.get(span, "#888"), width=1.2),
+        ))
 
+    if entry is not None and stop is not None:
+        fig.add_hrect(
+            y0=min(entry, stop), y1=max(entry, stop),
+            fillcolor="rgba(220,53,69,0.12)", line_width=0, layer="below",
+        )
+    if entry is not None and tp2 is not None:
+        fig.add_hrect(
+            y0=min(entry, tp2), y1=max(entry, tp2),
+            fillcolor="rgba(40,167,69,0.12)", line_width=0, layer="below",
+        )
 
-@st.cache_data(ttl=90, show_spinner=False)
-def _get_klines(symbol: str):
-    daily = fetch_klines(symbol, "1d", 300)
-    fourh = fetch_klines(symbol, TRADING_TIMEFRAME, 300)
-    entry = fetch_klines(symbol, ENTRY_TIMEFRAME, 100)
-    price = fetch_latest_price(symbol)
-    return daily, fourh, entry, price
+    levels = (
+        (entry, "Entry", "#0066cc"),
+        (stop, "Stop", "#dc3545"),
+        (tp1, "TP1", "#28a745"),
+        (tp2, "TP2", "#1e7e34"),
+    )
+    for value, _label, color in levels:
+        if value is None:
+            continue
+        fig.add_hline(y=value, line_dash="dot", line_color=color, line_width=1.3)
+
+    # Caja agrupada en vez de una etiqueta por línea: cuando entry/stop/tp1/tp2
+    # quedan muy cerca en precio (rango angosto vs. todo el histórico mostrado),
+    # las anotaciones individuales se superponen y se vuelven ilegibles.
+    box_rows = [
+        f'<span style="color:{color}">{label} <b>{_fmt_price(value)}</b></span>'
+        for value, label, color in levels if value is not None
+    ]
+    if box_rows:
+        fig.add_annotation(
+            xref="paper", yref="paper", x=0.01, y=0.98,
+            xanchor="left", yanchor="top", align="left", showarrow=False,
+            text="<br>".join(box_rows),
+            bgcolor="rgba(255,255,255,0.9)", bordercolor="#dee2e6", borderwidth=1,
+            borderpad=6, font=dict(size=11.5),
+        )
+
+    fig.update_layout(
+        height=height,
+        margin=dict(l=10, r=10, t=10, b=10),
+        xaxis_rangeslider_visible=False,
+        template="plotly_white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
+        hovermode="x unified",
+    )
+    return fig
 
 
 def _get_recent_alerts(symbol: str, side: str, timeframe: str) -> List[sqlite3.Row]:
@@ -306,46 +246,7 @@ with st.sidebar:
         btc_dominance = _get_btc_dominance()
         market_context = _get_context()
 
-    dom_str = f"{btc_dominance:.1f}%" if btc_dominance is not None else "N/D"
-    if btc_dominance is None:
-        dom_color, dom_label = "#6c757d", "No disponible"
-    elif btc_dominance >= 58:
-        dom_color, dom_label = "#dc3545", "Alta — penaliza longs en altcoins"
-    elif btc_dominance <= 44:
-        dom_color, dom_label = "#28a745", "Baja — rotación a altcoins"
-    else:
-        dom_color, dom_label = "#6c757d", "Neutral"
-
-    dom_tip = _tip(
-        "BTC Dominance",
-        "Qué % de la capitalización total del mercado cripto es Bitcoin. "
-        "Alta (≥58%) penaliza longs en altcoins y favorece shorts; "
-        "baja (≤44%) hace lo opuesto. No aplica al propio BTC.",
-    )
-    st.markdown(f"""
-    <div class="card" style="border-left: 4px solid {dom_color}; padding: 0.8rem 1rem; margin-bottom:0.6rem;">
-      <div style="font-size:0.75rem;color:#888;">{dom_tip}</div>
-      <div style="font-size:1.8rem;font-weight:700;color:{dom_color};">{dom_str}</div>
-      <div style="font-size:0.78rem;color:{dom_color};">{dom_label}</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    global_ctx = market_context.get("GLOBAL", {}) if isinstance(market_context, dict) else {}
-    caution = str(global_ctx.get("caution_level", "NORMAL")).upper() if isinstance(global_ctx, dict) else "NORMAL"
-    caution_colors = {"LOW": "#28a745", "NORMAL": "#28a745", "MEDIUM": "#fd7e14", "HIGH": "#dc3545", "EXTREME": "#dc3545"}
-    caution_color = caution_colors.get(caution, "#6c757d")
-    caution_tip = _tip(
-        "Cautela global",
-        "Nivel manual configurado en market_context.json → GLOBAL.caution_level. "
-        "A mayor cautela, mayor penalización al score de todas las señales "
-        "(NORMAL=0, MEDIUM=-0.25, HIGH=-0.6, EXTREME=-1.0).",
-    )
-    st.markdown(f"""
-    <div class="card" style="border-left: 4px solid {caution_color}; padding: 0.8rem 1rem; margin-bottom:0.6rem;">
-      <div style="font-size:0.75rem;color:#888;">{caution_tip}</div>
-      <div style="font-size:1.4rem;font-weight:700;color:{caution_color};">{caution}</div>
-    </div>
-    """, unsafe_allow_html=True)
+    render_market_snapshot(btc_dominance, market_context)
 
     st.divider()
     st.caption(
@@ -359,12 +260,18 @@ with st.sidebar:
 st.markdown("## Crypto Sentinel Inspector")
 st.caption("Motor idéntico al bot (1D macro + 4H setup + 15m timing) · sin Telegram, sin escribir en la DB")
 
+# Si venimos de un clic en la tabla de pages/1_Resumen.py, preseleccionar ese
+# activo y saltar directo a la evaluación sin exigir un segundo clic en "Evaluar".
+preselected_symbol = st.session_state.get("selected_symbol")
+default_index = SYMBOLS.index(preselected_symbol) if preselected_symbol in SYMBOLS else 0
+
 col_sym, col_btn = st.columns([5, 1])
 
 with col_sym:
     symbol: str = st.selectbox(
         "",
         options=SYMBOLS,
+        index=default_index,
         format_func=lambda s: f"{pair_label(s)}  —  {asset_group(s)}",
         label_visibility="collapsed",
     )
@@ -372,6 +279,8 @@ with col_sym:
 with col_btn:
     st.write("")
     evaluar = st.button("Evaluar →", type="primary", use_container_width=True)
+
+evaluar = evaluar or (preselected_symbol == symbol)
 
 st.divider()
 
@@ -381,40 +290,22 @@ if not evaluar:
 
 # ── Descarga + evaluación ─────────────────────────────────────────────────────
 
-cg_id = SYMBOL_TO_CGID[symbol]
-
 with st.spinner(f"Descargando velas 1D/4H/15m y evaluando {symbol}..."):
-    daily_df, fourh_df, entry_df, current_price = _get_klines(symbol)
+    pair_data = evaluate_pair(symbol, market_context, btc_dominance)
 
-if daily_df is None or fourh_df is None or entry_df is None:
+if pair_data is None:
     st.error(f"Datos insuficientes para **{symbol}** — Bybit/OKX no devolvieron velas en alguna de las 3 capas.")
     st.stop()
 
-normalized_context = normalize_context(market_context, symbol)
-if btc_dominance is not None:
-    normalized_context["btc_dominance"] = btc_dominance
-allowed_sides = parse_allowed_sides(normalized_context)
+daily_df = pair_data["daily_df"]
+fourh_df = pair_data["fourh_df"]
+entry_df = pair_data["entry_df"]
+current_price = pair_data["current_price"]
+normalized_context = pair_data["normalized_context"]
+allowed_sides = pair_data["allowed_sides"]
+results = pair_data["results"]
 
-results: Dict[str, Optional[Dict[str, Any]]] = {}
-for side in (SIDE_LONG, SIDE_SHORT):
-    macro_eval = evaluate_macro_confirmation(daily_df, symbol, normalized_context, side=side)
-    setup_eval = evaluate_setup_confirmation(fourh_df, symbol, cg_id, side=side)
-    timing_eval = evaluate_timing_confirmation(entry_df, symbol, side=side)
-
-    if not macro_eval or not setup_eval or not timing_eval:
-        results[side] = None
-        continue
-
-    candidate = build_candidate(symbol, cg_id, macro_eval, setup_eval, timing_eval)
-    candidate = apply_execution_quality_gate(candidate, current_price)
-    results[side] = {
-        "macro": macro_eval,
-        "setup": setup_eval,
-        "timing": timing_eval,
-        "candidate": candidate,
-    }
-
-price_str = f"${current_price:,.4g}" if current_price is not None else "N/D"
+price_str = _fmt_price(current_price) if current_price is not None else "N/D"
 st.markdown(f"### {pair_label(symbol)} — {asset_group(symbol)}  ·  precio actual: **{price_str}**")
 
 note = str(normalized_context.get("note", "")).strip()
@@ -550,19 +441,19 @@ def render_side(side: str) -> None:
         <div class="trade-row">
           <div class="trade-cell">
             <div class="lbl">{entry_tip}</div>
-            <div class="val">${entry:,.4g}</div>
+            <div class="val">{_fmt_price(entry)}</div>
           </div>
           <div class="trade-cell">
             <div class="lbl">{stop_tip}</div>
-            <div class="val stop-val">${stop:,.4g}</div>
+            <div class="val stop-val">{_fmt_price(stop)}</div>
           </div>
           <div class="trade-cell">
             <div class="lbl">{tp1_tip}</div>
-            <div class="val tp-val">${tp1:,.4g}</div>
+            <div class="val tp-val">{_fmt_price(tp1)}</div>
           </div>
           <div class="trade-cell">
             <div class="lbl">{tp2_tip}</div>
-            <div class="val tp-val">${tp2:,.4g}</div>
+            <div class="val tp-val">{_fmt_price(tp2)}</div>
           </div>
         </div>
         <div class="trade-row">
@@ -582,7 +473,7 @@ def render_side(side: str) -> None:
         """, unsafe_allow_html=True)
 
         st.caption(
-            f"Breakeven trigger: **${candidate.get('breakeven_trigger', 0):,.4g}** &nbsp;·&nbsp; "
+            f"Breakeven trigger: **{_fmt_price(candidate.get('breakeven_trigger', 0))}** &nbsp;·&nbsp; "
             f"Grupo: **{candidate['asset_group']}**"
         )
 
@@ -615,9 +506,37 @@ def render_side(side: str) -> None:
     # COLUMNA DERECHA — tabs
     # ═══════════════════════════════════════════════════════
     with right:
-        tab_score, tab_ind, tab_signals, tab_cooldown = st.tabs(
-            ["📊 Scoring", "📐 Indicadores", "🔍 Señales", "🕒 Cooldown"]
+        tab_chart, tab_score, tab_ind, tab_signals, tab_cooldown = st.tabs(
+            ["📈 Gráfico", "📊 Scoring", "📐 Indicadores", "🔍 Señales", "🕒 Cooldown"]
         )
+
+        # ── TAB 0: Gráfico ────────────────────────────────────
+        with tab_chart:
+            tf_1d, tf_4h, tf_15m = st.tabs(["1D", "4H", "15m"])
+            with tf_1d:
+                st.caption("EMA20 / EMA50 / EMA200 — régimen macro usado por la confirmación 1D. Últimos 2 meses.")
+                st.plotly_chart(
+                    _candlestick_chart(daily_df, ema_spans=(20, 50, 200), tail_bars=60),
+                    use_container_width=True, config={"displayModeBar": False},
+                    key=f"chart_1d_{side}",
+                )
+            with tf_4h:
+                st.caption("EMA20 / EMA50 / EMA200 + niveles del trade setup (entry/stop/TP1/TP2). Última semana.")
+                st.plotly_chart(
+                    _candlestick_chart(
+                        fourh_df, ema_spans=(20, 50, 200),
+                        entry=entry, stop=stop, tp1=tp1, tp2=tp2, tail_bars=42,
+                    ),
+                    use_container_width=True, config={"displayModeBar": False},
+                    key=f"chart_4h_{side}",
+                )
+            with tf_15m:
+                st.caption("EMA20 / EMA50 — capa de timing de entrada. Últimas 24h.")
+                st.plotly_chart(
+                    _candlestick_chart(entry_df, ema_spans=(20, 50), tail_bars=96),
+                    use_container_width=True, config={"displayModeBar": False},
+                    key=f"chart_15m_{side}",
+                )
 
         # ── TAB 1: Scoring ──────────────────────────────────
         with tab_score:
@@ -693,7 +612,7 @@ def render_side(side: str) -> None:
             s1, s2, s3 = st.columns(3)
             s1.metric("Régimen 4H", candidate["regime"], help="Régimen EMA en la capa 4H, la que determina el setup base.")
             s2.metric("RSI 4H", f"{candidate['rsi']:.1f}", help="RSI(14) en 4H.")
-            s3.metric("ATR 4H", f"${candidate['atr']:,.4g}", help="Volatilidad 4H en unidades de precio; define distancia de stop/TP.")
+            s3.metric("ATR 4H", _fmt_price(candidate['atr']), help="Volatilidad 4H en unidades de precio; define distancia de stop/TP.")
 
             s4, s5, s6 = st.columns(3)
             s4.metric("VWAP dist.", f"{candidate['vwap_distance_pct']:+.2f}%", help="Distancia del precio al VWAP de las últimas 20 velas 4H.")
@@ -713,8 +632,8 @@ def render_side(side: str) -> None:
             l1.markdown(f"""
             | Nivel | Valor |
             |---|---|
-            | Swing low (4H) | ${candidate['swing_low']:,.4g} |
-            | Swing high (4H) | ${candidate['swing_high']:,.4g} |
+            | Swing low (4H) | {_fmt_price(candidate['swing_low'])} |
+            | Swing high (4H) | {_fmt_price(candidate['swing_high'])} |
             | Dist. a swing high | {candidate.get('distance_to_swing_high_pct', 0):.2f}% |
             | Dist. a swing low | {candidate.get('distance_to_swing_low_pct', 0):.2f}% |
             """)
@@ -807,7 +726,7 @@ def render_side(side: str) -> None:
                     st.markdown(f"""
                     <div class="signal-item {"signal-ok" if row["status"] == ACTIVE else "signal-warn"}">
                       <span>{"🟢" if row["status"] == ACTIVE else "⚪"}</span>
-                      <span>{sent_dt} · score {row['score']:.2f} · RR {row['rr_ratio']:.2f} · entry ${row['entry_price']:,.4g} · status {row['status']}</span>
+                      <span>{sent_dt} · score {row['score']:.2f} · RR {row['rr_ratio']:.2f} · entry {_fmt_price(row['entry_price'])} · status {row['status']}</span>
                     </div>
                     """, unsafe_allow_html=True)
 

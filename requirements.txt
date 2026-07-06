@@ -4,3 +4,4 @@ pandas-stubs>=2.2,<3.0
 types-requests>=2.32,<3.0
 pytest>=8.0
 streamlit>=1.35,<2.0
+plotly>=5.20,<6.0

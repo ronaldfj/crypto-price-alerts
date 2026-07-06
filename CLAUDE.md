@@ -12,7 +12,9 @@ Bot de alertas de trading para crypto. Analiza activos en 3 timeframes (1D, 4H, 
 | `data_source.py` | Fetching OHLCV desde Bybit (primario) y OKX (fallback) |
 | `backtester.py` | Backtest histórico point-in-time, walk-forward 70/30, reporte de expectancy en R |
 | `diagnose_scan.py` | Diagnóstico detallado del scan actual sin enviar alertas |
-| `inspector.py` | Inspector interactivo (Streamlit): evalúa cualquier activo rastreado bajo demanda con el motor idéntico a `alert.py` (1D+4H+15m). Solo lectura — no envía Telegram ni escribe en `alerts_state.db`. `streamlit run inspector.py` |
+| `inspector.py` | Inspector interactivo (Streamlit), página principal: evalúa un activo elegido a mano con el motor idéntico a `alert.py` (1D+4H+15m). Solo lectura — no envía Telegram ni escribe en `alerts_state.db`. `streamlit run inspector.py` |
+| `pages/1_Resumen.py` | Segunda página del mismo app Streamlit (multipage): tabla comparativa de los 11 pares (score/RR/ADX/régimen por timeframe, LONG y SHORT). Clic en una fila → `st.switch_page` al Inspector con ese par preseleccionado y evaluado. Streamlit detecta `pages/` automáticamente junto a `inspector.py`; no cambia el comando de arranque |
+| `sentinel_shared.py` | Utilidades compartidas entre `inspector.py` y `pages/1_Resumen.py`: fetchers cacheados (`get_klines`, `get_context`, `get_btc_dominance`) y `evaluate_pair()` (pipeline macro/setup/timing/candidate para ambos lados). Sin UI propia |
 | `market_context.json` | Contexto macro manual por símbolo (sesgos, bloqueos, ajustes de RR) |
 | `alerts_state.db` | SQLite con tabla `alerts` y cooldowns |
 

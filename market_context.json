@@ -24,6 +24,9 @@
       "LONG",
       "SHORT"
     ],
+    "hard_block_long": true,
+    "hard_block_short": true,
+    "hard_block_reason": "Excluido jul 2026: negativo en las 4 lecturas out-of-sample probadas (backtest 24m completo, in-sample 12m, out-of-sample 12m, y el histórico ya documentado en CLAUDE.md) sin ninguna lectura positiva que lo contradiga. Revertir solo si un backtest fresco muestra out-of-sample positivo con N>=20.",
     "caution_level": "MEDIUM",
     "long_resistance_near": true,
     "long_resistance_label": "~65k / swing alto de junio",

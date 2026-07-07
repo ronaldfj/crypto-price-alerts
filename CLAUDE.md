@@ -24,6 +24,8 @@ BTC, ETH, SOL, BNB, XRP, TRX, XLM, DOT, TON, LTC, LINK — todos vs USDT, en Byb
 
 **⚠️ TON sin cobertura de datos (detectado jul 2026 vía `inspector.py`):** ni Bybit ni OKX listan un par spot para TON (`TONUSDT` / `TON-USDT`) bajo ningún nombre — se confirmó contra `/v5/market/instruments-info` (Bybit, 598 símbolos) y `/api/v5/public/instruments` (OKX, 1278 símbolos), cero coincidencias. Desde la migración de `alert.py`/`diagnose_scan.py` a `data_source.fetch_klines()`, cada corrida falla para TON ("ningún proveedor devolvió datos") y nunca genera alertas para ese activo. Con el data-health check (jul 2026, ver sección "Circuit breaker y data-health check" abajo) este tipo de falla ya no requiere inspección manual: tras 3 corridas consecutivas sin datos se envía un aviso Telegram automático. Pendiente decidir: quitar TON de `CRYPTO_IDS`/`SYMBOL_TO_BASE` o buscar un exchange/par alternativo.
 
+**⚠️ BTC bloqueado para alertar (jul 2026):** `market_context.json` tiene `hard_block_long`/`hard_block_short=true` para BTC — negativo en las 4 lecturas out-of-sample probadas (backtest 24m completo, in-sample 12m, out-of-sample 12m, y el histórico previo), sin ninguna lectura positiva que lo contradiga. Sigue en `CRYPTO_IDS` (visible en `inspector.py`/`pages/1_Resumen.py`/backtester para monitorear si el edge se recupera), pero `evaluate_macro_confirmation` fuerza `macro_ok=False` en ambos lados, así que nunca completa las 3 confirmaciones. Revertir solo si un backtest fresco muestra out-of-sample positivo con N≥20 (ver `BACKTEST_MIN_VERDICT_N` abajo).
+
 ## Arquitectura de 3 timeframes
 
 ### 1D — `evaluate_macro_confirmation()`
@@ -132,6 +134,8 @@ python backtester.py --fees 0.001 --slippage 0.0005 --output results.json
 - Walk-forward 70/30 (train/test) para detectar overfit
 - Forward bars: 24 × 4H = 96h por default
 - Métrica primaria: expectancy en R (no win rate)
+- **VEREDICTO se calcula sobre out-of-sample (`test_metrics`), no el agregado in+out** (fix jul 2026, `compute_verdict()`): el agregado se infla con el tramo in-sample — un run real mostró in-sample +0.588R / out-sample +0.047R (degradación 0.08, OVERFIT) pero el agregado igual cruzaba el umbral de "edge positivo neto". Con `BACKTEST_MIN_VERDICT_N=20` (default) el veredicto avisa si el out-of-sample no tiene señales suficientes en vez de forzar un veredicto.
+- **Caveat de `market_context.json` en backtests largos:** el contexto manual (soporte/resistencia, ajustes de score) es una foto actual aplicada por igual a *todo* el rango histórico — no es point-in-time. Un backtest de 24m puede mostrar cero señales en los primeros ~17 meses si el contexto vigente no corresponde a los precios de esa época (confirmado con BTC). El horizonte confiable hoy es ~12m, no el default de 24m.
 
 ## Entorno y dependencias
 

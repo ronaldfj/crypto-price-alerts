@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import sqlite3
+import time
 import pandas as pd
 import numpy as np
 import pytest
@@ -29,9 +30,12 @@ from alert import (
     get_meta,
     get_regime,
     init_db,
+    is_circuit_broken,
     load_market_context,
     normalize_context,
     parse_allowed_sides,
+    record_data_health_failure,
+    record_data_health_success,
     rsi_bucket,
     set_meta,
     should_send_alert,
@@ -620,3 +624,175 @@ class TestInvalidateOldAlerts:
         assert updated["status"] == alert.INVALIDATED
         assert updated["outcome_rr"] is None
         assert updated["validation_status"] == alert.VALIDATION_PENDING
+
+
+# ── is_circuit_broken / should_send_alert circuit breaker gate ───────────────
+
+class TestCircuitBreaker:
+    """Circuit breaker estilo freqtrade Protections/StoplossGuard: bloquea
+    symbol+side tras N invalidaciones discrecionales recientes, cortando el
+    ciclo de re-alertar un side que sigue "mejorando" (is_material_improvement)
+    para luego invalidarse de nuevo en mercado choppy."""
+
+    def _candidate(self, symbol="BTC", side=SIDE_SHORT, score=7.0):
+        key = f"{symbol}|{side}|4h|BEAR_STACK|50-54|0.500-0.618|1234"
+        return {
+            "symbol": symbol, "side": side, "timeframe": "4h",
+            "regime": "BEAR_STACK", "rsi_bucket": "50-54",
+            "fib_zone": "0.500-0.618", "price_bucket": "1234",
+            "setup_key": key, "setup_hash": build_setup_hash(key),
+            "score": score, "entry_price": 30000.0,
+            "rr_ratio": 2.0, "adx": 30.0,
+        }
+
+    def _insert_invalidated_alert(self, conn, symbol, side, invalidated_at):
+        now = int(time.time())
+        key = f"{symbol}|{side}|4h|BEAR_STACK|50-54|0.500-0.618|1234"
+        conn.execute(
+            """INSERT INTO alerts
+               (symbol, cg_id, side, timeframe, setup_key, setup_hash, regime,
+                rsi_bucket, fib_zone, price_bucket, candle_ts, entry_price,
+                stop_loss, take_profit, rr_ratio, score, adx, rsi, atr,
+                reasons_json, status, sent_at, invalidated_at, invalidation_reason)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (symbol, symbol.lower(), side, "4h", key, build_setup_hash(key), "BEAR_STACK",
+             "50-54", "0.500-0.618", "1234",
+             now - 7200, 30000.0, 31000.0, 28000.0, 2.0, 7.0, 30.0, 50.0, 300.0,
+             "[]", alert.INVALIDATED, now - 7200, invalidated_at, "Confirmación macro perdida"),
+        )
+        conn.commit()
+
+    def test_no_invalidations_allows_send(self):
+        conn = _in_memory_db()
+        broken, count = is_circuit_broken(conn, "BTC", SIDE_SHORT, int(time.time()))
+        assert broken is False
+        assert count == 0
+
+    def test_threshold_invalidations_within_window_blocks(self):
+        conn = _in_memory_db()
+        now_ts = int(time.time())
+        for _ in range(alert.CIRCUIT_BREAKER_MAX_INVALIDATIONS):
+            self._insert_invalidated_alert(conn, "BTC", SIDE_SHORT, now_ts - 3600)
+
+        ok, _, reason = should_send_alert(conn, self._candidate("BTC", SIDE_SHORT))
+        assert ok is False
+        assert "Circuit breaker" in reason
+
+    def test_below_threshold_does_not_block(self):
+        conn = _in_memory_db()
+        now_ts = int(time.time())
+        for _ in range(alert.CIRCUIT_BREAKER_MAX_INVALIDATIONS - 1):
+            self._insert_invalidated_alert(conn, "BTC", SIDE_SHORT, now_ts - 3600)
+
+        broken, count = is_circuit_broken(conn, "BTC", SIDE_SHORT, now_ts)
+        assert broken is False
+        assert count == alert.CIRCUIT_BREAKER_MAX_INVALIDATIONS - 1
+
+    def test_only_applies_to_matching_side(self):
+        """3 invalidaciones en SHORT no deben bloquear LONG del mismo symbol —
+        la granularidad es symbol+side, no todo el activo."""
+        conn = _in_memory_db()
+        now_ts = int(time.time())
+        for _ in range(alert.CIRCUIT_BREAKER_MAX_INVALIDATIONS):
+            self._insert_invalidated_alert(conn, "BTC", SIDE_SHORT, now_ts - 3600)
+
+        broken, _ = is_circuit_broken(conn, "BTC", SIDE_LONG, now_ts)
+        assert broken is False
+
+    def test_invalidations_outside_window_do_not_block(self):
+        conn = _in_memory_db()
+        now_ts = int(time.time())
+        old_ts = now_ts - (alert.CIRCUIT_BREAKER_WINDOW_HOURS + 1) * 3600
+        for _ in range(alert.CIRCUIT_BREAKER_MAX_INVALIDATIONS):
+            self._insert_invalidated_alert(conn, "BTC", SIDE_SHORT, old_ts)
+
+        broken, count = is_circuit_broken(conn, "BTC", SIDE_SHORT, now_ts)
+        assert broken is False
+        assert count == 0
+
+    def test_closed_status_does_not_count_toward_breaker(self):
+        """Un CLOSED (SL/TP real) no es una invalidación discrecional — no debe
+        contar para el circuit breaker aunque haya varios."""
+        conn = _in_memory_db()
+        now_ts = int(time.time())
+        key = "BTC|SHORT|4h|BEAR_STACK|50-54|0.500-0.618|1234"
+        for _ in range(alert.CIRCUIT_BREAKER_MAX_INVALIDATIONS):
+            conn.execute(
+                """INSERT INTO alerts
+                   (symbol, cg_id, side, timeframe, setup_key, setup_hash, regime,
+                    rsi_bucket, fib_zone, price_bucket, candle_ts, entry_price,
+                    stop_loss, take_profit, rr_ratio, score, adx, rsi, atr,
+                    reasons_json, status, sent_at, invalidated_at, invalidation_reason)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ("BTC", "bitcoin", SIDE_SHORT, "4h", key, build_setup_hash(key), "BEAR_STACK",
+                 "50-54", "0.500-0.618", "1234",
+                 now_ts - 7200, 30000.0, 31000.0, 28000.0, 2.0, 7.0, 30.0, 50.0, 300.0,
+                 "[]", alert.CLOSED, now_ts - 7200, now_ts - 3600, "Stop técnico vulnerado"),
+            )
+        conn.commit()
+
+        broken, count = is_circuit_broken(conn, "BTC", SIDE_SHORT, now_ts)
+        assert broken is False
+        assert count == 0
+
+
+# ── record_data_health_failure / record_data_health_success ──────────────────
+
+class TestDataHealth:
+    """Data-health check estilo freqtrade Pairlist: detecta y avisa cuando un
+    símbolo lleva N corridas seguidas sin datos de ningún proveedor (caso TON:
+    antes de esto, el fallo quedaba silencioso salvo en logs)."""
+
+    def test_first_failure_increments_and_does_not_alert(self):
+        conn = _in_memory_db()
+        now_ts = int(time.time())
+        consecutive, should_alert = record_data_health_failure(conn, "TON", now_ts)
+        assert consecutive == 1
+        assert should_alert is False
+
+    def test_crossing_threshold_alerts_once(self):
+        conn = _in_memory_db()
+        now_ts = int(time.time())
+        for i in range(alert.DATA_HEALTH_ALERT_THRESHOLD - 1):
+            consecutive, should_alert = record_data_health_failure(conn, "TON", now_ts + i)
+            assert should_alert is False
+
+        consecutive, should_alert = record_data_health_failure(
+            conn, "TON", now_ts + alert.DATA_HEALTH_ALERT_THRESHOLD
+        )
+        assert consecutive == alert.DATA_HEALTH_ALERT_THRESHOLD
+        assert should_alert is True
+
+    def test_does_not_realert_immediately_after_crossing(self):
+        conn = _in_memory_db()
+        now_ts = int(time.time())
+        for i in range(alert.DATA_HEALTH_ALERT_THRESHOLD):
+            record_data_health_failure(conn, "TON", now_ts + i)
+
+        # Una falla más, inmediatamente después de haber avisado: no debe repetir.
+        _, should_alert = record_data_health_failure(
+            conn, "TON", now_ts + alert.DATA_HEALTH_ALERT_THRESHOLD + 1
+        )
+        assert should_alert is False
+
+    def test_realerts_after_seven_days(self):
+        conn = _in_memory_db()
+        now_ts = int(time.time())
+        for i in range(alert.DATA_HEALTH_ALERT_THRESHOLD):
+            record_data_health_failure(conn, "TON", now_ts + i)
+
+        later = now_ts + alert.DATA_HEALTH_ALERT_THRESHOLD + 8 * 24 * 3600
+        _, should_alert = record_data_health_failure(conn, "TON", later)
+        assert should_alert is True
+
+    def test_success_resets_consecutive_failures(self):
+        conn = _in_memory_db()
+        now_ts = int(time.time())
+        record_data_health_failure(conn, "TON", now_ts)
+        record_data_health_failure(conn, "TON", now_ts + 1)
+
+        record_data_health_success(conn, "TON", now_ts + 2)
+
+        consecutive, should_alert = record_data_health_failure(conn, "TON", now_ts + 3)
+        assert consecutive == 1
+        assert should_alert is False

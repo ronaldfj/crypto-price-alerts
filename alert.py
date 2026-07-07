@@ -64,6 +64,19 @@ REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
 SLEEP_BETWEEN_ASSETS = float(os.getenv("SLEEP_BETWEEN_ASSETS", "1.0"))
 FIB_LOOKBACK = int(os.getenv("FIB_LOOKBACK", "55"))
 
+# Circuit breaker: bloquea symbol+side tras N invalidaciones discrecionales
+# recientes (patrón "Protections/StoplossGuard" de freqtrade). Corta el ciclo
+# de re-alertar un side que sigue "mejorando" (is_material_improvement) para
+# luego invalidarse de nuevo en mercado choppy — ver CLAUDE.md, observaciones
+# de producción jun-jul 2026.
+ENABLE_CIRCUIT_BREAKER = os.getenv("ENABLE_CIRCUIT_BREAKER", "true").lower() == "true"
+CIRCUIT_BREAKER_MAX_INVALIDATIONS = int(os.getenv("CIRCUIT_BREAKER_MAX_INVALIDATIONS", "3"))
+CIRCUIT_BREAKER_WINDOW_HOURS = int(os.getenv("CIRCUIT_BREAKER_WINDOW_HOURS", "24"))
+
+# Data-health: avisa por Telegram si un símbolo lleva N corridas seguidas sin
+# datos de ningún proveedor (patrón "Pairlist" de freqtrade) — ver caso TON.
+DATA_HEALTH_ALERT_THRESHOLD = int(os.getenv("DATA_HEALTH_ALERT_THRESHOLD", "3"))
+
 ENABLE_RANKING = os.getenv("ENABLE_RANKING", "true").lower() == "true"
 MAX_ALERTS_PER_RUN = int(os.getenv("MAX_ALERTS_PER_RUN", "2"))
 MAX_ALERTS_PER_GROUP = int(os.getenv("MAX_ALERTS_PER_GROUP", "1"))
@@ -413,6 +426,35 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
         (key, value),
     )
     conn.commit()
+
+
+def _data_health_key(symbol: str) -> str:
+    return f"data_health:{symbol}"
+
+
+def record_data_health_failure(conn: sqlite3.Connection, symbol: str, now_ts: int) -> Tuple[int, bool]:
+    """Registra una corrida sin datos para `symbol`. Devuelve (corridas seguidas,
+    si corresponde avisar por Telegram ahora). Solo avisa una vez al cruzar el
+    umbral, y no vuelve a avisar hasta 7 días después (o hasta que se recupere)."""
+    state = json.loads(get_meta(conn, _data_health_key(symbol), "{}") or "{}")
+    consecutive = state.get("consecutive_failures", 0) + 1
+    alerted_at = state.get("alerted_at")
+    should_alert = consecutive >= DATA_HEALTH_ALERT_THRESHOLD and (
+        alerted_at is None or now_ts - alerted_at > 7 * 24 * 3600
+    )
+    state["consecutive_failures"] = consecutive
+    state["last_failure_at"] = now_ts
+    if should_alert:
+        state["alerted_at"] = now_ts
+    set_meta(conn, _data_health_key(symbol), json.dumps(state))
+    return consecutive, should_alert
+
+
+def record_data_health_success(conn: sqlite3.Connection, symbol: str, now_ts: int) -> None:
+    set_meta(conn, _data_health_key(symbol), json.dumps({
+        "consecutive_failures": 0,
+        "last_success_at": now_ts,
+    }))
 
 
 def import_legacy_state_if_needed(conn: sqlite3.Connection) -> None:
@@ -2131,9 +2173,36 @@ def blocked_by_legacy_cooldown(conn: sqlite3.Connection, symbol: str, now_ts: in
     return (now_ts - int(row["sent_at"])) < COOLDOWN_HOURS * 3600
 
 
+def is_circuit_broken(conn: sqlite3.Connection, symbol: str, side: str, now_ts: int) -> Tuple[bool, int]:
+    """Cuenta invalidaciones discrecionales (status=INVALIDATED, no CLOSED por
+    SL/TP real) de este symbol+side dentro de la ventana. Si supera el umbral,
+    bloquea nuevas alertas hasta que las invalidaciones recientes salgan de la
+    ventana por sí solas — sin estado persistido aparte."""
+    if not ENABLE_CIRCUIT_BREAKER:
+        return False, 0
+    cutoff = now_ts - CIRCUIT_BREAKER_WINDOW_HOURS * 3600
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS c FROM alerts
+        WHERE symbol = ? AND side = ? AND status = ? AND invalidated_at >= ?
+        """,
+        (symbol, side, INVALIDATED, cutoff),
+    ).fetchone()
+    count = row["c"]
+    return count >= CIRCUIT_BREAKER_MAX_INVALIDATIONS, count
+
+
 def should_send_alert(conn: sqlite3.Connection, candidate: Dict[str, Any]) -> Tuple[bool, Optional[int], str]:
     now_ts = int(time.time())
     cutoff = now_ts - (COOLDOWN_HOURS * 3600)
+
+    broken, invalidation_count = is_circuit_broken(conn, candidate["symbol"], candidate["side"], now_ts)
+    if broken:
+        return (
+            False,
+            None,
+            f"Circuit breaker: {invalidation_count} invalidaciones en {CIRCUIT_BREAKER_WINDOW_HOURS}h",
+        )
 
     if blocked_by_legacy_cooldown(conn, candidate["symbol"], now_ts):
         return False, None, "Cooldown heredado aún vigente"
@@ -3103,9 +3172,21 @@ def main() -> None:
             current_price = fetch_latest_price(symbol)
 
             if daily_df is None or fourh_df is None or entry_df is None:
-                blocked_messages.append(f"{symbol}: datos insuficientes para 1D/4H/15m")
+                consecutive_failures, should_alert_data_health = record_data_health_failure(
+                    conn, symbol, int(time.time())
+                )
+                blocked_messages.append(
+                    f"{symbol}: datos insuficientes para 1D/4H/15m ({consecutive_failures} corridas seguidas)"
+                )
+                if should_alert_data_health:
+                    send_telegram(
+                        f"⚠️ <b>{symbol}</b> sin datos por {consecutive_failures} corridas consecutivas "
+                        f"(~{consecutive_failures * 4}h). Ningún proveedor (Bybit/OKX) devolvió velas."
+                    )
                 time.sleep(SLEEP_BETWEEN_ASSETS)
                 continue
+
+            record_data_health_success(conn, symbol, int(time.time()))
 
             normalized_context = normalize_context(market_context, symbol)
             if btc_dominance is not None:

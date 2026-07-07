@@ -22,7 +22,7 @@ Bot de alertas de trading para crypto. Analiza activos en 3 timeframes (1D, 4H, 
 
 BTC, ETH, SOL, BNB, XRP, TRX, XLM, DOT, TON, LTC, LINK — todos vs USDT, en Bybit Spot.
 
-**⚠️ TON sin cobertura de datos (detectado jul 2026 vía `inspector.py`):** ni Bybit ni OKX listan un par spot para TON (`TONUSDT` / `TON-USDT`) bajo ningún nombre — se confirmó contra `/v5/market/instruments-info` (Bybit, 598 símbolos) y `/api/v5/public/instruments` (OKX, 1278 símbolos), cero coincidencias. Desde la migración de `alert.py`/`diagnose_scan.py` a `data_source.fetch_klines()`, cada corrida falla silenciosamente para TON ("ningún proveedor devolvió datos") y nunca genera alertas para ese activo — sin crash, sin aviso visible salvo en logs. Pendiente decidir: quitar TON de `CRYPTO_IDS`/`SYMBOL_TO_BASE` o buscar un exchange/par alternativo.
+**⚠️ TON sin cobertura de datos (detectado jul 2026 vía `inspector.py`):** ni Bybit ni OKX listan un par spot para TON (`TONUSDT` / `TON-USDT`) bajo ningún nombre — se confirmó contra `/v5/market/instruments-info` (Bybit, 598 símbolos) y `/api/v5/public/instruments` (OKX, 1278 símbolos), cero coincidencias. Desde la migración de `alert.py`/`diagnose_scan.py` a `data_source.fetch_klines()`, cada corrida falla para TON ("ningún proveedor devolvió datos") y nunca genera alertas para ese activo. Con el data-health check (jul 2026, ver sección "Circuit breaker y data-health check" abajo) este tipo de falla ya no requiere inspección manual: tras 3 corridas consecutivas sin datos se envía un aviso Telegram automático. Pendiente decidir: quitar TON de `CRYPTO_IDS`/`SYMBOL_TO_BASE` o buscar un exchange/par alternativo.
 
 ## Arquitectura de 3 timeframes
 
@@ -67,11 +67,15 @@ REQUIRE_VWAP_PROXIMITY_SHORT=true # Solo SHORT: rechaza |vwap_distance_pct| > MA
 MAX_VWAP_DISTANCE_SHORT_PCT=3.5
 SEND_RUN_SUMMARY=false   # Resumen por-corrida desactivado; daily_summary.py cubre el "una vez al día"
 RISK_PER_TRADE_USD=50.0  # USD en riesgo por trade
+ENABLE_CIRCUIT_BREAKER=true          # Bloquea symbol+side tras invalidaciones repetidas — ver sección abajo
+CIRCUIT_BREAKER_MAX_INVALIDATIONS=3  # Nº de invalidaciones (status=INVALIDATED) que gatillan el bloqueo
+CIRCUIT_BREAKER_WINDOW_HOURS=24      # Ventana de conteo (y de auto-expiración del bloqueo)
+DATA_HEALTH_ALERT_THRESHOLD=3        # Corridas consecutivas sin datos antes de avisar por Telegram
 ```
 
 ## Pipeline de una alerta
 
-1. `data_source.fetch_klines()` → velas 1D/4H/15m reales desde Bybit (primario) / OKX (fallback)
+1. `data_source.fetch_klines()` → velas 1D/4H/15m reales desde Bybit (primario) / OKX (fallback). Si algún timeframe devuelve `None`, se registra en el data-health tracker (ver abajo) en vez de fallar en silencio.
 2. `data_source.fetch_latest_price()` → precio actual para el execution gate
 3. `evaluate_macro_confirmation()` → sesgo 1D
 4. Para cada side (LONG, SHORT):
@@ -80,9 +84,10 @@ RISK_PER_TRADE_USD=50.0  # USD en riesgo por trade
    - `build_candidate()` → combina scores, aplica policy
    - `apply_execution_quality_gate()` → descarta entradas tardías
 5. Quality gates: ADX, RSI extremo, régimen MIXED, banda RSI [35,50), fuera de zona Fibonacci, distancia a VWAP ≤3.5% (últimos 3 solo SHORT, validados por walk-forward)
-6. Ranking y deduplicación → max 2 alertas por run
-7. `format_alert_message()` → HTML para Telegram
-8. `send_telegram()` + persistencia en SQLite
+6. `should_send_alert()`: cooldown + similitud de setup + **circuit breaker** (bloquea symbol+side con invalidaciones recientes — ver abajo)
+7. Ranking y deduplicación → max 2 alertas por run
+8. `format_alert_message()` → HTML para Telegram
+9. `send_telegram()` + persistencia en SQLite
 
 ## Sizing de posición
 
@@ -209,6 +214,13 @@ Una auditoría completa encontró y corrigió lo siguiente:
 - **Gate de RR roto**: `compute_required_min_rr` derivaba el techo de RR requerido del propio `candidate["tp2_rr"]`, que ya había sido capado por `apply_context_execution_policy` — el gate era tautológico y `MIN_RR=1.8` nunca bloqueaba nada para símbolos cuyo contexto cap por debajo de ese valor (BTC, GLOBAL). Corregido para derivar el techo de `macro_eval` (el contexto, antes del cap).
 - **Entry-window gate muerto**: `candidate["current_price"]` nunca se asignaba, por lo que `ENABLE_ENTRY_WINDOW_GATE` (activo por default en producción) nunca corría pese a estar "activado". Corregido.
 - **Workflow duplicado eliminado**: `crypto-alert.yml` (legado, cron cada 2h) ejecutaba el mismo `alert.py` que `alert_production.yml` (cada 4h) con configuración efectivamente idéntica, sin coordinación en el commit+push de `alerts_state.db` — riesgo de alerta Telegram duplicada y de pérdida de estado por push no-fast-forward. Se eliminó `crypto-alert.yml`; `alert_production.yml` es ahora el único workflow de escaneo.
+
+## Circuit breaker y data-health check (jul 2026)
+
+Dos patrones adoptados tras comparar este proyecto con freqtrade (bot de ejecución, no de alertas — pero con dos ideas de gating rescatables). Ninguno requirió cambios de esquema SQLite: ambos se apoyan en estado ya existente (tabla `alerts` y key-value `meta`).
+
+- **Circuit breaker** (`is_circuit_broken()`, hook en `should_send_alert()`): cuenta invalidaciones discrecionales (`status=INVALIDATED`, no `CLOSED` por SL/TP real) del mismo symbol+side dentro de `CIRCUIT_BREAKER_WINDOW_HOURS`; si supera `CIRCUIT_BREAKER_MAX_INVALIDATIONS`, bloquea nuevas alertas para ese symbol+side (se auto-expira solo cuando las invalidaciones salen de la ventana — no hay estado de "lock" separado que mantener). Apunta directo al patrón de producción de jun-jul 2026 (26 alertas SHORT, 92% invalidación, BTC/DOT/SOL repitiendo "confirmación macro perdida" en mercado choppy): `is_material_improvement()` permite reabrir un side dentro del cooldown cuando el setup "mejora", y sin este freno esas mejoras seguían generando alertas que volvían a invalidarse. Granularidad symbol+side (no todo el activo) porque el patrón observado fue específico de un lado. Se ve reflejado en `daily_summary.py` bajo "🔒 Bloqueadas por circuit breaker", no genera Telegram ad-hoc (consistente con `SEND_RUN_SUMMARY=false`).
+- **Data-health check** (`record_data_health_failure()`/`record_data_health_success()`, persistido en `meta` bajo `data_health:{symbol}`): cuenta corridas consecutivas donde `fetch_klines` devuelve `None` para algún timeframe; al cruzar `DATA_HEALTH_ALERT_THRESHOLD` envía un aviso Telegram inmediato (no se repite hasta 7 días después o hasta que el símbolo recupere datos). Es la respuesta directa al caso TON: antes de esto, un símbolo sin cobertura de exchange fallaba en silencio indefinidamente porque el único canal (`blocked_messages` vía `format_run_summary`) depende de `SEND_RUN_SUMMARY=true`, que está apagado. `daily_summary.py` también lista símbolos con salud de datos degradada como respaldo, por si el Telegram inmediato no llegó a enviarse.
 
 ## Cuándo actualizar CLAUDE.md
 

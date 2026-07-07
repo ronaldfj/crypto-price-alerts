@@ -15,9 +15,11 @@ from backtester import (
     _build_result,
     breakdown_by,
     compute_metrics,
+    compute_verdict,
     score_bucket,
     simulate_outcome_with_costs,
 )
+import backtester
 from alert import SIDE_LONG, SIDE_SHORT
 
 
@@ -284,6 +286,56 @@ class TestComputeMetrics:
 
 
 # ── breakdown_by ──────────────────────────────────────────────────────────────
+
+class TestComputeVerdict:
+    """compute_verdict() debe evaluar sobre métricas out-of-sample (test_metrics),
+    no sobre el agregado in+out — un sistema con in-sample inflado y out-sample
+    apenas positivo no debe reportarse como "edge positivo neto"."""
+
+    def _metrics(self, n, expectancy, pf):
+        return {"total": n, "expectancy_r": expectancy, "profit_factor": pf}
+
+    def test_insufficient_out_of_sample_n(self):
+        metrics = self._metrics(backtester.MIN_VERDICT_N - 1, 0.50, 3.0)
+        assert "DATOS INSUFICIENTES" in compute_verdict(metrics)
+
+    def test_n_exactly_at_minimum_is_not_insufficient(self):
+        metrics = self._metrics(backtester.MIN_VERDICT_N, 0.20, 1.5)
+        assert "DATOS INSUFICIENTES" not in compute_verdict(metrics)
+
+    def test_positive_edge(self):
+        metrics = self._metrics(50, 0.20, 1.5)
+        assert "EDGE POSITIVO NETO" in compute_verdict(metrics)
+
+    def test_marginal_edge(self):
+        metrics = self._metrics(50, 0.08, 1.2)
+        assert "EDGE MARGINAL" in compute_verdict(metrics)
+
+    def test_breakeven(self):
+        metrics = self._metrics(50, 0.0, 1.0)
+        assert "BREAKEVEN" in compute_verdict(metrics)
+
+    def test_negative_edge(self):
+        metrics = self._metrics(50, -0.20, 0.6)
+        assert "EDGE NEGATIVO" in compute_verdict(metrics)
+
+    def test_high_expectancy_but_low_profit_factor_is_not_positive(self):
+        """Un expectancy alto con PF débil no debe calificar como edge positivo
+        neto — ambas condiciones son necesarias (ver umbral 0.15R Y 1.4 PF)."""
+        metrics = self._metrics(50, 0.20, 1.2)
+        assert "EDGE POSITIVO NETO" not in compute_verdict(metrics)
+
+    def test_uses_out_of_sample_not_aggregate(self):
+        """Caso real encontrado en producción: in-sample +0.59R / out-sample
+        +0.05R. El agregado (in+out) podía superar el umbral de 0.15R aunque
+        el out-of-sample fuera apenas marginal — el veredicto debe basarse
+        solo en out-of-sample."""
+        inflated_aggregate = self._metrics(400, 0.26, 1.76)  # in+out, por encima del umbral positivo
+        real_out_of_sample = self._metrics(267, 0.047, 1.11)  # lo que realmente importa (BREAKEVEN, no positivo)
+        assert "EDGE POSITIVO NETO" in compute_verdict(inflated_aggregate)
+        assert "EDGE POSITIVO NETO" not in compute_verdict(real_out_of_sample)
+        assert "BREAKEVEN" in compute_verdict(real_out_of_sample)
+
 
 class TestBreakdownBy:
     def test_breakdown_by_symbol(self):

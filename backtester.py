@@ -69,6 +69,9 @@ DEFAULT_SLIPPAGE = float(os.getenv("BACKTEST_SLIPPAGE", "0.0005"))          # 0.
 # Walk-forward: fracción del rango asignada a "train" (in-sample).
 TRAIN_FRACTION = float(os.getenv("BACKTEST_TRAIN_FRACTION", "0.7"))
 
+# Mínimo de señales out-of-sample para animarse a dar un veredicto de edge.
+MIN_VERDICT_N = int(os.getenv("BACKTEST_MIN_VERDICT_N", "20"))
+
 
 # ── Estructuras ───────────────────────────────────────────────────────────────
 @dataclass
@@ -493,6 +496,26 @@ def breakdown_by(trades: List[TradeOutcome], key: str, use_net: bool = True) -> 
     return {k: compute_metrics(v, use_net=use_net) for k, v in groups.items()}
 
 
+def compute_verdict(test_metrics: Dict[str, Any]) -> str:
+    """Veredicto basado en expectancy/PF *out-of-sample* (test_metrics), no en
+    el agregado in+out. El agregado se infla con el tramo in-sample — un
+    sistema con in-sample +0.59R y out-sample +0.05R puede tener un agregado
+    que despinta "edge positivo" cuando el forward-looking real es breakeven."""
+    n = test_metrics.get("total", 0)
+    if n < MIN_VERDICT_N:
+        return f"⚠️  DATOS INSUFICIENTES OUT-OF-SAMPLE (N={n} < {MIN_VERDICT_N}) — no se puede validar"
+
+    expectancy = test_metrics["expectancy_r"]
+    pf = test_metrics["profit_factor"]
+    if expectancy >= 0.15 and pf >= 1.4:
+        return f"✅ EDGE POSITIVO NETO out-of-sample (N={n})"
+    if expectancy >= 0.05:
+        return f"🟡 EDGE MARGINAL out-of-sample (N={n}) — revisar componentes que no aportan"
+    if expectancy >= -0.05:
+        return f"⚠️  BREAKEVEN out-of-sample (N={n}) — el sistema no tiene edge demostrable"
+    return f"❌ EDGE NEGATIVO out-of-sample (N={n}) — no operar; replantear estrategia"
+
+
 # ── Reporte ───────────────────────────────────────────────────────────────────
 def print_report(
     all_trades: List[TradeOutcome],
@@ -635,19 +658,9 @@ def print_report(
         survival = (counters_total.get("passed_full", 0) + counters_total.get("passed_tactical", 0)) / counters_total["evaluated"] * 100
         print(f"  → tasa de supervivencia: {survival:.2f}% de evaluaciones devienen señal")
 
-    # ── Veredicto ──
+    # ── Veredicto ── (sobre test_metrics/out-of-sample, no el agregado in+out)
     print(f"\n{sep}")
-    expectancy_net = full_metrics["expectancy_r"]
-    pf_net = full_metrics["profit_factor"]
-    if expectancy_net >= 0.15 and pf_net >= 1.4:
-        verdict = "✅ EDGE POSITIVO NETO — sigue validando out-of-sample"
-    elif expectancy_net >= 0.05:
-        verdict = "🟡 EDGE MARGINAL — revisar componentes que no aportan"
-    elif expectancy_net >= -0.05:
-        verdict = "⚠️  BREAKEVEN — el sistema no tiene edge demostrable"
-    else:
-        verdict = "❌ EDGE NEGATIVO — no operar; replantear estrategia"
-    print(f"  VEREDICTO: {verdict}")
+    print(f"  VEREDICTO: {compute_verdict(test_metrics)}")
     print(sep)
     print()
 

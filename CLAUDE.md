@@ -173,54 +173,29 @@ Archivos: `tests/test_alert.py`, `tests/test_data_source.py`, `tests/test_backte
 
 `alerts_state.db` se commitea automáticamente después de cada ejecución del bot con `[skip ci]`.
 
-## Observaciones de producción (Jun 8 – Jul 1, 2026)
+## Observaciones de producción (jun-jul 2026)
 
-Estos patrones surgieron del análisis de las primeras 3 semanas en producción. Útiles para calibrar ajustes futuros.
-
-**Patrón de invalidaciones (26 alertas, todas SHORT):**
-- 92% invalidación — promedio 4.9h hasta invalidar
-- "Confirmación macro perdida" (54%): el 1D oscilaba porque el mercado estaba en rango choppy, no en bajista limpio. Afecta principalmente BTC, DOT, SOL, ETH, LTC.
-- "Timing de entrada perdido" (46%): la ventana 15m revertía en horas. Especialmente LINK (3/3 alertas con este patrón) y TRX (2/2).
-
-**Por activo:**
-- **BNB**: en esta muestra de 3 semanas parecía el mejor (2/3 en TP1), pero el backtest de 12 meses (96 señales) lo muestra como el **peor** activo del set (43.8% WR, -0.179R) — la muestra corta de producción era ruido, no señal. No priorizar BNB por esta observación temprana.
-- **LINK**: 3/3 timing invalidations — 15m extremadamente inestable. Señales de LINK requieren mayor escepticismo.
-- **BTC/DOT/SOL**: mayoría de invalidaciones por macro — sensibles a contexto 1D cambiante. En el backtest de 12m, BTC también rinde negativo (-0.182R); DOT y SOL sí generalizan positivo.
-
-**Sobre los targets:**
-- Los 2 únicos trades cerrados llegaron a TP1 pero no a TP2. El mercado en rango da movimientos cortos, no extensiones. Confirma que `fast_exit_mode=true` y TP1 conservador (≤1R) es la estrategia correcta en este tipo de mercado.
-
-**Causa raíz del problema de invalidaciones:**
-El contexto tenía `caution_level: HIGH` + `long_score_adjustment: -0.8` + `long_rank_adjustment: -3.0` en BTC, pensado para un bajista limpio desde 84k. Al entrar en rango (~57k–65k), el 1D empezó a oscilar y las señales SHORT se disparaban con soporte a solo 5% de distancia — sin recorrido real. La resistencia de referencia (84k) también estaba obsoleta.
-
-**Señal de alerta para contexto desactualizado:**
-Si más del 50% de las invalidaciones son "Confirmación macro perdida" en múltiples activos simultáneamente, el `market_context.json` probablemente no refleja la fase actual del mercado y hay que revisarlo.
+De las primeras 3 semanas en producción: LINK y TRX tienen timing 15m inestable — mayor escepticismo en sus señales. BTC/DOT/SOL son sensibles a `market_context.json` desactualizado (mayoría de invalidaciones por "confirmación macro perdida"). **Heurística de contexto obsoleto:** si >50% de las invalidaciones recientes son por macro en varios activos a la vez, revisar `market_context.json`. BNB parecía el mejor activo en esta muestra corta (2/3 TP1) pero el backtest de 12m lo mostró como el peor (-0.179R, ver calibración abajo) — no rankear activos con muestras de producción de pocas semanas. Los únicos 2 trades cerrados llegaron a TP1 pero no TP2, confirmando que `fast_exit_mode=true` + TP1 conservador es la estrategia correcta en mercado en rango.
 
 ## Calibración validada por walk-forward (jul 2026)
 
-Backtest de 12 meses (994 señales, todos los activos) mostró que el sistema completo apenas generalizaba fuera de muestra (walk-forward out-sample E[R]=+0.023R, degradación 0.08 = overfit — veredicto del backtester: EDGE MARGINAL). Se probó cada componente por separado, comparando expectancy in-sample vs out-sample, y solo 3 condiciones sostuvieron out-of-sample positivo para SHORT: perfil FULL (no TACTICAL), RSI en [35,50), y entrada fuera de zona Fibonacci 0.382-0.786. Con esos 3 gates aplicados, el out-of-sample sube a +0.110R y el veredicto pasa a EDGE POSITIVO NETO (ver `ENABLE_TACTICAL_ALERTS`, `REQUIRE_RSI_BAND_SHORT`, `REQUIRE_FIB_OUTSIDE_SHORT` arriba).
+Backtest de 12m mostró edge marginal agregado que sube a +0.110R out-of-sample con 3 gates SHORT: perfil FULL (no TACTICAL), RSI en banda [35,50), fuera de zona Fibonacci — ver `ENABLE_TACTICAL_ALERTS`/`REQUIRE_RSI_BAND_SHORT`/`REQUIRE_FIB_OUTSIDE_SHORT` arriba. Momentum de volumen 4H SHORT se podó del score (no discriminaba out-of-sample); VWAP >3.5% se agregó como gate (`REQUIRE_VWAP_PROXIMITY_SHORT`) tras rendir negativo en ambas mitades del split.
 
-**Importante:** subir `MIN_ADX` parecía mejorar el agregado global (hasta +0.56R en ADX≥45), pero al separar in/out-sample cada corte de ADX más alto **empeoraba** el out-of-sample (llegaba a -0.115R en ADX≥38) — era overfitting puro. No se tocó `MIN_ADX`. Lección para futuras calibraciones: nunca decidir un threshold solo por el agregado global; siempre partir in-sample vs out-sample antes de tocar producción.
-
-**Segunda ronda — poda de componentes del score (jul 2026):** a pedido del usuario, se repitió el mismo ejercicio in/out-sample pero por componente del score (EMA stack, VWAP, momentum de volumen, Fibonacci), buscando simplificar en vez de solo agregar filtros. Resultados: EMA stack ya no tiene variación que podar (el gate de régimen MIXED lo satura); momentum de volumen 4H para SHORT (`volume_strong`/`divergence`) no discrimina out-of-sample (+0.110R con momentum fuerte vs +0.133R sin él) y se quitó del score; distancia a VWAP >3.5% rinde negativo en ambas mitades del split (no solo in-sample) y se agregó como gate nuevo (`REQUIRE_VWAP_PROXIMITY_SHORT`, `MAX_VWAP_DISTANCE_SHORT_PCT`). Resultado neto: out-of-sample sube de +0.110R a +0.122R — mejora modesta pero consistente, como anticipaba la evidencia por componente.
-
-BTC y BNB siguen negativos incluso con los 3 gates aplicados, pero no se excluyeron para evitar seleccionar símbolos ganadores sobre el mismo dataset donde se descubrieron — pendiente de validar con datos frescos.
+**Regla dura:** nunca fijar un threshold por el agregado global — subir `MIN_ADX` mejoraba el agregado pero empeoraba out-of-sample en cada corte (overfitting puro, no se tocó). Partir siempre in/out-sample antes de calibrar producción. BTC/BNB siguen negativos con los 3 gates aplicados — no excluidos, pendiente validar con datos frescos.
 
 ## Auditoría de infraestructura y lógica (jul 2026)
 
-Una auditoría completa encontró y corrigió lo siguiente:
-
-- **Fuente de datos unificada**: hasta esta fecha, el escaneo en vivo (`alert.py`) armaba OHLC sintético desde CoinGecko (precio-only, sin volumen real) en las 3 capas, mientras `backtester.py` siempre usó velas reales de Bybit/OKX vía `data_source.fetch_klines_range()`. Es decir, la calibración walk-forward de este documento nunca se había probado contra los datos que el bot realmente operaba. Se migró `alert.py` (escaneo principal, invalidación de alertas, validación de outcomes) y `diagnose_scan.py` a `data_source.fetch_klines()`/`fetch_latest_price()`, alineando ambos procesos sobre la misma fuente. Efecto secundario esperado: con volumen real disponible, el componente de momentum de volumen 4H para LONG (ya validado en backtest, que siempre tuvo volumen real) empieza a contribuir al score en vivo por primera vez; el componente SHORT sigue podado del score (ver sección anterior), independientemente de la fuente de datos.
-- **Gate de RR roto**: `compute_required_min_rr` derivaba el techo de RR requerido del propio `candidate["tp2_rr"]`, que ya había sido capado por `apply_context_execution_policy` — el gate era tautológico y `MIN_RR=1.8` nunca bloqueaba nada para símbolos cuyo contexto cap por debajo de ese valor (BTC, GLOBAL). Corregido para derivar el techo de `macro_eval` (el contexto, antes del cap).
-- **Entry-window gate muerto**: `candidate["current_price"]` nunca se asignaba, por lo que `ENABLE_ENTRY_WINDOW_GATE` (activo por default en producción) nunca corría pese a estar "activado". Corregido.
-- **Workflow duplicado eliminado**: `crypto-alert.yml` (legado, cron cada 2h) ejecutaba el mismo `alert.py` que `alert_production.yml` (cada 4h) con configuración efectivamente idéntica, sin coordinación en el commit+push de `alerts_state.db` — riesgo de alerta Telegram duplicada y de pérdida de estado por push no-fast-forward. Se eliminó `crypto-alert.yml`; `alert_production.yml` es ahora el único workflow de escaneo.
+- **Fuente de datos unificada**: el escaneo en vivo usaba OHLC sintético de CoinGecko (sin volumen real); se migró a klines reales Bybit/OKX (`data_source.fetch_klines()`), igualando la fuente de `backtester.py` — la calibración walk-forward nunca se había probado contra los datos reales del bot hasta esta migración. Efecto: momentum de volumen 4H ahora contribuye al score LONG en vivo por primera vez.
+- **Gate de RR roto**: `compute_required_min_rr` derivaba el techo del propio `candidate["tp2_rr"]` ya capado — tautológico, `MIN_RR` no bloqueaba nada en BTC/GLOBAL. Corregido para derivar del contexto antes del cap.
+- **Entry-window gate muerto**: `candidate["current_price"]` nunca se asignaba — `ENABLE_ENTRY_WINDOW_GATE` nunca corría pese a estar activo. Corregido.
+- **Workflow duplicado eliminado**: `crypto-alert.yml` (cron 2h) duplicaba `alert_production.yml` (4h) sin coordinar el commit de `alerts_state.db` — riesgo de alerta duplicada. Eliminado.
 
 ## Circuit breaker y data-health check (jul 2026)
 
-Dos patrones adoptados tras comparar este proyecto con freqtrade (bot de ejecución, no de alertas — pero con dos ideas de gating rescatables). Ninguno requirió cambios de esquema SQLite: ambos se apoyan en estado ya existente (tabla `alerts` y key-value `meta`).
+Dos patrones adoptados de freqtrade (Protections/Pairlist), sin cambios de esquema SQL — ambos reusan estado existente (`alerts`, `meta`).
 
-- **Circuit breaker** (`is_circuit_broken()`, hook en `should_send_alert()`): cuenta invalidaciones discrecionales (`status=INVALIDATED`, no `CLOSED` por SL/TP real) del mismo symbol+side dentro de `CIRCUIT_BREAKER_WINDOW_HOURS`; si supera `CIRCUIT_BREAKER_MAX_INVALIDATIONS`, bloquea nuevas alertas para ese symbol+side (se auto-expira solo cuando las invalidaciones salen de la ventana — no hay estado de "lock" separado que mantener). Apunta directo al patrón de producción de jun-jul 2026 (26 alertas SHORT, 92% invalidación, BTC/DOT/SOL repitiendo "confirmación macro perdida" en mercado choppy): `is_material_improvement()` permite reabrir un side dentro del cooldown cuando el setup "mejora", y sin este freno esas mejoras seguían generando alertas que volvían a invalidarse. Granularidad symbol+side (no todo el activo) porque el patrón observado fue específico de un lado. Se ve reflejado en `daily_summary.py` bajo "🔒 Bloqueadas por circuit breaker", no genera Telegram ad-hoc (consistente con `SEND_RUN_SUMMARY=false`).
-- **Data-health check** (`record_data_health_failure()`/`record_data_health_success()`, persistido en `meta` bajo `data_health:{symbol}`): cuenta corridas consecutivas donde `fetch_klines` devuelve `None` para algún timeframe; al cruzar `DATA_HEALTH_ALERT_THRESHOLD` envía un aviso Telegram inmediato (no se repite hasta 7 días después o hasta que el símbolo recupere datos). Es la respuesta directa al caso TON: antes de esto, un símbolo sin cobertura de exchange fallaba en silencio indefinidamente porque el único canal (`blocked_messages` vía `format_run_summary`) depende de `SEND_RUN_SUMMARY=true`, que está apagado. `daily_summary.py` también lista símbolos con salud de datos degradada como respaldo, por si el Telegram inmediato no llegó a enviarse.
+- **Circuit breaker** (`is_circuit_broken()`, hook en `should_send_alert()`): bloquea symbol+side tras `CIRCUIT_BREAKER_MAX_INVALIDATIONS` invalidaciones discrecionales en `CIRCUIT_BREAKER_WINDOW_HOURS` (no cuenta `CLOSED` por SL/TP real). Corta el ciclo de re-alertar un side que "mejora" (`is_material_improvement`) y vuelve a invalidarse en mercado choppy (ver observaciones de producción arriba). Se auto-expira solo; visible en `daily_summary.py` ("🔒 Bloqueadas"), sin Telegram ad-hoc.
+- **Data-health check** (`record_data_health_failure/success()`, persistido en `meta` bajo `data_health:{symbol}`): avisa por Telegram tras `DATA_HEALTH_ALERT_THRESHOLD` corridas sin datos de ningún proveedor — responde al caso TON, que antes fallaba en silencio.
 
 ## Cuándo actualizar CLAUDE.md
 
@@ -231,3 +206,5 @@ Actualizar cuando cambie algo **estructural** (no thresholds temporales):
 - Hay learnings de producción que cambian cómo calibrar el sistema
 
 No actualizar por cambios en `market_context.json` — ese archivo se lee directo y cambia frecuentemente.
+
+Este archivo se recarga completo en cada mensaje del proyecto — las entradas de learnings van como conclusión + por qué en pocas líneas, no como relato paso a paso. El detalle histórico completo ya vive en `git log`/commits; no hace falta duplicarlo acá.

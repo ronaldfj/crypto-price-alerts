@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import json
 import os
 import sqlite3
 import time
@@ -25,6 +26,12 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 DB_FILE = os.getenv("ALERT_DB_FILE", "alerts_state.db")
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
+
+# Mismos defaults que alert.py — se leen del mismo env para que el resumen
+# refleje el umbral que realmente está gateando alertas en vivo.
+CIRCUIT_BREAKER_MAX_INVALIDATIONS = int(os.getenv("CIRCUIT_BREAKER_MAX_INVALIDATIONS", "3"))
+CIRCUIT_BREAKER_WINDOW_HOURS = int(os.getenv("CIRCUIT_BREAKER_WINDOW_HOURS", "24"))
+DATA_HEALTH_ALERT_THRESHOLD = int(os.getenv("DATA_HEALTH_ALERT_THRESHOLD", "3"))
 
 ACTIVE = "ACTIVE"
 CLOSED = "CLOSED"
@@ -156,6 +163,54 @@ def build_summary(conn: sqlite3.Connection, since_ts: int) -> str:
             by_reason.setdefault(reason, []).append(r["symbol"])
         for reason, symbols in by_reason.items():
             lines.append(f"  • {esc(reason)}: {esc(', '.join(symbols))}")
+
+    # ── Circuit breaker: symbol+side bloqueados ahora ─────────────────────────
+    # Ventana independiente del período del resumen — es el mismo cálculo que
+    # hace alert.py en vivo (should_send_alert -> is_circuit_broken).
+    breaker_cutoff = now - CIRCUIT_BREAKER_WINDOW_HOURS * 3600
+    broken = conn.execute(
+        """
+        SELECT symbol, side, COUNT(*) AS c
+        FROM alerts
+        WHERE status = ? AND invalidated_at >= ?
+        GROUP BY symbol, side
+        HAVING c >= ?
+        ORDER BY c DESC
+        """,
+        (INVALIDATED, breaker_cutoff, CIRCUIT_BREAKER_MAX_INVALIDATIONS),
+    ).fetchall()
+
+    if broken:
+        lines.append("")
+        lines.append(f"🔒 <b>Bloqueadas por circuit breaker: {len(broken)}</b>")
+        for r in broken:
+            lines.append(
+                f"  {side_icon(r['side'])} <b>{esc(r['symbol'])}</b> {esc(r['side'])} "
+                f"— {r['c']} inval. en {CIRCUIT_BREAKER_WINDOW_HOURS}h"
+            )
+
+    # ── Data-health: símbolos sin datos de ningún proveedor ───────────────────
+    # Respaldo del aviso inmediato que ya manda alert.py — por si ese Telegram
+    # no llegó a enviarse (ej. rate limit).
+    health_rows = conn.execute(
+        "SELECT key, value FROM meta WHERE key LIKE 'data_health:%'"
+    ).fetchall()
+    stale_symbols = []
+    for r in health_rows:
+        try:
+            state = json.loads(r["value"])
+        except (ValueError, TypeError):
+            continue
+        consecutive = state.get("consecutive_failures", 0)
+        if consecutive >= DATA_HEALTH_ALERT_THRESHOLD:
+            symbol = r["key"].split(":", 1)[1]
+            stale_symbols.append((symbol, consecutive))
+
+    if stale_symbols:
+        lines.append("")
+        lines.append(f"⚠️ <b>Sin datos: {len(stale_symbols)}</b>")
+        for symbol, consecutive in sorted(stale_symbols, key=lambda x: -x[1]):
+            lines.append(f"  • <b>{esc(symbol)}</b> — {consecutive} corridas seguidas sin velas")
 
     # ── Mini estadísticas si hay suficientes datos ────────────────────────────
     all_period = conn.execute(

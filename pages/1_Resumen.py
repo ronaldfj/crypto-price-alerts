@@ -53,7 +53,8 @@ with st.sidebar:
     st.divider()
     st.caption(
         f"Score mín: **{MIN_SCORE}** · RR mín: **{MIN_RR}** · ADX mín: **{MIN_ADX}**\n\n"
-        "Mismos thresholds y motor que el bot en vivo."
+        "Mismos thresholds y motor que el bot en vivo.\n\n"
+        "La tabla se recalcula sola cada 5 min; **Refrescar** fuerza una corrida nueva ahora."
     )
 
 st.markdown("## Crypto Sentinel — Resumen de pares")
@@ -84,48 +85,58 @@ def _side_summary(pair_data: Dict[str, Any], side: str) -> Dict[str, Any]:
     return {"score": candidate["score"], "rr": candidate["rr_ratio"], "estado": estado}
 
 
-rows: list[Dict[str, Any]] = []
-progress = st.progress(0.0, text="Evaluando pares...")
-for i, symbol in enumerate(SYMBOLS):
-    progress.progress((i) / len(SYMBOLS), text=f"Evaluando {pair_label(symbol)}… ({i + 1}/{len(SYMBOLS)})")
-    pair_data = evaluate_pair(symbol, market_context, btc_dominance)
+@st.cache_data(ttl=300, show_spinner=False)
+def _build_summary_rows(market_context: Dict[str, Any], btc_dominance: Optional[float]) -> list[Dict[str, Any]]:
+    """Evalúa los 11 pares (macro+setup+timing+candidate, ambos lados) y arma
+    las filas de la tabla. Cacheado 5 min: recorrer esto implica ~44 llamadas
+    de red secuenciales (11 símbolos × 1D/4H/15m/precio) en frío, y no hay
+    razón para repetirlo en cada clic si las velas de origen no cambiaron
+    (la más rápida —15m— igual no vence antes de 15 min; el bot en vivo
+    escanea cada 4h). "Refrescar" en el sidebar limpia esta caché a mano.
+    """
+    rows: list[Dict[str, Any]] = []
+    for symbol in SYMBOLS:
+        pair_data = evaluate_pair(symbol, market_context, btc_dominance)
 
-    if pair_data is None:
+        if pair_data is None:
+            rows.append({
+                "Symbol": symbol,
+                "Par": pair_label(symbol),
+                "Grupo": asset_group(symbol),
+                "Precio": "N/D",
+                "1D": "—",
+                "4H": "—",
+                "ADX": None,
+                "Score LONG": None, "RR LONG": None, "Estado LONG": "N/D — sin datos",
+                "Score SHORT": None, "RR SHORT": None, "Estado SHORT": "N/D — sin datos",
+            })
+            continue
+
+        long_summary = _side_summary(pair_data, SIDE_LONG)
+        short_summary = _side_summary(pair_data, SIDE_SHORT)
+
+        any_side_data = pair_data["results"].get(SIDE_LONG) or pair_data["results"].get(SIDE_SHORT)
+        macro_regime = any_side_data["macro"]["regime"] if any_side_data else "—"
+        setup_regime = any_side_data["candidate"]["regime"] if any_side_data else "—"
+        adx_4h = any_side_data["candidate"]["adx"] if any_side_data else None
+
+        current_price = pair_data["current_price"]
         rows.append({
             "Symbol": symbol,
             "Par": pair_label(symbol),
             "Grupo": asset_group(symbol),
-            "Precio": "N/D",
-            "1D": "—",
-            "4H": "—",
-            "ADX": None,
-            "Score LONG": None, "RR LONG": None, "Estado LONG": "N/D — sin datos",
-            "Score SHORT": None, "RR SHORT": None, "Estado SHORT": "N/D — sin datos",
+            "Precio": fmt_price(current_price) if current_price is not None else "N/D",
+            "1D": macro_regime,
+            "4H": setup_regime,
+            "ADX": round(adx_4h, 1) if adx_4h is not None else None,
+            "Score LONG": long_summary["score"], "RR LONG": long_summary["rr"], "Estado LONG": long_summary["estado"],
+            "Score SHORT": short_summary["score"], "RR SHORT": short_summary["rr"], "Estado SHORT": short_summary["estado"],
         })
-        continue
+    return rows
 
-    long_summary = _side_summary(pair_data, SIDE_LONG)
-    short_summary = _side_summary(pair_data, SIDE_SHORT)
 
-    any_side_data = pair_data["results"].get(SIDE_LONG) or pair_data["results"].get(SIDE_SHORT)
-    macro_regime = any_side_data["macro"]["regime"] if any_side_data else "—"
-    setup_regime = any_side_data["candidate"]["regime"] if any_side_data else "—"
-    adx_4h = any_side_data["candidate"]["adx"] if any_side_data else None
-
-    current_price = pair_data["current_price"]
-    rows.append({
-        "Symbol": symbol,
-        "Par": pair_label(symbol),
-        "Grupo": asset_group(symbol),
-        "Precio": fmt_price(current_price) if current_price is not None else "N/D",
-        "1D": macro_regime,
-        "4H": setup_regime,
-        "ADX": round(adx_4h, 1) if adx_4h is not None else None,
-        "Score LONG": long_summary["score"], "RR LONG": long_summary["rr"], "Estado LONG": long_summary["estado"],
-        "Score SHORT": short_summary["score"], "RR SHORT": short_summary["rr"], "Estado SHORT": short_summary["estado"],
-    })
-
-progress.empty()
+with st.spinner("Evaluando los 11 pares… (primera carga puede tardar unos segundos, después queda en caché 5 min)"):
+    rows = _build_summary_rows(market_context, btc_dominance)
 
 df = pd.DataFrame(rows)
 df["_best_score"] = pd.to_numeric(df[["Score LONG", "Score SHORT"]].max(axis=1), errors="coerce")

@@ -15,6 +15,7 @@ import pandas as pd
 import requests
 
 from data_source import fetch_klines, fetch_latest_price, symbol_to_pair
+from market_regime import get_regime_context
 
 CRYPTO_IDS = {
     "bitcoin": "BTC",
@@ -128,6 +129,30 @@ MAX_ENTRY_SLIP_PCT = float(os.getenv("MAX_ENTRY_SLIP_PCT", "2.0"))  # Max 2% sli
 ENABLE_EXECUTION_QUALITY_GATE = os.getenv("ENABLE_EXECUTION_QUALITY_GATE", "true").lower() == "true"
 EXECUTION_MIN_CURRENT_RR = float(os.getenv("EXECUTION_MIN_CURRENT_RR", "1.00"))
 EXECUTION_CAUTION_CURRENT_RR = float(os.getenv("EXECUTION_CAUTION_CURRENT_RR", "1.30"))
+
+# ── Régimen adaptativo por volatilidad (Markov, bloques sin solapamiento) ────
+# Clasificación informativa (state + stickiness, ver market_regime.py): segura de
+# activar por default, no cambia comportamiento de alertas por sí sola. El
+# AFLOJAMIENTO de filtros de entrada queda apagado por default hasta validarse
+# por walk-forward en backtester.py — mismo patrón que ENABLE_TACTICAL_ALERTS,
+# que se desactivó tras fallar out-of-sample. No activar en producción sin antes
+# correr las 4 variantes descritas en CLAUDE.md y confirmar edge out-of-sample.
+ENABLE_REGIME_DETAIL = os.getenv("ENABLE_REGIME_DETAIL", "true").lower() == "true"
+REGIME_LOOKBACK = int(os.getenv("REGIME_LOOKBACK", "20"))
+REGIME_BLOCK_SIZE = int(os.getenv("REGIME_BLOCK_SIZE", "20"))
+REGIME_MIN_BLOCKS = int(os.getenv("REGIME_MIN_BLOCKS", "30"))
+REGIME_Z_TREND = float(os.getenv("REGIME_Z_TREND", "0.8"))
+REGIME_Z_DEEP = float(os.getenv("REGIME_Z_DEEP", "1.8"))
+REGIME_MIN_ADX_FOR_DEEP = float(os.getenv("REGIME_MIN_ADX_FOR_DEEP", "20.0"))
+
+# GATED — apagado por default. Solo activar si un backtest walk-forward fresco
+# muestra edge out-of-sample positivo (ver sección "POR REGIME_DETAIL" del
+# reporte de backtester.py).
+ENABLE_REGIME_ADAPTIVE_THRESHOLDS = os.getenv("ENABLE_REGIME_ADAPTIVE_THRESHOLDS", "false").lower() == "true"
+REGIME_STICKY_MIN_SCORE = float(os.getenv("REGIME_STICKY_MIN_SCORE", "0.70"))
+REGIME_DEEP_LOOSEN_RSI_EXTENSION = float(os.getenv("REGIME_DEEP_LOOSEN_RSI_EXTENSION", "5.0"))
+REGIME_DEEP_LOOSEN_VWAP_PCT = float(os.getenv("REGIME_DEEP_LOOSEN_VWAP_PCT", "1.5"))
+REGIME_CHOP_DISABLE_BREAKOUTS = os.getenv("REGIME_CHOP_DISABLE_BREAKOUTS", "false").lower() == "true"
 EXECUTION_CAUTION_TP1_PROGRESS = float(os.getenv("EXECUTION_CAUTION_TP1_PROGRESS", "0.25"))
 EXECUTION_MAX_TP1_PROGRESS = float(os.getenv("EXECUTION_MAX_TP1_PROGRESS", "0.45"))
 EXECUTION_HARD_MAX_TP1_PROGRESS = float(os.getenv("EXECUTION_HARD_MAX_TP1_PROGRESS", "0.60"))
@@ -680,6 +705,30 @@ def get_regime(row: pd.Series) -> str:
     return "MIXED"
 
 
+_REGIME_CONTEXT_OFF = {"regime_detail": None, "stickiness_score": 0.0, "regime_confidence": "OFF", "n_blocks": 0}
+
+
+def _regime_context_or_fallback(work: pd.DataFrame, symbol: str, timeframe: str) -> Dict[str, Any]:
+    """Envuelve get_regime_context() en try/except: un bug en market_regime.py
+    nunca debe tumbar una evaluación real de alertas con capital en riesgo."""
+    if not ENABLE_REGIME_DETAIL:
+        return dict(_REGIME_CONTEXT_OFF)
+    try:
+        return get_regime_context(
+            work,
+            lookback=REGIME_LOOKBACK,
+            block_size=REGIME_BLOCK_SIZE,
+            min_blocks=REGIME_MIN_BLOCKS,
+            z_trend=REGIME_Z_TREND,
+            z_deep=REGIME_Z_DEEP,
+            min_adx_for_deep=REGIME_MIN_ADX_FOR_DEEP,
+            cache_key=f"{symbol}:{timeframe}",
+        )
+    except Exception as exc:
+        print(f"⚠️ {symbol}: regime_context falló ({exc}); usando fallback inerte.")
+        return {"regime_detail": None, "stickiness_score": 0.0, "regime_confidence": "ERROR", "n_blocks": 0}
+
+
 def rsi_bucket(rsi: float) -> str:
     base = int(max(0, min(95, math.floor(rsi / 5) * 5)))
     return f"{base:02d}-{base + 4:02d}"
@@ -846,6 +895,7 @@ def evaluate_macro_confirmation(
     plus_di = float(last["plus_di"])
     minus_di = float(last["minus_di"])
     regime = get_regime(last)
+    regime_ctx = _regime_context_or_fallback(work, symbol, MACRO_TIMEFRAME)
 
     reasons: List[str] = []
     adjustments = {"score": 0.0, "rank": 0.0}
@@ -1051,6 +1101,10 @@ def evaluate_macro_confirmation(
         "rank_adjustment": round(adjustments["rank"], 2),
         "reasons": reasons,
         "barrier_context_label": support_label if side == SIDE_SHORT else resistance_label,
+        "regime_detail": regime_ctx["regime_detail"],
+        "stickiness_score": regime_ctx["stickiness_score"],
+        "regime_confidence": regime_ctx["regime_confidence"],
+        "n_blocks": regime_ctx["n_blocks"],
     }
 
 
@@ -1087,6 +1141,7 @@ def evaluate_setup_confirmation(
     score = 0.0
     reasons: List[str] = []
     regime = get_regime(last)
+    regime_ctx = _regime_context_or_fallback(work, symbol, TRADING_TIMEFRAME)
     bullish_cross = float(prev["ema20"]) <= float(prev["ema50"]) and ema20 > ema50
     bearish_cross = float(prev["ema20"]) >= float(prev["ema50"]) and ema20 < ema50
 
@@ -1095,6 +1150,23 @@ def evaluate_setup_confirmation(
 
     amplitude = max(float(fib["amplitude"]), 1e-9)
     buffer = max(atr * 0.25, close * 0.001)
+
+    # AFLOJAMIENTO GATEADO — apagado por default (ENABLE_REGIME_ADAPTIVE_THRESHOLDS=false).
+    # Solo activa si el régimen es de alta convicción (DEEP + sticky + confianza OK).
+    # No activar en producción sin validar out-of-sample primero (ver CLAUDE.md).
+    regime_loosen_active = (
+        ENABLE_REGIME_ADAPTIVE_THRESHOLDS
+        and regime_ctx["regime_confidence"] == "OK"
+        and regime_ctx["stickiness_score"] >= REGIME_STICKY_MIN_SCORE
+        and regime_ctx["regime_detail"] in ("BULL_DEEP", "BEAR_DEEP")
+    )
+    rsi_band_widen = REGIME_DEEP_LOOSEN_RSI_EXTENSION if regime_loosen_active else 0.0
+    vwap_widen = REGIME_DEEP_LOOSEN_VWAP_PCT if regime_loosen_active else 0.0
+    if regime_loosen_active:
+        reasons.append(
+            f"Régimen {regime_ctx['regime_detail']} sticky ({regime_ctx['stickiness_score']:.2f}): "
+            f"bandas RSI/VWAP ensanchadas"
+        )
 
     if side == SIDE_LONG:
         if regime == "BULL_STACK":
@@ -1115,10 +1187,10 @@ def evaluate_setup_confirmation(
         if bullish_cross:
             score += 0.75
             reasons.append("Cruce EMA20/EMA50 confirmado")
-        if 48 <= rsi <= 64:
+        if 48 - rsi_band_widen <= rsi <= 64 + rsi_band_widen:
             score += 1.0
             reasons.append(f"RSI sano ({rsi:.1f})")
-        elif 44 <= rsi <= 69:
+        elif 44 - rsi_band_widen <= rsi <= 69 + rsi_band_widen:
             score += 0.5
             reasons.append(f"RSI aceptable ({rsi:.1f})")
         if adx >= 22 and plus_di > minus_di:
@@ -1144,10 +1216,10 @@ def evaluate_setup_confirmation(
         if vwap_data["above_vwap"] and vwap_dist <= 1.5:
             score += 1.0
             reasons.append(f"Precio cerca del VWAP (+{vwap_dist:.1f}%)")
-        elif vwap_data["above_vwap"] and vwap_dist <= 3.5:
+        elif vwap_data["above_vwap"] and vwap_dist <= 3.5 + vwap_widen:
             score += 0.4
             reasons.append(f"Precio sobre VWAP (+{vwap_dist:.1f}%)")
-        elif vwap_data["above_vwap"] and vwap_dist > 3.5:
+        elif vwap_data["above_vwap"] and vwap_dist > 3.5 + vwap_widen:
             score -= 1.0
             reasons.append(f"Precio sobreextendido sobre VWAP (+{vwap_dist:.1f}%)")
         elif not vwap_data["above_vwap"]:
@@ -1223,10 +1295,10 @@ def evaluate_setup_confirmation(
         if bearish_cross:
             score += 0.75
             reasons.append("Cruce EMA20/EMA50 bajista confirmado")
-        if 36 <= rsi <= 52:
+        if 36 - rsi_band_widen <= rsi <= 52 + rsi_band_widen:
             score += 1.0
             reasons.append(f"RSI sano para short ({rsi:.1f})")
-        elif 31 <= rsi <= 57:
+        elif 31 - rsi_band_widen <= rsi <= 57 + rsi_band_widen:
             score += 0.5
             reasons.append(f"RSI aceptable para short ({rsi:.1f})")
         if adx >= 22 and minus_di > plus_di:
@@ -1252,10 +1324,10 @@ def evaluate_setup_confirmation(
         if not vwap_data["above_vwap"] and abs(vwap_dist) <= 1.5:
             score += 1.0
             reasons.append(f"Precio cerca del VWAP ({vwap_dist:.1f}%)")
-        elif not vwap_data["above_vwap"] and abs(vwap_dist) <= 3.5:
+        elif not vwap_data["above_vwap"] and abs(vwap_dist) <= 3.5 + vwap_widen:
             score += 0.4
             reasons.append(f"Precio bajo VWAP ({vwap_dist:.1f}%)")
-        elif not vwap_data["above_vwap"] and abs(vwap_dist) > 3.5:
+        elif not vwap_data["above_vwap"] and abs(vwap_dist) > 3.5 + vwap_widen:
             score -= 1.0
             reasons.append(f"Precio sobreextendido bajo VWAP ({vwap_dist:.1f}%)")
         elif vwap_data["above_vwap"]:
@@ -1312,6 +1384,24 @@ def evaluate_setup_confirmation(
         cross_flag = bearish_cross
         cross_key = "bearish_cross"
 
+    # Chop → mean-reversion (gateado, apagado por default). Primer corte heurístico:
+    # descarta el bonus de ruptura EMA20/50 y exige zona Fib de pullback para
+    # confirmar trend_ok — no es una estrategia de mean-reversion completa, se
+    # refina tras validar out-of-sample (ver CLAUDE.md).
+    if (
+        ENABLE_REGIME_ADAPTIVE_THRESHOLDS
+        and REGIME_CHOP_DISABLE_BREAKOUTS
+        and regime_ctx["regime_confidence"] == "OK"
+        and regime_ctx["regime_detail"] == "SIDEWAYS_CHOP"
+    ):
+        if cross_flag:
+            score -= 0.75
+            reasons.append("Chop: bonus de ruptura EMA20/50 descartado (modo mean-reversion)")
+            cross_flag = False
+        if zone not in {"0.382-0.500", "0.500-0.618", "0.618-0.786"}:
+            trend_ok = False
+            reasons.append("Chop: setup de ruptura descartado, se exige pullback Fib para mean-reversion")
+
     setup_score_floor = max(MIN_SCORE - 0.5, 5.25)
     setup_ok = (
         trend_ok
@@ -1327,6 +1417,10 @@ def evaluate_setup_confirmation(
         "side": side,
         "timeframe": TRADING_TIMEFRAME,
         "regime": regime,
+        "regime_detail": regime_ctx["regime_detail"],
+        "stickiness_score": regime_ctx["stickiness_score"],
+        "regime_confidence": regime_ctx["regime_confidence"],
+        "n_blocks": regime_ctx["n_blocks"],
         "rsi_bucket": rsi_bucket(rsi),
         "fib_zone": zone,
         "price_bucket": price_bucket(close, atr),

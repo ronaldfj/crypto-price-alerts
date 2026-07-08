@@ -19,6 +19,7 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
+          cache: 'pip'  # cachea ~/.cache/pip por hash de requirements.txt
 
       - name: Install dependencies
         run: |

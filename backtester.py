@@ -97,6 +97,10 @@ class TradeOutcome:
     above_vwap: bool = False
     volume_strong: bool = False
     volume_divergence: bool = False
+    regime_detail: str = ""
+    stickiness_score: float = 0.0
+    regime_confidence: str = ""
+    stickiness_bucket: str = ""
 
     outcome: str = "PENDING"           # TP1_HIT | TP2_HIT | SL_HIT | EXPIRED
     exit_price: float = 0.0
@@ -233,6 +237,16 @@ def score_bucket(score: float) -> str:
     if score < 9.0:
         return "8.0-9.0"
     return ">=9.0"
+
+
+def stickiness_bucket(score: float) -> str:
+    if score < 0.5:
+        return "<0.50"
+    if score < 0.7:
+        return "0.50-0.70"
+    if score < 0.85:
+        return "0.70-0.85"
+    return ">=0.85"
 
 
 # ── Backtest por activo ───────────────────────────────────────────────────────
@@ -410,6 +424,10 @@ def backtest_symbol(
                 above_vwap=bool(candidate.get("above_vwap", False)),
                 volume_strong=bool(candidate.get("volume_strong", False)),
                 volume_divergence=bool(candidate.get("volume_divergence", False)),
+                regime_detail=str(candidate.get("regime_detail") or ""),
+                stickiness_score=float(candidate.get("stickiness_score", 0.0)),
+                regime_confidence=str(candidate.get("regime_confidence", "")),
+                stickiness_bucket=stickiness_bucket(float(candidate.get("stickiness_score", 0.0))),
                 outcome=str(outcome_dict["outcome"]),
                 exit_price=float(outcome_dict.get("exit_price", entry_price)),
                 bars_to_exit=int(outcome_dict.get("bars_to_exit", 0)),
@@ -494,6 +512,22 @@ def breakdown_by(trades: List[TradeOutcome], key: str, use_net: bool = True) -> 
         k = str(getattr(t, key, "?"))
         groups.setdefault(k, []).append(t)
     return {k: compute_metrics(v, use_net=use_net) for k, v in groups.items()}
+
+
+def breakdown_by_split(
+    trades: List[TradeOutcome], key: str, use_net: bool = True
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """Como breakdown_by(), pero particionado también por is_train — devuelve
+    {bucket_value: {"train": metrics, "test": metrics}}. Es la pieza que permite
+    validar walk-forward por régimen/stickiness en vez de solo por el agregado."""
+    out: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for split_name, subset in (
+        ("train", [t for t in trades if t.is_train]),
+        ("test", [t for t in trades if not t.is_train]),
+    ):
+        for k, m in breakdown_by(subset, key, use_net=use_net).items():
+            out.setdefault(k, {})[split_name] = m
+    return out
 
 
 def compute_verdict(test_metrics: Dict[str, Any]) -> str:
@@ -612,6 +646,48 @@ def print_report(
             continue
         print(f"  {reg:<14} {m['total']:>4} {m['win_rate_pct']:>5.1f}% "
               f"{m['expectancy_r']:>+7.3f}R {m['profit_factor']:>6.2f}")
+
+    # ── Por regime_detail (train vs test) — valida si BULL_DEEP/BEAR_DEEP tienen
+    # edge real out-of-sample antes de activar ENABLE_REGIME_ADAPTIVE_THRESHOLDS ──
+    by_regime_detail_split = breakdown_by_split(all_trades, "regime_detail")
+    print(f"\n{sep}")
+    print("  POR REGIME_DETAIL (train vs test) — ¿tiene edge real BULL_DEEP/BEAR_DEEP?")
+    print(f"  {'ESTADO':<14} {'N-in':>5} {'E[R]-in':>9} {'N-out':>6} {'E[R]-out':>9}")
+    for state, splits in sorted(by_regime_detail_split.items()):
+        if not state:
+            continue
+        train_m = splits.get("train", {"total": 0})
+        test_m = splits.get("test", {"total": 0})
+        n_train, n_test = train_m.get("total", 0), test_m.get("total", 0)
+        if n_train == 0 and n_test == 0:
+            continue
+        warn = " ⚠️" if n_test < MIN_VERDICT_N else ""
+        print(
+            f"  {state:<14} {n_train:>5} {train_m.get('expectancy_r', 0.0):>+8.3f}R "
+            f"{n_test:>6} {test_m.get('expectancy_r', 0.0):>+8.3f}R{warn}"
+        )
+    print(f"  ⚠️ = N out-of-sample < {MIN_VERDICT_N}, no confiar en ese veredicto.")
+
+    # ── Por stickiness bucket (train vs test) — ¿la persistencia predice edge? ──
+    by_stickiness_split = breakdown_by_split(all_trades, "stickiness_bucket")
+    print(f"\n{sep}")
+    print("  POR STICKINESS BUCKET (train vs test)")
+    print(f"  {'BUCKET':<12} {'N-in':>5} {'E[R]-in':>9} {'N-out':>6} {'E[R]-out':>9}")
+    for bucket in ["<0.50", "0.50-0.70", "0.70-0.85", ">=0.85"]:
+        splits = by_stickiness_split.get(bucket)
+        if not splits:
+            continue
+        train_m = splits.get("train", {"total": 0})
+        test_m = splits.get("test", {"total": 0})
+        n_train, n_test = train_m.get("total", 0), test_m.get("total", 0)
+        if n_train == 0 and n_test == 0:
+            continue
+        warn = " ⚠️" if n_test < MIN_VERDICT_N else ""
+        print(
+            f"  {bucket:<12} {n_train:>5} {train_m.get('expectancy_r', 0.0):>+8.3f}R "
+            f"{n_test:>6} {test_m.get('expectancy_r', 0.0):>+8.3f}R{warn}"
+        )
+    print("  ↑ Si E[R]-out no sube con stickiness, REGIME_STICKY_MIN_SCORE no está justificado.")
 
     # ── Por score bucket — el más diagnóstico ──
     by_score = breakdown_by(all_trades, "score_bucket")

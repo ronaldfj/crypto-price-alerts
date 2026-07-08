@@ -25,6 +25,8 @@ from alert import (
     compute_adx,
     compute_rsi,
     estimate_qty,
+    evaluate_macro_confirmation,
+    evaluate_setup_confirmation,
     fibonacci_context,
     fib_zone,
     get_meta,
@@ -68,6 +70,26 @@ def _make_ohlc_df(n=50, trend="up"):
     return pd.DataFrame({
         "Open": opens, "High": highs, "Low": lows,
         "Close": closes, "Volume": rng.uniform(100, 500, n),
+    })
+
+
+def _make_4h_df(seed=3, n=250):
+    """DataFrame OHLCV con columna 'ts' (requerida por evaluate_setup_confirmation)
+    y suficiente historia (>=210 velas tras el dropna de add_indicators) para
+    ejercitar evaluate_macro_confirmation/evaluate_setup_confirmation end-to-end.
+    seed=3 produce, de forma determinística, un RSI final ~72 (zona 69-74) que
+    solo recibe el bonus de score si la banda RSI está ensanchada por régimen."""
+    rng = np.random.default_rng(seed)
+    base = 30000.0
+    steps = rng.normal(30, 80, n)
+    closes = base + np.cumsum(steps)
+    highs = closes + rng.uniform(20, 100, n)
+    lows = closes - rng.uniform(20, 100, n)
+    opens = closes - rng.uniform(-50, 50, n)
+    ts = pd.date_range("2024-01-01", periods=n, freq="4h", tz="UTC")
+    return pd.DataFrame({
+        "Open": opens, "High": highs, "Low": lows, "Close": closes,
+        "Volume": rng.uniform(100, 500, n), "ts": ts,
     })
 
 
@@ -266,6 +288,86 @@ class TestGetRegime:
 
     def test_mixed(self):
         assert get_regime(self._row(150, 200, 100)) == "MIXED"
+
+
+# ── Régimen adaptativo (market_regime.py wiring) ────────────────────────────
+
+class TestRegimeDetailWiring:
+    def test_macro_and_setup_confirmation_expose_regime_fields(self, monkeypatch):
+        """ENABLE_REGIME_DETAIL=true (default) agrega los 4 campos nuevos sin
+        romper la evaluación real, tanto en 1D como en 4H."""
+        monkeypatch.setattr(alert, "ENABLE_REGIME_DETAIL", True)
+        monkeypatch.setattr(alert, "ENABLE_REGIME_ADAPTIVE_THRESHOLDS", False)
+        df = _make_4h_df()
+
+        macro = evaluate_macro_confirmation(df, "BTC", {}, side=SIDE_LONG)
+        setup = evaluate_setup_confirmation(df, "BTC", "bitcoin", side=SIDE_LONG)
+
+        for result in (macro, setup):
+            assert result is not None
+            for key in ("regime_detail", "stickiness_score", "regime_confidence", "n_blocks"):
+                assert key in result
+
+    def test_adaptive_thresholds_off_by_default_is_behaviorally_inert(self, monkeypatch):
+        """El test de compatibilidad más importante: con
+        ENABLE_REGIME_ADAPTIVE_THRESHOLDS=False (default), activar o desactivar
+        ENABLE_REGIME_DETAIL no debe cambiar score/setup_ok/reasons en absoluto
+        — la clasificación informativa nunca debe filtrarse a la lógica de gating."""
+        monkeypatch.setattr(alert, "ENABLE_REGIME_ADAPTIVE_THRESHOLDS", False)
+        df = _make_4h_df()
+
+        monkeypatch.setattr(alert, "ENABLE_REGIME_DETAIL", True)
+        with_detail = evaluate_setup_confirmation(df, "BTC", "bitcoin", side=SIDE_LONG)
+
+        monkeypatch.setattr(alert, "ENABLE_REGIME_DETAIL", False)
+        without_detail = evaluate_setup_confirmation(df, "BTC", "bitcoin", side=SIDE_LONG)
+
+        ignore_keys = {"regime_detail", "stickiness_score", "regime_confidence", "n_blocks"}
+        for key in with_detail:
+            if key in ignore_keys:
+                continue
+            assert with_detail[key] == without_detail[key], f"campo '{key}' difirió con el flag apagado/prendido"
+
+    def test_regime_loosening_widens_rsi_band_when_active(self, monkeypatch):
+        """Con ENABLE_REGIME_ADAPTIVE_THRESHOLDS=True y un contexto de régimen
+        BULL_DEEP de alta stickiness, un RSI que cae en la zona 69-74 (fuera de
+        la banda base, dentro de la banda ensanchada +5) debe sumar el bonus de
+        score que con el flag apagado no recibiría."""
+        df = _make_4h_df(seed=3)  # RSI final ~72, determinístico
+
+        monkeypatch.setattr(alert, "ENABLE_REGIME_ADAPTIVE_THRESHOLDS", False)
+        baseline = evaluate_setup_confirmation(df, "BTC", "bitcoin", side=SIDE_LONG)
+        assert 69 < baseline["rsi"] < 74  # confirma que el fixture cae en la zona de interés
+
+        monkeypatch.setattr(
+            alert,
+            "_regime_context_or_fallback",
+            lambda work, symbol, timeframe: {
+                "regime_detail": "BULL_DEEP", "stickiness_score": 0.9,
+                "regime_confidence": "OK", "n_blocks": 40,
+            },
+        )
+        monkeypatch.setattr(alert, "ENABLE_REGIME_ADAPTIVE_THRESHOLDS", True)
+        widened = evaluate_setup_confirmation(df, "BTC", "bitcoin", side=SIDE_LONG)
+
+        assert widened["score"] > baseline["score"]
+        assert any("ensanchadas" in reason for reason in widened["reasons"])
+
+    def test_regime_loosening_stays_off_with_low_confidence(self, monkeypatch):
+        """Aunque el régimen sea BULL_DEEP y sticky, una lectura de baja
+        confianza (pocos bloques) no debe activar el aflojamiento."""
+        df = _make_4h_df(seed=3)
+        monkeypatch.setattr(
+            alert,
+            "_regime_context_or_fallback",
+            lambda work, symbol, timeframe: {
+                "regime_detail": "BULL_DEEP", "stickiness_score": 0.9,
+                "regime_confidence": "LOW", "n_blocks": 2,
+            },
+        )
+        monkeypatch.setattr(alert, "ENABLE_REGIME_ADAPTIVE_THRESHOLDS", True)
+        result = evaluate_setup_confirmation(df, "BTC", "bitcoin", side=SIDE_LONG)
+        assert not any("ensanchadas" in reason for reason in result["reasons"])
 
 
 # ── estimate_qty ──────────────────────────────────────────────────────────────

@@ -15,6 +15,7 @@ Bot de alertas de trading para crypto. Analiza activos en 3 timeframes (1D, 4H, 
 | `inspector.py` | Inspector interactivo (Streamlit), página principal: evalúa un activo elegido a mano con el motor idéntico a `alert.py` (1D+4H+15m). Solo lectura — no envía Telegram ni escribe en `alerts_state.db`. `streamlit run inspector.py` |
 | `pages/1_Resumen.py` | Segunda página del mismo app Streamlit (multipage): tabla comparativa de los 11 pares (score/RR/ADX/régimen por timeframe, LONG y SHORT). Clic en una fila → `st.switch_page` al Inspector con ese par preseleccionado y evaluado. Streamlit detecta `pages/` automáticamente junto a `inspector.py`; no cambia el comando de arranque |
 | `sentinel_shared.py` | Utilidades compartidas entre `inspector.py` y `pages/1_Resumen.py`: fetchers cacheados (`get_klines`, `get_context`, `get_btc_dominance`) y `evaluate_pair()` (pipeline macro/setup/timing/candidate para ambos lados). Sin UI propia |
+| `market_regime.py` | Régimen de mercado adaptativo por volatilidad (Markov, bloques sin solapamiento) — ver sección propia abajo |
 | `market_context.json` | Contexto macro manual por símbolo (sesgos, bloqueos, ajustes de RR) |
 | `alerts_state.db` | SQLite con tabla `alerts` y cooldowns |
 
@@ -73,6 +74,9 @@ ENABLE_CIRCUIT_BREAKER=true          # Bloquea symbol+side tras invalidaciones r
 CIRCUIT_BREAKER_MAX_INVALIDATIONS=3  # Nº de invalidaciones (status=INVALIDATED) que gatillan el bloqueo
 CIRCUIT_BREAKER_WINDOW_HOURS=24      # Ventana de conteo (y de auto-expiración del bloqueo)
 DATA_HEALTH_ALERT_THRESHOLD=3        # Corridas consecutivas sin datos antes de avisar por Telegram
+ENABLE_REGIME_DETAIL=true            # Clasificación informativa de régimen — ver sección propia abajo
+ENABLE_REGIME_ADAPTIVE_THRESHOLDS=false  # Aflojamiento de filtros por régimen — APAGADO, sin validar out-of-sample
+REGIME_CHOP_DISABLE_BREAKOUTS=false      # Switch a mean-reversion en chop — APAGADO, sin validar out-of-sample
 ```
 
 ## Pipeline de una alerta
@@ -200,6 +204,13 @@ Dos patrones adoptados de freqtrade (Protections/Pairlist), sin cambios de esque
 
 - **Circuit breaker** (`is_circuit_broken()`, hook en `should_send_alert()`): bloquea symbol+side tras `CIRCUIT_BREAKER_MAX_INVALIDATIONS` invalidaciones discrecionales en `CIRCUIT_BREAKER_WINDOW_HOURS` (no cuenta `CLOSED` por SL/TP real). Corta el ciclo de re-alertar un side que "mejora" (`is_material_improvement`) y vuelve a invalidarse en mercado choppy (ver observaciones de producción arriba). Se auto-expira solo; visible en `daily_summary.py` ("🔒 Bloqueadas"), sin Telegram ad-hoc.
 - **Data-health check** (`record_data_health_failure/success()`, persistido en `meta` bajo `data_health:{symbol}`): avisa por Telegram tras `DATA_HEALTH_ALERT_THRESHOLD` corridas sin datos de ningún proveedor — responde al caso TON, que antes fallaba en silencio.
+
+## Régimen de mercado adaptativo (jul 2026, estado: sin validar out-of-sample)
+
+`market_regime.py` clasifica el estado del mercado (`BEAR_DEEP/BEAR/SIDEWAYS_CHOP/BULL/BULL_DEEP`) normalizando el retorno acumulado de las últimas `REGIME_LOOKBACK` velas por su volatilidad (ATR o stdev de retornos, no un % fijo — un mismo movimiento es señal fuerte en baja volatilidad y ruido en alta) y estima "stickiness" (persistencia) con una matriz de transición de Markov calculada sobre bloques de `REGIME_BLOCK_SIZE` velas **sin solapamiento** (cada bloque usa solo su propia volatilidad interna, sin memoria EWM que cruce el límite — evita que la persistencia medida sea autocorrelación del método en vez de señal real).
+
+- **Capa informativa (`ENABLE_REGIME_DETAIL=true`, ON por default)**: agrega `regime_detail`/`stickiness_score`/`regime_confidence`/`n_blocks` a `evaluate_macro_confirmation()` (1D) y `evaluate_setup_confirmation()` (4H). Es aditivo — no toca `regime` (el clasificador EMA-stack de `get_regime()`, sin cambios), ni `build_setup_key`/`is_similar_setup` (dedup de alertas), ni `validate_regime_filter` (el hard-reject de `MIXED`, que sigue vigente y sin tocar: se calibró tras ver 100% de invalidación en backtest). Wireado con `try/except`: un bug en el módulo nunca tumba una evaluación real.
+- **Aflojamiento gateado (`ENABLE_REGIME_ADAPTIVE_THRESHOLDS=false`, `REGIME_CHOP_DISABLE_BREAKOUTS=false`, ambos APAGADOS por default)**: si se activan, ensancha las bandas de RSI/VWAP del setup 4H cuando el régimen es `BULL_DEEP`/`BEAR_DEEP` con `stickiness_score >= REGIME_STICKY_MIN_SCORE` y confianza `OK` (`REGIME_MIN_BLOCKS` bloques mínimo), o cambia a un gate de mean-reversion en `SIDEWAYS_CHOP`. **No activar en producción sin correr antes el walk-forward del backtester** (nuevas secciones "POR REGIME_DETAIL" / "POR STICKINESS BUCKET", train vs test) — el precedente directo es `ENABLE_TACTICAL_ALERTS`, otro intento de "aflojar filtros" que rindió +0.289R in-sample pero -0.137R out-of-sample y quedó desactivado. Mismo criterio de veredicto que `compute_verdict()`: solo el out-of-sample cuenta, con `N ≥ BACKTEST_MIN_VERDICT_N`.
 
 ## Cuándo actualizar CLAUDE.md
 

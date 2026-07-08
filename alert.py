@@ -14,7 +14,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import pandas as pd
 import requests
 
-from data_source import symbol_to_pair
+from data_source import fetch_klines, fetch_latest_price, symbol_to_pair
+from market_regime import get_regime_context
 
 CRYPTO_IDS = {
     "bitcoin": "BTC",
@@ -51,12 +52,6 @@ CG_API_KEY = os.getenv("COINGECKO_API_KEY", "")
 DB_FILE = os.getenv("ALERT_DB_FILE", "alerts_state.db")
 LEGACY_STATE_FILE = os.getenv("LEGACY_STATE_FILE", "alert_state.json")
 MARKET_CONTEXT_FILE = os.getenv("MARKET_CONTEXT_FILE", "market_context.json")
-VS_CURRENCY = os.getenv("VS_CURRENCY", "usd")
-
-DAILY_LOOKBACK_DAYS = int(os.getenv("DAILY_LOOKBACK_DAYS", "365"))
-HOURLY_LOOKBACK_DAYS = int(os.getenv("HOURLY_LOOKBACK_DAYS", "90"))
-INTRADAY_LOOKBACK_DAYS = int(os.getenv("INTRADAY_LOOKBACK_DAYS", "1"))
-HOURLY_INTERVAL = os.getenv("HOURLY_INTERVAL", "hourly")
 
 MACRO_TIMEFRAME = os.getenv("MACRO_TIMEFRAME", "1D")
 TRADING_TIMEFRAME = os.getenv("TRADING_TIMEFRAME", "4h")
@@ -67,10 +62,21 @@ MIN_SCORE = float(os.getenv("MIN_SCORE", "7.0"))  # OPTIMIZED: Was 6.0 → 7.5 �
 MIN_RR = float(os.getenv("MIN_RR", "1.8"))        # OPTIMIZED: Was 2.0 → 1.8 (slightly relaxed)
 MIN_ADX = float(os.getenv("MIN_ADX", "20.0"))     # Was 25.0 → 20.0 (relaxed)
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
-CG_HTTP_RETRIES = int(os.getenv("CG_HTTP_RETRIES", "3"))
-CG_HTTP_BACKOFF = float(os.getenv("CG_HTTP_BACKOFF", "1.5"))
 SLEEP_BETWEEN_ASSETS = float(os.getenv("SLEEP_BETWEEN_ASSETS", "1.0"))
 FIB_LOOKBACK = int(os.getenv("FIB_LOOKBACK", "55"))
+
+# Circuit breaker: bloquea symbol+side tras N invalidaciones discrecionales
+# recientes (patrón "Protections/StoplossGuard" de freqtrade). Corta el ciclo
+# de re-alertar un side que sigue "mejorando" (is_material_improvement) para
+# luego invalidarse de nuevo en mercado choppy — ver CLAUDE.md, observaciones
+# de producción jun-jul 2026.
+ENABLE_CIRCUIT_BREAKER = os.getenv("ENABLE_CIRCUIT_BREAKER", "true").lower() == "true"
+CIRCUIT_BREAKER_MAX_INVALIDATIONS = int(os.getenv("CIRCUIT_BREAKER_MAX_INVALIDATIONS", "3"))
+CIRCUIT_BREAKER_WINDOW_HOURS = int(os.getenv("CIRCUIT_BREAKER_WINDOW_HOURS", "24"))
+
+# Data-health: avisa por Telegram si un símbolo lleva N corridas seguidas sin
+# datos de ningún proveedor (patrón "Pairlist" de freqtrade) — ver caso TON.
+DATA_HEALTH_ALERT_THRESHOLD = int(os.getenv("DATA_HEALTH_ALERT_THRESHOLD", "3"))
 
 ENABLE_RANKING = os.getenv("ENABLE_RANKING", "true").lower() == "true"
 MAX_ALERTS_PER_RUN = int(os.getenv("MAX_ALERTS_PER_RUN", "2"))
@@ -123,6 +129,30 @@ MAX_ENTRY_SLIP_PCT = float(os.getenv("MAX_ENTRY_SLIP_PCT", "2.0"))  # Max 2% sli
 ENABLE_EXECUTION_QUALITY_GATE = os.getenv("ENABLE_EXECUTION_QUALITY_GATE", "true").lower() == "true"
 EXECUTION_MIN_CURRENT_RR = float(os.getenv("EXECUTION_MIN_CURRENT_RR", "1.00"))
 EXECUTION_CAUTION_CURRENT_RR = float(os.getenv("EXECUTION_CAUTION_CURRENT_RR", "1.30"))
+
+# ── Régimen adaptativo por volatilidad (Markov, bloques sin solapamiento) ────
+# Clasificación informativa (state + stickiness, ver market_regime.py): segura de
+# activar por default, no cambia comportamiento de alertas por sí sola. El
+# AFLOJAMIENTO de filtros de entrada queda apagado por default hasta validarse
+# por walk-forward en backtester.py — mismo patrón que ENABLE_TACTICAL_ALERTS,
+# que se desactivó tras fallar out-of-sample. No activar en producción sin antes
+# correr las 4 variantes descritas en CLAUDE.md y confirmar edge out-of-sample.
+ENABLE_REGIME_DETAIL = os.getenv("ENABLE_REGIME_DETAIL", "true").lower() == "true"
+REGIME_LOOKBACK = int(os.getenv("REGIME_LOOKBACK", "20"))
+REGIME_BLOCK_SIZE = int(os.getenv("REGIME_BLOCK_SIZE", "20"))
+REGIME_MIN_BLOCKS = int(os.getenv("REGIME_MIN_BLOCKS", "30"))
+REGIME_Z_TREND = float(os.getenv("REGIME_Z_TREND", "0.8"))
+REGIME_Z_DEEP = float(os.getenv("REGIME_Z_DEEP", "1.8"))
+REGIME_MIN_ADX_FOR_DEEP = float(os.getenv("REGIME_MIN_ADX_FOR_DEEP", "20.0"))
+
+# GATED — apagado por default. Solo activar si un backtest walk-forward fresco
+# muestra edge out-of-sample positivo (ver sección "POR REGIME_DETAIL" del
+# reporte de backtester.py).
+ENABLE_REGIME_ADAPTIVE_THRESHOLDS = os.getenv("ENABLE_REGIME_ADAPTIVE_THRESHOLDS", "false").lower() == "true"
+REGIME_STICKY_MIN_SCORE = float(os.getenv("REGIME_STICKY_MIN_SCORE", "0.70"))
+REGIME_DEEP_LOOSEN_RSI_EXTENSION = float(os.getenv("REGIME_DEEP_LOOSEN_RSI_EXTENSION", "5.0"))
+REGIME_DEEP_LOOSEN_VWAP_PCT = float(os.getenv("REGIME_DEEP_LOOSEN_VWAP_PCT", "1.5"))
+REGIME_CHOP_DISABLE_BREAKOUTS = os.getenv("REGIME_CHOP_DISABLE_BREAKOUTS", "false").lower() == "true"
 EXECUTION_CAUTION_TP1_PROGRESS = float(os.getenv("EXECUTION_CAUTION_TP1_PROGRESS", "0.25"))
 EXECUTION_MAX_TP1_PROGRESS = float(os.getenv("EXECUTION_MAX_TP1_PROGRESS", "0.45"))
 EXECUTION_HARD_MAX_TP1_PROGRESS = float(os.getenv("EXECUTION_HARD_MAX_TP1_PROGRESS", "0.60"))
@@ -288,6 +318,9 @@ def get_db_connection(db_file: str = DB_FILE) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
+    # FIX: sin busy_timeout, dos workflows de GitHub Actions corriendo alert.py en paralelo
+    # sobre el mismo archivo pueden chocar con "database is locked" de inmediato.
+    conn.execute("PRAGMA busy_timeout=15000;")
     return conn
 
 
@@ -420,6 +453,35 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
     conn.commit()
 
 
+def _data_health_key(symbol: str) -> str:
+    return f"data_health:{symbol}"
+
+
+def record_data_health_failure(conn: sqlite3.Connection, symbol: str, now_ts: int) -> Tuple[int, bool]:
+    """Registra una corrida sin datos para `symbol`. Devuelve (corridas seguidas,
+    si corresponde avisar por Telegram ahora). Solo avisa una vez al cruzar el
+    umbral, y no vuelve a avisar hasta 7 días después (o hasta que se recupere)."""
+    state = json.loads(get_meta(conn, _data_health_key(symbol), "{}") or "{}")
+    consecutive = state.get("consecutive_failures", 0) + 1
+    alerted_at = state.get("alerted_at")
+    should_alert = consecutive >= DATA_HEALTH_ALERT_THRESHOLD and (
+        alerted_at is None or now_ts - alerted_at > 7 * 24 * 3600
+    )
+    state["consecutive_failures"] = consecutive
+    state["last_failure_at"] = now_ts
+    if should_alert:
+        state["alerted_at"] = now_ts
+    set_meta(conn, _data_health_key(symbol), json.dumps(state))
+    return consecutive, should_alert
+
+
+def record_data_health_success(conn: sqlite3.Connection, symbol: str, now_ts: int) -> None:
+    set_meta(conn, _data_health_key(symbol), json.dumps({
+        "consecutive_failures": 0,
+        "last_success_at": now_ts,
+    }))
+
+
 def import_legacy_state_if_needed(conn: sqlite3.Connection) -> None:
     if get_meta(conn, "legacy_import_done", "0") == "1":
         return
@@ -486,86 +548,6 @@ def normalize_context(context: Dict[str, Any], symbol: str) -> Dict[str, Any]:
     if isinstance(asset_ctx, dict):
         merged.update(asset_ctx)
     return merged
-
-
-# ── Datos de mercado ──────────────────────────────────────────────────────────
-def get_market_prices(cg_id: str, days: int, interval: Optional[str] = None) -> Optional[pd.DataFrame]:
-    url = f"https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart"
-    headers = {"accept": "application/json"}
-    if CG_API_KEY:
-        headers["x-cg-demo-api-key"] = CG_API_KEY
-
-    params = {
-        "vs_currency": VS_CURRENCY,
-        "days": str(days),
-        "precision": "full",
-    }
-    if interval:
-        params["interval"] = interval
-
-    backoff = CG_HTTP_BACKOFF
-    for attempt in range(CG_HTTP_RETRIES):
-        try:
-            response = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
-            if response.status_code == 200:
-                payload = response.json()
-                prices = payload.get("prices", []) if isinstance(payload, dict) else []
-                if len(prices) < 50:
-                    print(f"⚠️ {cg_id}: datos insuficientes ({len(prices)} puntos).")
-                    return None
-
-                df = pd.DataFrame(prices, columns=["ts", "price"])
-                df["price"] = pd.to_numeric(df["price"], errors="coerce")
-                df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-                df = df.dropna().sort_values("ts").drop_duplicates(subset=["ts"]).reset_index(drop=True)
-                return df
-
-            if response.status_code in (429, 418, 403):
-                retry_after = response.headers.get("Retry-After")
-                wait = float(retry_after) if retry_after and retry_after.isdigit() else backoff
-                print(f"⚠️ {cg_id}: CoinGecko rate limit {response.status_code}, retrying in {wait}s...")
-                time.sleep(wait)
-                backoff *= 2
-                continue
-
-            if response.status_code >= 500:
-                print(f"⚠️ {cg_id}: CoinGecko servidor {response.status_code}, retrying in {backoff}s...")
-                time.sleep(backoff)
-                backoff *= 2
-                continue
-
-            print(f"⚠️ {cg_id}: CoinGecko respondió {response.status_code}: {response.text[:180]}")
-            return None
-        except (requests.Timeout, requests.ConnectionError) as exc:
-            print(f"⚠️ {cg_id}: CoinGecko network error {exc}, retrying in {backoff}s...")
-            time.sleep(backoff)
-            backoff *= 2
-        except Exception as exc:
-            print(f"❌ Error obteniendo datos para {cg_id}: {exc}")
-            return None
-
-    print(f"⚠️ {cg_id}: no se pudo obtener datos de CoinGecko tras {CG_HTTP_RETRIES} intentos.")
-    return None
-
-
-def build_ohlc_from_prices(price_df: pd.DataFrame, timeframe: str, min_candles: int) -> Optional[pd.DataFrame]:
-    if price_df is None or price_df.empty:
-        return None
-
-    df = price_df.copy().set_index("ts")
-    ohlc = df["price"].resample(timeframe, label="right", closed="right").ohlc()
-    ohlc.columns = ["Open", "High", "Low", "Close"]
-    ohlc = ohlc.dropna().reset_index()
-
-    if len(ohlc) <= min_candles:
-        print(f"⚠️ OHLC insuficiente ({len(ohlc)} velas {timeframe}).")
-        return None
-
-    closed = ohlc.iloc[:-1].reset_index(drop=True)
-    if len(closed) < min_candles:
-        print(f"⚠️ Velas cerradas insuficientes ({len(closed)} velas {timeframe}).")
-        return None
-    return closed
 
 
 # ── Indicadores ───────────────────────────────────────────────────────────────
@@ -721,6 +703,30 @@ def get_regime(row: pd.Series) -> str:
     if ema20 < ema50 < ema200:
         return "BEAR_STACK"
     return "MIXED"
+
+
+_REGIME_CONTEXT_OFF = {"regime_detail": None, "stickiness_score": 0.0, "regime_confidence": "OFF", "n_blocks": 0}
+
+
+def _regime_context_or_fallback(work: pd.DataFrame, symbol: str, timeframe: str) -> Dict[str, Any]:
+    """Envuelve get_regime_context() en try/except: un bug en market_regime.py
+    nunca debe tumbar una evaluación real de alertas con capital en riesgo."""
+    if not ENABLE_REGIME_DETAIL:
+        return dict(_REGIME_CONTEXT_OFF)
+    try:
+        return get_regime_context(
+            work,
+            lookback=REGIME_LOOKBACK,
+            block_size=REGIME_BLOCK_SIZE,
+            min_blocks=REGIME_MIN_BLOCKS,
+            z_trend=REGIME_Z_TREND,
+            z_deep=REGIME_Z_DEEP,
+            min_adx_for_deep=REGIME_MIN_ADX_FOR_DEEP,
+            cache_key=f"{symbol}:{timeframe}",
+        )
+    except Exception as exc:
+        print(f"⚠️ {symbol}: regime_context falló ({exc}); usando fallback inerte.")
+        return {"regime_detail": None, "stickiness_score": 0.0, "regime_confidence": "ERROR", "n_blocks": 0}
 
 
 def rsi_bucket(rsi: float) -> str:
@@ -889,6 +895,7 @@ def evaluate_macro_confirmation(
     plus_di = float(last["plus_di"])
     minus_di = float(last["minus_di"])
     regime = get_regime(last)
+    regime_ctx = _regime_context_or_fallback(work, symbol, MACRO_TIMEFRAME)
 
     reasons: List[str] = []
     adjustments = {"score": 0.0, "rank": 0.0}
@@ -1094,6 +1101,10 @@ def evaluate_macro_confirmation(
         "rank_adjustment": round(adjustments["rank"], 2),
         "reasons": reasons,
         "barrier_context_label": support_label if side == SIDE_SHORT else resistance_label,
+        "regime_detail": regime_ctx["regime_detail"],
+        "stickiness_score": regime_ctx["stickiness_score"],
+        "regime_confidence": regime_ctx["regime_confidence"],
+        "n_blocks": regime_ctx["n_blocks"],
     }
 
 
@@ -1130,6 +1141,7 @@ def evaluate_setup_confirmation(
     score = 0.0
     reasons: List[str] = []
     regime = get_regime(last)
+    regime_ctx = _regime_context_or_fallback(work, symbol, TRADING_TIMEFRAME)
     bullish_cross = float(prev["ema20"]) <= float(prev["ema50"]) and ema20 > ema50
     bearish_cross = float(prev["ema20"]) >= float(prev["ema50"]) and ema20 < ema50
 
@@ -1138,6 +1150,23 @@ def evaluate_setup_confirmation(
 
     amplitude = max(float(fib["amplitude"]), 1e-9)
     buffer = max(atr * 0.25, close * 0.001)
+
+    # AFLOJAMIENTO GATEADO — apagado por default (ENABLE_REGIME_ADAPTIVE_THRESHOLDS=false).
+    # Solo activa si el régimen es de alta convicción (DEEP + sticky + confianza OK).
+    # No activar en producción sin validar out-of-sample primero (ver CLAUDE.md).
+    regime_loosen_active = (
+        ENABLE_REGIME_ADAPTIVE_THRESHOLDS
+        and regime_ctx["regime_confidence"] == "OK"
+        and regime_ctx["stickiness_score"] >= REGIME_STICKY_MIN_SCORE
+        and regime_ctx["regime_detail"] in ("BULL_DEEP", "BEAR_DEEP")
+    )
+    rsi_band_widen = REGIME_DEEP_LOOSEN_RSI_EXTENSION if regime_loosen_active else 0.0
+    vwap_widen = REGIME_DEEP_LOOSEN_VWAP_PCT if regime_loosen_active else 0.0
+    if regime_loosen_active:
+        reasons.append(
+            f"Régimen {regime_ctx['regime_detail']} sticky ({regime_ctx['stickiness_score']:.2f}): "
+            f"bandas RSI/VWAP ensanchadas"
+        )
 
     if side == SIDE_LONG:
         if regime == "BULL_STACK":
@@ -1158,10 +1187,10 @@ def evaluate_setup_confirmation(
         if bullish_cross:
             score += 0.75
             reasons.append("Cruce EMA20/EMA50 confirmado")
-        if 48 <= rsi <= 64:
+        if 48 - rsi_band_widen <= rsi <= 64 + rsi_band_widen:
             score += 1.0
             reasons.append(f"RSI sano ({rsi:.1f})")
-        elif 44 <= rsi <= 69:
+        elif 44 - rsi_band_widen <= rsi <= 69 + rsi_band_widen:
             score += 0.5
             reasons.append(f"RSI aceptable ({rsi:.1f})")
         if adx >= 22 and plus_di > minus_di:
@@ -1187,10 +1216,10 @@ def evaluate_setup_confirmation(
         if vwap_data["above_vwap"] and vwap_dist <= 1.5:
             score += 1.0
             reasons.append(f"Precio cerca del VWAP (+{vwap_dist:.1f}%)")
-        elif vwap_data["above_vwap"] and vwap_dist <= 3.5:
+        elif vwap_data["above_vwap"] and vwap_dist <= 3.5 + vwap_widen:
             score += 0.4
             reasons.append(f"Precio sobre VWAP (+{vwap_dist:.1f}%)")
-        elif vwap_data["above_vwap"] and vwap_dist > 3.5:
+        elif vwap_data["above_vwap"] and vwap_dist > 3.5 + vwap_widen:
             score -= 1.0
             reasons.append(f"Precio sobreextendido sobre VWAP (+{vwap_dist:.1f}%)")
         elif not vwap_data["above_vwap"]:
@@ -1266,10 +1295,10 @@ def evaluate_setup_confirmation(
         if bearish_cross:
             score += 0.75
             reasons.append("Cruce EMA20/EMA50 bajista confirmado")
-        if 36 <= rsi <= 52:
+        if 36 - rsi_band_widen <= rsi <= 52 + rsi_band_widen:
             score += 1.0
             reasons.append(f"RSI sano para short ({rsi:.1f})")
-        elif 31 <= rsi <= 57:
+        elif 31 - rsi_band_widen <= rsi <= 57 + rsi_band_widen:
             score += 0.5
             reasons.append(f"RSI aceptable para short ({rsi:.1f})")
         if adx >= 22 and minus_di > plus_di:
@@ -1295,10 +1324,10 @@ def evaluate_setup_confirmation(
         if not vwap_data["above_vwap"] and abs(vwap_dist) <= 1.5:
             score += 1.0
             reasons.append(f"Precio cerca del VWAP ({vwap_dist:.1f}%)")
-        elif not vwap_data["above_vwap"] and abs(vwap_dist) <= 3.5:
+        elif not vwap_data["above_vwap"] and abs(vwap_dist) <= 3.5 + vwap_widen:
             score += 0.4
             reasons.append(f"Precio bajo VWAP ({vwap_dist:.1f}%)")
-        elif not vwap_data["above_vwap"] and abs(vwap_dist) > 3.5:
+        elif not vwap_data["above_vwap"] and abs(vwap_dist) > 3.5 + vwap_widen:
             score -= 1.0
             reasons.append(f"Precio sobreextendido bajo VWAP ({vwap_dist:.1f}%)")
         elif vwap_data["above_vwap"]:
@@ -1355,6 +1384,24 @@ def evaluate_setup_confirmation(
         cross_flag = bearish_cross
         cross_key = "bearish_cross"
 
+    # Chop → mean-reversion (gateado, apagado por default). Primer corte heurístico:
+    # descarta el bonus de ruptura EMA20/50 y exige zona Fib de pullback para
+    # confirmar trend_ok — no es una estrategia de mean-reversion completa, se
+    # refina tras validar out-of-sample (ver CLAUDE.md).
+    if (
+        ENABLE_REGIME_ADAPTIVE_THRESHOLDS
+        and REGIME_CHOP_DISABLE_BREAKOUTS
+        and regime_ctx["regime_confidence"] == "OK"
+        and regime_ctx["regime_detail"] == "SIDEWAYS_CHOP"
+    ):
+        if cross_flag:
+            score -= 0.75
+            reasons.append("Chop: bonus de ruptura EMA20/50 descartado (modo mean-reversion)")
+            cross_flag = False
+        if zone not in {"0.382-0.500", "0.500-0.618", "0.618-0.786"}:
+            trend_ok = False
+            reasons.append("Chop: setup de ruptura descartado, se exige pullback Fib para mean-reversion")
+
     setup_score_floor = max(MIN_SCORE - 0.5, 5.25)
     setup_ok = (
         trend_ok
@@ -1370,6 +1417,10 @@ def evaluate_setup_confirmation(
         "side": side,
         "timeframe": TRADING_TIMEFRAME,
         "regime": regime,
+        "regime_detail": regime_ctx["regime_detail"],
+        "stickiness_score": regime_ctx["stickiness_score"],
+        "regime_confidence": regime_ctx["regime_confidence"],
+        "n_blocks": regime_ctx["n_blocks"],
         "rsi_bucket": rsi_bucket(rsi),
         "fib_zone": zone,
         "price_bucket": price_bucket(close, atr),
@@ -1687,22 +1738,16 @@ def compute_required_min_rr(candidate: Dict[str, Any], macro_eval: Dict[str, Any
     Si el contexto recorta el target máximo a 1.20R / 1.55R, no tiene sentido exigir 2.0R.
     Conserva el umbral más estricto que siga siendo alcanzable por la política vigente.
     """
+    # FIX: el techo debe salir del propio contexto (macro_eval), no de candidate — a esta
+    # altura candidate["tp2_rr"] ya fue capado por apply_context_execution_policy, y comparar
+    # el resultado contra sí mismo volvía el gate tautológico (nunca podía fallar).
+    policy_tp2_rr = float(macro_eval.get("tp2_rr", 1.8))
+    policy_max_rr = float(macro_eval.get("max_rr", policy_tp2_rr))
     rr_policy_cap = max(
-        float(candidate.get("tp2_rr", candidate.get("rr_ratio", MIN_RR))),
+        min(policy_tp2_rr, policy_max_rr),
         float(macro_eval.get("min_structural_room_rr", 1.0)),
     )
     return round(max(1.0, min(float(MIN_RR), rr_policy_cap)), 2)
-
-
-
-def latest_price_from_df(price_df: Optional[pd.DataFrame]) -> Optional[float]:
-    if price_df is None or price_df.empty or "price" not in price_df.columns:
-        return None
-    try:
-        value = float(price_df.dropna(subset=["price"]).iloc[-1]["price"])
-        return value if math.isfinite(value) and value > 0 else None
-    except Exception:
-        return None
 
 
 def execution_metrics_for_candidate(candidate: Dict[str, Any], current_price: Optional[float]) -> Dict[str, Any]:
@@ -1759,6 +1804,11 @@ def apply_execution_quality_gate(candidate: Dict[str, Any], current_price: Optio
     """
     metrics = execution_metrics_for_candidate(candidate, current_price)
     candidate["execution"] = metrics
+    # FIX: candidate["current_price"] nunca se asignaba, por lo que el entry-window gate
+    # (línea ~3269, `candidate.get("current_price")`) siempre leía None y nunca corría,
+    # sin importar ENABLE_ENTRY_WINDOW_GATE. Se asigna aquí, antes del early-return de abajo,
+    # para que sobreviva hasta el loop de envío independientemente de ese flag.
+    candidate["current_price"] = current_price
     candidate["execution_state"] = "NOT_CHECKED"
     candidate["execution_decision"] = "Filtro de ejecución desactivado"
 
@@ -2013,11 +2063,11 @@ def resolve_price_outcome_since_alert(row: sqlite3.Row, now_ts: int) -> Optional
     days_needed = max(2, math.ceil((now_ts - candle_ts) / 86400) + 2)
     days_needed = min(days_needed, VALIDATION_FETCH_MAX_DAYS)
 
-    prices = get_market_prices(str(row["cg_id"]), days_needed, interval=HOURLY_INTERVAL)
-    if prices is None:
-        return None
+    tf_seconds = timeframe_to_seconds(TRADING_TIMEFRAME)
+    candles_per_day = max(1, int(86400 / tf_seconds))
+    candles_needed = min(days_needed * candles_per_day + 10, 1000)
 
-    candles = build_ohlc_from_prices(prices, TRADING_TIMEFRAME, 10)
+    candles = fetch_klines(str(row["symbol"]), TRADING_TIMEFRAME, candles_needed, now_ts=now_ts)
     if candles is None or candles.empty:
         return None
 
@@ -2217,9 +2267,36 @@ def blocked_by_legacy_cooldown(conn: sqlite3.Connection, symbol: str, now_ts: in
     return (now_ts - int(row["sent_at"])) < COOLDOWN_HOURS * 3600
 
 
+def is_circuit_broken(conn: sqlite3.Connection, symbol: str, side: str, now_ts: int) -> Tuple[bool, int]:
+    """Cuenta invalidaciones discrecionales (status=INVALIDATED, no CLOSED por
+    SL/TP real) de este symbol+side dentro de la ventana. Si supera el umbral,
+    bloquea nuevas alertas hasta que las invalidaciones recientes salgan de la
+    ventana por sí solas — sin estado persistido aparte."""
+    if not ENABLE_CIRCUIT_BREAKER:
+        return False, 0
+    cutoff = now_ts - CIRCUIT_BREAKER_WINDOW_HOURS * 3600
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS c FROM alerts
+        WHERE symbol = ? AND side = ? AND status = ? AND invalidated_at >= ?
+        """,
+        (symbol, side, INVALIDATED, cutoff),
+    ).fetchone()
+    count = row["c"]
+    return count >= CIRCUIT_BREAKER_MAX_INVALIDATIONS, count
+
+
 def should_send_alert(conn: sqlite3.Connection, candidate: Dict[str, Any]) -> Tuple[bool, Optional[int], str]:
     now_ts = int(time.time())
     cutoff = now_ts - (COOLDOWN_HOURS * 3600)
+
+    broken, invalidation_count = is_circuit_broken(conn, candidate["symbol"], candidate["side"], now_ts)
+    if broken:
+        return (
+            False,
+            None,
+            f"Circuit breaker: {invalidation_count} invalidaciones en {CIRCUIT_BREAKER_WINDOW_HOURS}h",
+        )
 
     if blocked_by_legacy_cooldown(conn, candidate["symbol"], now_ts):
         return False, None, "Cooldown heredado aún vigente"
@@ -2855,20 +2932,18 @@ def validate_open_alerts(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     now_ts = int(time.time())
     grouped: Dict[str, List[sqlite3.Row]] = {}
     for row in rows:
-        grouped.setdefault(str(row["cg_id"]), []).append(row)
+        grouped.setdefault(str(row["symbol"]), []).append(row)
 
     resolved: List[Dict[str, Any]] = []
     tf_seconds = timeframe_to_seconds(TRADING_TIMEFRAME)
+    candles_per_day = max(1, int(86400 / tf_seconds))
 
-    for cg_id, group in grouped.items():
+    for symbol, group in grouped.items():
         oldest_ts = min(int(r["candle_ts"]) for r in group)
         days_needed = max(2, math.ceil((now_ts - oldest_ts) / 86400) + 2)
         days_needed = min(days_needed, VALIDATION_FETCH_MAX_DAYS)
-        prices = get_market_prices(cg_id, days_needed, interval=HOURLY_INTERVAL)
-        if prices is None:
-            continue
-
-        candles = build_ohlc_from_prices(prices, TRADING_TIMEFRAME, 10)
+        candles_needed = min(days_needed * candles_per_day + 10, 1000)
+        candles = fetch_klines(symbol, TRADING_TIMEFRAME, candles_needed, now_ts=now_ts)
         if candles is None or candles.empty:
             continue
 
@@ -3150,185 +3225,180 @@ def format_run_summary(
 def main() -> None:
     start = time.time()
     conn = get_db_connection(DB_FILE)
-    init_db(conn)
-    import_legacy_state_if_needed(conn)
+    # FIX: sin try/finally, una excepción no capturada a mitad de la corrida dejaba la
+    # conexión SQLite abierta.
+    try:
+        init_db(conn)
+        import_legacy_state_if_needed(conn)
 
-    resolved_alerts = validate_open_alerts(conn)
-    if resolved_alerts:
-        print(f"🧾 Alerts validadas en esta corrida: {len(resolved_alerts)}")
-    notified_alerts = maybe_notify_validated_alerts(conn)
-    if notified_alerts:
-        print(f"📣 Outcomes notificados: {notified_alerts}")
+        resolved_alerts = validate_open_alerts(conn)
+        if resolved_alerts:
+            print(f"🧾 Alerts validadas en esta corrida: {len(resolved_alerts)}")
+        notified_alerts = maybe_notify_validated_alerts(conn)
+        if notified_alerts:
+            print(f"📣 Outcomes notificados: {notified_alerts}")
 
-    market_context = load_market_context(MARKET_CONTEXT_FILE)
-    btc_dominance = fetch_btc_dominance()
-    if btc_dominance is not None:
-        print(f"📊 BTC Dominance: {btc_dominance:.1f}%")
-    else:
-        print("⚠️ BTC Dominance no disponible — se omite del análisis macro.")
-
-    print(f"🚀 Iniciando escaneo de {len(CRYPTO_IDS)} activos...")
-    sent_count = 0
-    total_ready = 0
-    ready_candidates: List[Dict[str, Any]] = []
-    watch_candidates: List[Dict[str, Any]] = []
-    blocked_messages: List[str] = []
-
-    for cg_id, symbol in CRYPTO_IDS.items():
-        daily_prices = get_market_prices(cg_id, DAILY_LOOKBACK_DAYS, interval=None)
-        fourh_prices = get_market_prices(cg_id, HOURLY_LOOKBACK_DAYS, interval=HOURLY_INTERVAL)
-        intraday_prices = get_market_prices(cg_id, INTRADAY_LOOKBACK_DAYS, interval=None)
-        current_price = latest_price_from_df(intraday_prices)
-
-        daily_df = build_ohlc_from_prices(daily_prices, "1D", 220) if daily_prices is not None else None
-        fourh_df = build_ohlc_from_prices(fourh_prices, TRADING_TIMEFRAME, 220) if fourh_prices is not None else None
-        entry_df = build_ohlc_from_prices(intraday_prices, ENTRY_TIMEFRAME, 60) if intraday_prices is not None else None
-
-        if daily_df is None or fourh_df is None or entry_df is None:
-            blocked_messages.append(f"{symbol}: datos insuficientes para 1D/4H/15m")
-            time.sleep(SLEEP_BETWEEN_ASSETS)
-            continue
-
-        normalized_context = normalize_context(market_context, symbol)
+        market_context = load_market_context(MARKET_CONTEXT_FILE)
+        btc_dominance = fetch_btc_dominance()
         if btc_dominance is not None:
-            normalized_context["btc_dominance"] = btc_dominance
-
-        allowed_sides = parse_allowed_sides(normalized_context)
-        for side in allowed_sides:
-            macro_eval = evaluate_macro_confirmation(daily_df, symbol, normalized_context, side=side)
-            setup_eval = evaluate_setup_confirmation(fourh_df, symbol, cg_id, side=side)
-            timing_eval = evaluate_timing_confirmation(entry_df, symbol, side=side)
-
-            if not macro_eval or not setup_eval or not timing_eval:
-                blocked_messages.append(f"{symbol} {side}: no se pudo evaluar alguna confirmación")
-                continue
-
-            candidate = build_candidate(symbol, cg_id, macro_eval, setup_eval, timing_eval)
-            candidate = apply_execution_quality_gate(candidate, current_price)
-            invalidate_old_alerts(conn, candidate)
-
-            if not candidate["alert"]:
-                exec_suffix = ""
-                if candidate.get("execution_state") in {"INVALID_NOW", "LATE"}:
-                    exec_suffix = f" | ejecución {candidate.get('execution_state')}: {candidate.get('execution_decision')}"
-                gate_reasons = [
-                    r for r in candidate.get("reasons", [])
-                    if any(kw in r for kw in ["ADX", "RSI", "Régimen", "Execution gate", "gate"])
-                ]
-                gate_suffix = f" | {gate_reasons[0]}" if gate_reasons else ""
-                reason = (
-                    f"{symbol} {side}: {candidate['confirmations_passed']}/3 | "
-                    f"score {candidate['score']:.2f} | adx {candidate.get('adx', 0):.0f} | "
-                    f"regime {candidate.get('regime', '?')}{exec_suffix}{gate_suffix}"
-                )
-                blocked_messages.append(reason)
-                if candidate.get("macro_ok") or candidate.get("setup_ok"):
-                    watch_candidates.append(candidate)
-                continue
-
-            total_ready += 1
-            should_send, improved_from_alert_id, decision_reason = should_send_alert(conn, candidate)
-            if should_send:
-                candidate["improved_from_alert_id"] = improved_from_alert_id
-                candidate["decision_reason"] = decision_reason
-                ready_candidates.append(candidate)
-            else:
-                blocked_message = f"{symbol} {side}: {decision_reason}"
-                blocked_messages.append(blocked_message)
-                print(f"⏳ {symbol} {side}: omitida. {decision_reason}.")
-
-        time.sleep(SLEEP_BETWEEN_ASSETS)
-
-    ranked_candidates = rank_candidates(ready_candidates) if ready_candidates else []
-    sorted_watch_candidates = sort_watch_candidates(watch_candidates) if watch_candidates else []
-    if ranked_candidates:
-        print("🏅 Ranking interno:")
-        for idx, item in enumerate(ranked_candidates, start=1):
-            print(
-                f"   {idx}. {item['symbol']} {item['side']} | prioridad={item['rank_score']:.2f} | "
-                f"grupo={item['asset_group']} | perfil={item.get('alert_profile','FULL')} | score={item['score']:.2f}"
-            )
-
-    selected_candidates, deferred_candidates = select_ranked_candidates(ranked_candidates)
-
-    for item in deferred_candidates:
-        print(
-            f"⏸️ {item['symbol']} {item['side']}: diferida por ranking/diversificación. "
-            f"prioridad={item['rank_score']:.2f}, grupo={item['asset_group']}"
-        )
-
-    if sorted_watch_candidates:
-        print("👀 Vigilancia táctica:")
-        for item in sorted_watch_candidates[:5]:
-            human = item.get("human_summary") or build_human_signal_summary(item)
-            print(f"   - {item['symbol']} {item['side']}: {human['label']}")
-
-    for candidate in selected_candidates:
-        # PHASE 2 CHANGE 6: Entry Window Gate
-        # Get current price (optional, can be None if data source unavailable)
-        current_price = candidate.get("current_price")
-        
-        if ENABLE_ENTRY_WINDOW_GATE and current_price:
-            entry_valid, entry_reason = validate_entry_window(
-                current_price,
-                candidate["entry_price"],
-                MAX_ENTRY_SLIP_PCT
-            )
-            if not entry_valid:
-                print(f"⚠️ {candidate['symbol']} {candidate['side']}: {entry_reason} (alerta descartada)")
-                blocked_messages.append(f"{candidate['symbol']}: {entry_reason}")
-                continue
-        
-        markup = build_alert_inline_keyboard(candidate)
-        sent_ok = send_telegram(format_message(candidate, candidate["decision_reason"]), reply_markup=markup)
-        if sent_ok:
-            save_alert(conn, candidate, candidate.get("improved_from_alert_id"))
-            sent_count += 1
+            print(f"📊 BTC Dominance: {btc_dominance:.1f}%")
         else:
-            print(f"⚠️ {candidate['symbol']} {candidate['side']}: alerta no guardada porque Telegram no confirmó el envío.")
+            print("⚠️ BTC Dominance no disponible — se omite del análisis macro.")
 
-    if SEND_RUN_SUMMARY and (selected_candidates or deferred_candidates or blocked_messages or resolved_alerts):
-        summary_sent = send_telegram(
-            format_run_summary(
-                selected_candidates,
-                deferred_candidates,
-                blocked_messages,
-                total_ready,
-                sorted_watch_candidates,
-                resolved_alerts=resolved_alerts,
+        print(f"🚀 Iniciando escaneo de {len(CRYPTO_IDS)} activos...")
+        sent_count = 0
+        total_ready = 0
+        ready_candidates: List[Dict[str, Any]] = []
+        watch_candidates: List[Dict[str, Any]] = []
+        blocked_messages: List[str] = []
+
+        for cg_id, symbol in CRYPTO_IDS.items():
+            # FIX: el escaneo en vivo usaba OHLC sintético de CoinGecko (sin volumen real)
+            # mientras el backtester que "valida" la calibración usa klines reales de
+            # Bybit/OKX — dos procesos generadores de datos distintos. Se unifica sobre
+            # data_source.fetch_klines/fetch_latest_price (mismo módulo que backtester.py).
+            # 300 velas (no 210/220 justos) porque add_indicators() descarta ~25-30 filas
+            # de warm-up (RSI/ATR/ADX con min_periods=14, en cascada para ADX) antes del
+            # guard len(work) >= 210 de evaluate_setup_confirmation/evaluate_macro_confirmation.
+            daily_df = fetch_klines(symbol, "1d", 300)
+            fourh_df = fetch_klines(symbol, TRADING_TIMEFRAME, 300)
+            entry_df = fetch_klines(symbol, ENTRY_TIMEFRAME, 100)
+            current_price = fetch_latest_price(symbol)
+
+            if daily_df is None or fourh_df is None or entry_df is None:
+                consecutive_failures, should_alert_data_health = record_data_health_failure(
+                    conn, symbol, int(time.time())
+                )
+                blocked_messages.append(
+                    f"{symbol}: datos insuficientes para 1D/4H/15m ({consecutive_failures} corridas seguidas)"
+                )
+                if should_alert_data_health:
+                    send_telegram(
+                        f"⚠️ <b>{symbol}</b> sin datos por {consecutive_failures} corridas consecutivas "
+                        f"(~{consecutive_failures * 4}h). Ningún proveedor (Bybit/OKX) devolvió velas."
+                    )
+                time.sleep(SLEEP_BETWEEN_ASSETS)
+                continue
+
+            record_data_health_success(conn, symbol, int(time.time()))
+
+            normalized_context = normalize_context(market_context, symbol)
+            if btc_dominance is not None:
+                normalized_context["btc_dominance"] = btc_dominance
+
+            allowed_sides = parse_allowed_sides(normalized_context)
+            for side in allowed_sides:
+                macro_eval = evaluate_macro_confirmation(daily_df, symbol, normalized_context, side=side)
+                setup_eval = evaluate_setup_confirmation(fourh_df, symbol, cg_id, side=side)
+                timing_eval = evaluate_timing_confirmation(entry_df, symbol, side=side)
+
+                if not macro_eval or not setup_eval or not timing_eval:
+                    blocked_messages.append(f"{symbol} {side}: no se pudo evaluar alguna confirmación")
+                    continue
+
+                candidate = build_candidate(symbol, cg_id, macro_eval, setup_eval, timing_eval)
+                candidate = apply_execution_quality_gate(candidate, current_price)
+                invalidate_old_alerts(conn, candidate)
+
+                if not candidate["alert"]:
+                    exec_suffix = ""
+                    if candidate.get("execution_state") in {"INVALID_NOW", "LATE"}:
+                        exec_suffix = f" | ejecución {candidate.get('execution_state')}: {candidate.get('execution_decision')}"
+                    gate_reasons = [
+                        r for r in candidate.get("reasons", [])
+                        if any(kw in r for kw in ["ADX", "RSI", "Régimen", "Execution gate", "gate"])
+                    ]
+                    gate_suffix = f" | {gate_reasons[0]}" if gate_reasons else ""
+                    reason = (
+                        f"{symbol} {side}: {candidate['confirmations_passed']}/3 | "
+                        f"score {candidate['score']:.2f} | adx {candidate.get('adx', 0):.0f} | "
+                        f"regime {candidate.get('regime', '?')}{exec_suffix}{gate_suffix}"
+                    )
+                    blocked_messages.append(reason)
+                    if candidate.get("macro_ok") or candidate.get("setup_ok"):
+                        watch_candidates.append(candidate)
+                    continue
+
+                total_ready += 1
+                should_send, improved_from_alert_id, decision_reason = should_send_alert(conn, candidate)
+                if should_send:
+                    candidate["improved_from_alert_id"] = improved_from_alert_id
+                    candidate["decision_reason"] = decision_reason
+                    ready_candidates.append(candidate)
+                else:
+                    blocked_message = f"{symbol} {side}: {decision_reason}"
+                    blocked_messages.append(blocked_message)
+                    print(f"⏳ {symbol} {side}: omitida. {decision_reason}.")
+
+            time.sleep(SLEEP_BETWEEN_ASSETS)
+
+        ranked_candidates = rank_candidates(ready_candidates) if ready_candidates else []
+        sorted_watch_candidates = sort_watch_candidates(watch_candidates) if watch_candidates else []
+        if ranked_candidates:
+            print("🏅 Ranking interno:")
+            for idx, item in enumerate(ranked_candidates, start=1):
+                print(
+                    f"   {idx}. {item['symbol']} {item['side']} | prioridad={item['rank_score']:.2f} | "
+                    f"grupo={item['asset_group']} | perfil={item.get('alert_profile','FULL')} | score={item['score']:.2f}"
+                )
+
+        selected_candidates, deferred_candidates = select_ranked_candidates(ranked_candidates)
+
+        for item in deferred_candidates:
+            print(
+                f"⏸️ {item['symbol']} {item['side']}: diferida por ranking/diversificación. "
+                f"prioridad={item['rank_score']:.2f}, grupo={item['asset_group']}"
             )
-        )
-        if not summary_sent:
-            print("⚠️ No se pudo enviar el resumen de ejecución.")
 
-    duration = round(time.time() - start, 1)
-    print(f"🏁 Fin del escaneo. Alertas enviadas: {sent_count}. Duración: {duration}s")
-    conn.close()
+        if sorted_watch_candidates:
+            print("👀 Vigilancia táctica:")
+            for item in sorted_watch_candidates[:5]:
+                human = item.get("human_summary") or build_human_signal_summary(item)
+                print(f"   - {item['symbol']} {item['side']}: {human['label']}")
+
+        for candidate in selected_candidates:
+            # PHASE 2 CHANGE 6: Entry Window Gate
+            # Get current price (optional, can be None if data source unavailable)
+            current_price = candidate.get("current_price")
+
+            if ENABLE_ENTRY_WINDOW_GATE and current_price:
+                entry_valid, entry_reason = validate_entry_window(
+                    current_price,
+                    candidate["entry_price"],
+                    MAX_ENTRY_SLIP_PCT
+                )
+                if not entry_valid:
+                    print(f"⚠️ {candidate['symbol']} {candidate['side']}: {entry_reason} (alerta descartada)")
+                    blocked_messages.append(f"{candidate['symbol']}: {entry_reason}")
+                    continue
+
+            markup = build_alert_inline_keyboard(candidate)
+            sent_ok = send_telegram(format_message(candidate, candidate["decision_reason"]), reply_markup=markup)
+            if sent_ok:
+                save_alert(conn, candidate, candidate.get("improved_from_alert_id"))
+                sent_count += 1
+            else:
+                print(f"⚠️ {candidate['symbol']} {candidate['side']}: alerta no guardada porque Telegram no confirmó el envío.")
+
+        if SEND_RUN_SUMMARY and (selected_candidates or deferred_candidates or blocked_messages or resolved_alerts):
+            summary_sent = send_telegram(
+                format_run_summary(
+                    selected_candidates,
+                    deferred_candidates,
+                    blocked_messages,
+                    total_ready,
+                    sorted_watch_candidates,
+                    resolved_alerts=resolved_alerts,
+                )
+            )
+            if not summary_sent:
+                print("⚠️ No se pudo enviar el resumen de ejecución.")
+
+        duration = round(time.time() - start, 1)
+        print(f"🏁 Fin del escaneo. Alertas enviadas: {sent_count}. Duración: {duration}s")
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
     main()
-
-# ── PHASE 3: Outcome Validation ───────────────────────────────────────────────
-ENABLE_OUTCOME_VALIDATION = os.getenv("ENABLE_OUTCOME_VALIDATION", "true").lower() == "true"
-OUTCOME_LOOKBACK_BARS = int(os.getenv("OUTCOME_LOOKBACK_BARS", "24"))  # 24 × 4H = 96h
-
-def update_alert_with_outcome(
-    conn: sqlite3.Connection,
-    alert_id: int,
-    outcome_rr: float,
-    exit_price: float,
-    bars_to_outcome: int
-) -> None:
-    """Update alert with real outcome (Phase 3)"""
-    now_ts = int(time.time())
-    conn.execute("""
-    UPDATE alerts
-    SET outcome_rr = ?,
-        outcome_price = ?,
-        bars_to_outcome = ?,
-        validation_status = 'COMPLETED',
-        validated_at = ?
-    WHERE id = ?
-    """, (outcome_rr, exit_price, bars_to_outcome, now_ts, alert_id))
-    conn.commit()

@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m pytest tests/test_alert.py -q -k \"InvalidateOldAlerts\")",
+      "Bash(env)",
+      "Bash(python3 -)",
+      "Bash(gh run *)",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -c \"import json; json.load\\(open\\('/Users/rofranco/Documents/Proyectos/crypto-price-alerts/market_context.json'\\)\\); print\\('valid JSON'\\)\")",
+      "Bash(.venv/bin/python -m pytest tests/ -q)",
+      "Bash(ALERT_DB_FILE=/private/tmp/claude-502/-Users-rofranco-Documents-Proyectos-crypto-price-alerts/d3ac62a3-c33e-445e-a119-29c3aee3fb67/scratchpad/smoke_test.db .venv/bin/python diagnose_scan.py)",
+      "Bash(.venv/bin/python -c ' *)",
+      "Bash(ALERT_DB_FILE=/private/tmp/claude-502/-Users-rofranco-Documents-Proyectos-crypto-price-alerts/d3ac62a3-c33e-445e-a119-29c3aee3fb67/scratchpad/smoke_test.db .venv/bin/python -c ' *)",
+      "Bash(rm -f /private/tmp/claude-502/-Users-rofranco-Documents-Proyectos-crypto-price-alerts/d3ac62a3-c33e-445e-a119-29c3aee3fb67/scratchpad/smoke_test.db* && echo \"scratch db removed\" && git status)",
+      "Bash(.venv/bin/python -c \"import alert, diagnose_scan, backtester, data_source; print\\('all modules import cleanly'\\)\")",
+      "Bash(pkill -f \"inspector.py --server.port 8502\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('inspector.py'\\).read\\(\\)\\)\")",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" http://localhost:8501)",
+      "Bash(.venv/bin/pip install *)",
+      "Bash(.venv/bin/python -c \"import ast; ast.parse\\(open\\('inspector.py'\\).read\\(\\)\\)\")",
+      "Bash(.venv/bin/streamlit run *)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" http://localhost:8502)",
+      "Bash(.venv/bin/python /private/tmp/claude-502/-Users-rofranco-Documents-Proyectos-crypto-price-alerts/d8ad4b15-f956-4266-b080-79db02919c50/scratchpad/test_inspector.py)",
+      "Bash(.venv/bin/python /private/tmp/claude-502/-Users-rofranco-Documents-Proyectos-crypto-price-alerts/d8ad4b15-f956-4266-b080-79db02919c50/scratchpad/test_inspector_all.py)",
+      "Bash(grep -v \"WARNING\\\\|NotOpenSSLWarning\\\\|warnings.warn\\\\|empty value\\\\|Stack \\(most\\\\|File \\\\\"\\\\|self\\\\.\\\\|result = \\\\|_LOGGER\\\\|exec\\(\\\\|return \\\\|maybe_raise\\\\|^$\")"
+    ],
+    "additionalDirectories": [
+      "/private/tmp/claude-502/-Users-rofranco-Documents-Proyectos-crypto-price-alerts/d3ac62a3-c33e-445e-a119-29c3aee3fb67/scratchpad",
+      "/Users/rofranco/Documents/Proyectos/nyse_price_alerts"
+    ]
+  }
+}

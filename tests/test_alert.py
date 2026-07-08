@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import sqlite3
+import time
 import pandas as pd
 import numpy as np
 import pytest
@@ -24,14 +25,19 @@ from alert import (
     compute_adx,
     compute_rsi,
     estimate_qty,
+    evaluate_macro_confirmation,
+    evaluate_setup_confirmation,
     fibonacci_context,
     fib_zone,
     get_meta,
     get_regime,
     init_db,
+    is_circuit_broken,
     load_market_context,
     normalize_context,
     parse_allowed_sides,
+    record_data_health_failure,
+    record_data_health_success,
     rsi_bucket,
     set_meta,
     should_send_alert,
@@ -64,6 +70,26 @@ def _make_ohlc_df(n=50, trend="up"):
     return pd.DataFrame({
         "Open": opens, "High": highs, "Low": lows,
         "Close": closes, "Volume": rng.uniform(100, 500, n),
+    })
+
+
+def _make_4h_df(seed=3, n=250):
+    """DataFrame OHLCV con columna 'ts' (requerida por evaluate_setup_confirmation)
+    y suficiente historia (>=210 velas tras el dropna de add_indicators) para
+    ejercitar evaluate_macro_confirmation/evaluate_setup_confirmation end-to-end.
+    seed=3 produce, de forma determinística, un RSI final ~72 (zona 69-74) que
+    solo recibe el bonus de score si la banda RSI está ensanchada por régimen."""
+    rng = np.random.default_rng(seed)
+    base = 30000.0
+    steps = rng.normal(30, 80, n)
+    closes = base + np.cumsum(steps)
+    highs = closes + rng.uniform(20, 100, n)
+    lows = closes - rng.uniform(20, 100, n)
+    opens = closes - rng.uniform(-50, 50, n)
+    ts = pd.date_range("2024-01-01", periods=n, freq="4h", tz="UTC")
+    return pd.DataFrame({
+        "Open": opens, "High": highs, "Low": lows, "Close": closes,
+        "Volume": rng.uniform(100, 500, n), "ts": ts,
     })
 
 
@@ -104,6 +130,15 @@ class TestComputeRsi:
         rsi = compute_rsi(close).dropna()
         assert rsi.iloc[-1] < 50
 
+    def test_matches_hand_computed_reference_value(self):
+        # 14 variaciones alternadas +2/-1 (ganancia=2, pérdida=1 por vela).
+        # compute_rsi usa gain.ewm(alpha=1/14, adjust=False, min_periods=14): la recursión
+        # arranca en avg_1=2 (primera observación no nula) y sigue avg_t=avg_{t-1}+(x_t-avg_{t-1})/14.
+        # avg_gain final=1.330422, avg_loss final=0.334789 -> RSI=100*RS/(1+RS)=79.8951.
+        close = _make_close_series([100, 102, 101, 103, 102, 104, 103, 105, 104, 106, 105, 107, 106, 108, 107])
+        rsi = compute_rsi(close, period=14)
+        assert rsi.iloc[-1] == pytest.approx(79.8951, abs=0.01)
+
 
 # ── compute_atr ───────────────────────────────────────────────────────────────
 
@@ -127,6 +162,16 @@ class TestComputeAtr:
         high_vol = pd.DataFrame({"High": 100 + rng.uniform(0, 20, n), "Low": 100 - rng.uniform(0, 20, n), "Close": [100.0]*n})
         assert compute_atr(high_vol).dropna().mean() > compute_atr(low_vol).dropna().mean()
 
+    def test_matches_hand_computed_reference_value(self):
+        # 14 velas con True Range alterno 5/3 (Close=100 constante; High-Low=5 en pares, 3
+        # en impares). compute_atr aplica la misma recursión de Wilder arrancando en
+        # avg_0=TR_0=5 -> ATR final = 4.330422.
+        highs = [103.0 if t % 2 == 0 else 101.5 for t in range(14)]
+        lows = [98.0 if t % 2 == 0 else 98.5 for t in range(14)]
+        df = pd.DataFrame({"High": highs, "Low": lows, "Close": [100.0] * 14})
+        atr = compute_atr(df, period=14)
+        assert atr.iloc[-1] == pytest.approx(4.330422, abs=0.001)
+
 
 # ── compute_adx ───────────────────────────────────────────────────────────────
 
@@ -146,6 +191,20 @@ class TestComputeAdx:
         _, plus_di, minus_di = compute_adx(df)
         # In a strong uptrend, +DI should be >= -DI on average
         assert plus_di.dropna().mean() >= minus_di.dropna().mean()
+
+    def test_perfect_uptrend_channel_gives_adx_100(self):
+        # Canal alcista perfecto (High y Low suben +2/vela, ancho constante): Low nunca
+        # retrocede -> minus_dm ≡ 0 -> minus_di ≡ 0. Con plus_di>0, dx=100 en cada vela
+        # válida, y el EMA de una constante es esa constante -> ADX == 100.0 exacto.
+        # 27 velas: dos máscaras min_periods=14 en cascada (ATR/±DM, luego DX->ADX).
+        n = 27
+        closes = [100.0 + 2 * t for t in range(n)]
+        highs = [c + 1.0 for c in closes]
+        lows = [c - 1.0 for c in closes]
+        df = pd.DataFrame({"High": highs, "Low": lows, "Close": closes})
+        adx, plus_di, minus_di = compute_adx(df, period=14)
+        assert adx.iloc[-1] == pytest.approx(100.0, abs=1e-6)
+        assert minus_di.iloc[-1] == pytest.approx(0.0, abs=1e-9)
 
 
 # ── fibonacci_context ─────────────────────────────────────────────────────────
@@ -229,6 +288,86 @@ class TestGetRegime:
 
     def test_mixed(self):
         assert get_regime(self._row(150, 200, 100)) == "MIXED"
+
+
+# ── Régimen adaptativo (market_regime.py wiring) ────────────────────────────
+
+class TestRegimeDetailWiring:
+    def test_macro_and_setup_confirmation_expose_regime_fields(self, monkeypatch):
+        """ENABLE_REGIME_DETAIL=true (default) agrega los 4 campos nuevos sin
+        romper la evaluación real, tanto en 1D como en 4H."""
+        monkeypatch.setattr(alert, "ENABLE_REGIME_DETAIL", True)
+        monkeypatch.setattr(alert, "ENABLE_REGIME_ADAPTIVE_THRESHOLDS", False)
+        df = _make_4h_df()
+
+        macro = evaluate_macro_confirmation(df, "BTC", {}, side=SIDE_LONG)
+        setup = evaluate_setup_confirmation(df, "BTC", "bitcoin", side=SIDE_LONG)
+
+        for result in (macro, setup):
+            assert result is not None
+            for key in ("regime_detail", "stickiness_score", "regime_confidence", "n_blocks"):
+                assert key in result
+
+    def test_adaptive_thresholds_off_by_default_is_behaviorally_inert(self, monkeypatch):
+        """El test de compatibilidad más importante: con
+        ENABLE_REGIME_ADAPTIVE_THRESHOLDS=False (default), activar o desactivar
+        ENABLE_REGIME_DETAIL no debe cambiar score/setup_ok/reasons en absoluto
+        — la clasificación informativa nunca debe filtrarse a la lógica de gating."""
+        monkeypatch.setattr(alert, "ENABLE_REGIME_ADAPTIVE_THRESHOLDS", False)
+        df = _make_4h_df()
+
+        monkeypatch.setattr(alert, "ENABLE_REGIME_DETAIL", True)
+        with_detail = evaluate_setup_confirmation(df, "BTC", "bitcoin", side=SIDE_LONG)
+
+        monkeypatch.setattr(alert, "ENABLE_REGIME_DETAIL", False)
+        without_detail = evaluate_setup_confirmation(df, "BTC", "bitcoin", side=SIDE_LONG)
+
+        ignore_keys = {"regime_detail", "stickiness_score", "regime_confidence", "n_blocks"}
+        for key in with_detail:
+            if key in ignore_keys:
+                continue
+            assert with_detail[key] == without_detail[key], f"campo '{key}' difirió con el flag apagado/prendido"
+
+    def test_regime_loosening_widens_rsi_band_when_active(self, monkeypatch):
+        """Con ENABLE_REGIME_ADAPTIVE_THRESHOLDS=True y un contexto de régimen
+        BULL_DEEP de alta stickiness, un RSI que cae en la zona 69-74 (fuera de
+        la banda base, dentro de la banda ensanchada +5) debe sumar el bonus de
+        score que con el flag apagado no recibiría."""
+        df = _make_4h_df(seed=3)  # RSI final ~72, determinístico
+
+        monkeypatch.setattr(alert, "ENABLE_REGIME_ADAPTIVE_THRESHOLDS", False)
+        baseline = evaluate_setup_confirmation(df, "BTC", "bitcoin", side=SIDE_LONG)
+        assert 69 < baseline["rsi"] < 74  # confirma que el fixture cae en la zona de interés
+
+        monkeypatch.setattr(
+            alert,
+            "_regime_context_or_fallback",
+            lambda work, symbol, timeframe: {
+                "regime_detail": "BULL_DEEP", "stickiness_score": 0.9,
+                "regime_confidence": "OK", "n_blocks": 40,
+            },
+        )
+        monkeypatch.setattr(alert, "ENABLE_REGIME_ADAPTIVE_THRESHOLDS", True)
+        widened = evaluate_setup_confirmation(df, "BTC", "bitcoin", side=SIDE_LONG)
+
+        assert widened["score"] > baseline["score"]
+        assert any("ensanchadas" in reason for reason in widened["reasons"])
+
+    def test_regime_loosening_stays_off_with_low_confidence(self, monkeypatch):
+        """Aunque el régimen sea BULL_DEEP y sticky, una lectura de baja
+        confianza (pocos bloques) no debe activar el aflojamiento."""
+        df = _make_4h_df(seed=3)
+        monkeypatch.setattr(
+            alert,
+            "_regime_context_or_fallback",
+            lambda work, symbol, timeframe: {
+                "regime_detail": "BULL_DEEP", "stickiness_score": 0.9,
+                "regime_confidence": "LOW", "n_blocks": 2,
+            },
+        )
+        monkeypatch.setattr(alert, "ENABLE_REGIME_ADAPTIVE_THRESHOLDS", True)
+        result = evaluate_setup_confirmation(df, "BTC", "bitcoin", side=SIDE_LONG)
+        assert not any("ensanchadas" in reason for reason in result["reasons"])
 
 
 # ── estimate_qty ──────────────────────────────────────────────────────────────
@@ -542,8 +681,7 @@ class TestInvalidateOldAlerts:
         candles = self._fake_candles([
             (candle_ts + 3600, 30000, 30100, 28900, 28950),  # low <= stop
         ])
-        with patch.object(alert, "get_market_prices", return_value=pd.DataFrame({"ts": [1], "price": [1.0]})), \
-             patch.object(alert, "build_ohlc_from_prices", return_value=candles):
+        with patch.object(alert, "fetch_klines", return_value=candles):
             alert.invalidate_old_alerts(conn, self._candidate_breaking_thesis(SIDE_LONG))
 
         updated = conn.execute("SELECT * FROM alerts WHERE id = ?", (row["id"],)).fetchone()
@@ -564,8 +702,7 @@ class TestInvalidateOldAlerts:
         candles = self._fake_candles([
             (candle_ts + 3600, 30000, 30400, 29900, 30300),
         ])
-        with patch.object(alert, "get_market_prices", return_value=pd.DataFrame({"ts": [1], "price": [1.0]})), \
-             patch.object(alert, "build_ohlc_from_prices", return_value=candles):
+        with patch.object(alert, "fetch_klines", return_value=candles):
             alert.invalidate_old_alerts(conn, self._candidate_breaking_thesis(SIDE_LONG))
 
         updated = conn.execute("SELECT * FROM alerts WHERE id = ?", (row["id"],)).fetchone()
@@ -582,10 +719,182 @@ class TestInvalidateOldAlerts:
         conn = _in_memory_db()
         row = self._insert_active_alert(conn, side=SIDE_LONG)
 
-        with patch.object(alert, "get_market_prices", return_value=None):
+        with patch.object(alert, "fetch_klines", return_value=None):
             alert.invalidate_old_alerts(conn, self._candidate_breaking_thesis(SIDE_LONG))
 
         updated = conn.execute("SELECT * FROM alerts WHERE id = ?", (row["id"],)).fetchone()
         assert updated["status"] == alert.INVALIDATED
         assert updated["outcome_rr"] is None
         assert updated["validation_status"] == alert.VALIDATION_PENDING
+
+
+# ── is_circuit_broken / should_send_alert circuit breaker gate ───────────────
+
+class TestCircuitBreaker:
+    """Circuit breaker estilo freqtrade Protections/StoplossGuard: bloquea
+    symbol+side tras N invalidaciones discrecionales recientes, cortando el
+    ciclo de re-alertar un side que sigue "mejorando" (is_material_improvement)
+    para luego invalidarse de nuevo en mercado choppy."""
+
+    def _candidate(self, symbol="BTC", side=SIDE_SHORT, score=7.0):
+        key = f"{symbol}|{side}|4h|BEAR_STACK|50-54|0.500-0.618|1234"
+        return {
+            "symbol": symbol, "side": side, "timeframe": "4h",
+            "regime": "BEAR_STACK", "rsi_bucket": "50-54",
+            "fib_zone": "0.500-0.618", "price_bucket": "1234",
+            "setup_key": key, "setup_hash": build_setup_hash(key),
+            "score": score, "entry_price": 30000.0,
+            "rr_ratio": 2.0, "adx": 30.0,
+        }
+
+    def _insert_invalidated_alert(self, conn, symbol, side, invalidated_at):
+        now = int(time.time())
+        key = f"{symbol}|{side}|4h|BEAR_STACK|50-54|0.500-0.618|1234"
+        conn.execute(
+            """INSERT INTO alerts
+               (symbol, cg_id, side, timeframe, setup_key, setup_hash, regime,
+                rsi_bucket, fib_zone, price_bucket, candle_ts, entry_price,
+                stop_loss, take_profit, rr_ratio, score, adx, rsi, atr,
+                reasons_json, status, sent_at, invalidated_at, invalidation_reason)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (symbol, symbol.lower(), side, "4h", key, build_setup_hash(key), "BEAR_STACK",
+             "50-54", "0.500-0.618", "1234",
+             now - 7200, 30000.0, 31000.0, 28000.0, 2.0, 7.0, 30.0, 50.0, 300.0,
+             "[]", alert.INVALIDATED, now - 7200, invalidated_at, "Confirmación macro perdida"),
+        )
+        conn.commit()
+
+    def test_no_invalidations_allows_send(self):
+        conn = _in_memory_db()
+        broken, count = is_circuit_broken(conn, "BTC", SIDE_SHORT, int(time.time()))
+        assert broken is False
+        assert count == 0
+
+    def test_threshold_invalidations_within_window_blocks(self):
+        conn = _in_memory_db()
+        now_ts = int(time.time())
+        for _ in range(alert.CIRCUIT_BREAKER_MAX_INVALIDATIONS):
+            self._insert_invalidated_alert(conn, "BTC", SIDE_SHORT, now_ts - 3600)
+
+        ok, _, reason = should_send_alert(conn, self._candidate("BTC", SIDE_SHORT))
+        assert ok is False
+        assert "Circuit breaker" in reason
+
+    def test_below_threshold_does_not_block(self):
+        conn = _in_memory_db()
+        now_ts = int(time.time())
+        for _ in range(alert.CIRCUIT_BREAKER_MAX_INVALIDATIONS - 1):
+            self._insert_invalidated_alert(conn, "BTC", SIDE_SHORT, now_ts - 3600)
+
+        broken, count = is_circuit_broken(conn, "BTC", SIDE_SHORT, now_ts)
+        assert broken is False
+        assert count == alert.CIRCUIT_BREAKER_MAX_INVALIDATIONS - 1
+
+    def test_only_applies_to_matching_side(self):
+        """3 invalidaciones en SHORT no deben bloquear LONG del mismo symbol —
+        la granularidad es symbol+side, no todo el activo."""
+        conn = _in_memory_db()
+        now_ts = int(time.time())
+        for _ in range(alert.CIRCUIT_BREAKER_MAX_INVALIDATIONS):
+            self._insert_invalidated_alert(conn, "BTC", SIDE_SHORT, now_ts - 3600)
+
+        broken, _ = is_circuit_broken(conn, "BTC", SIDE_LONG, now_ts)
+        assert broken is False
+
+    def test_invalidations_outside_window_do_not_block(self):
+        conn = _in_memory_db()
+        now_ts = int(time.time())
+        old_ts = now_ts - (alert.CIRCUIT_BREAKER_WINDOW_HOURS + 1) * 3600
+        for _ in range(alert.CIRCUIT_BREAKER_MAX_INVALIDATIONS):
+            self._insert_invalidated_alert(conn, "BTC", SIDE_SHORT, old_ts)
+
+        broken, count = is_circuit_broken(conn, "BTC", SIDE_SHORT, now_ts)
+        assert broken is False
+        assert count == 0
+
+    def test_closed_status_does_not_count_toward_breaker(self):
+        """Un CLOSED (SL/TP real) no es una invalidación discrecional — no debe
+        contar para el circuit breaker aunque haya varios."""
+        conn = _in_memory_db()
+        now_ts = int(time.time())
+        key = "BTC|SHORT|4h|BEAR_STACK|50-54|0.500-0.618|1234"
+        for _ in range(alert.CIRCUIT_BREAKER_MAX_INVALIDATIONS):
+            conn.execute(
+                """INSERT INTO alerts
+                   (symbol, cg_id, side, timeframe, setup_key, setup_hash, regime,
+                    rsi_bucket, fib_zone, price_bucket, candle_ts, entry_price,
+                    stop_loss, take_profit, rr_ratio, score, adx, rsi, atr,
+                    reasons_json, status, sent_at, invalidated_at, invalidation_reason)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ("BTC", "bitcoin", SIDE_SHORT, "4h", key, build_setup_hash(key), "BEAR_STACK",
+                 "50-54", "0.500-0.618", "1234",
+                 now_ts - 7200, 30000.0, 31000.0, 28000.0, 2.0, 7.0, 30.0, 50.0, 300.0,
+                 "[]", alert.CLOSED, now_ts - 7200, now_ts - 3600, "Stop técnico vulnerado"),
+            )
+        conn.commit()
+
+        broken, count = is_circuit_broken(conn, "BTC", SIDE_SHORT, now_ts)
+        assert broken is False
+        assert count == 0
+
+
+# ── record_data_health_failure / record_data_health_success ──────────────────
+
+class TestDataHealth:
+    """Data-health check estilo freqtrade Pairlist: detecta y avisa cuando un
+    símbolo lleva N corridas seguidas sin datos de ningún proveedor (caso TON:
+    antes de esto, el fallo quedaba silencioso salvo en logs)."""
+
+    def test_first_failure_increments_and_does_not_alert(self):
+        conn = _in_memory_db()
+        now_ts = int(time.time())
+        consecutive, should_alert = record_data_health_failure(conn, "TON", now_ts)
+        assert consecutive == 1
+        assert should_alert is False
+
+    def test_crossing_threshold_alerts_once(self):
+        conn = _in_memory_db()
+        now_ts = int(time.time())
+        for i in range(alert.DATA_HEALTH_ALERT_THRESHOLD - 1):
+            consecutive, should_alert = record_data_health_failure(conn, "TON", now_ts + i)
+            assert should_alert is False
+
+        consecutive, should_alert = record_data_health_failure(
+            conn, "TON", now_ts + alert.DATA_HEALTH_ALERT_THRESHOLD
+        )
+        assert consecutive == alert.DATA_HEALTH_ALERT_THRESHOLD
+        assert should_alert is True
+
+    def test_does_not_realert_immediately_after_crossing(self):
+        conn = _in_memory_db()
+        now_ts = int(time.time())
+        for i in range(alert.DATA_HEALTH_ALERT_THRESHOLD):
+            record_data_health_failure(conn, "TON", now_ts + i)
+
+        # Una falla más, inmediatamente después de haber avisado: no debe repetir.
+        _, should_alert = record_data_health_failure(
+            conn, "TON", now_ts + alert.DATA_HEALTH_ALERT_THRESHOLD + 1
+        )
+        assert should_alert is False
+
+    def test_realerts_after_seven_days(self):
+        conn = _in_memory_db()
+        now_ts = int(time.time())
+        for i in range(alert.DATA_HEALTH_ALERT_THRESHOLD):
+            record_data_health_failure(conn, "TON", now_ts + i)
+
+        later = now_ts + alert.DATA_HEALTH_ALERT_THRESHOLD + 8 * 24 * 3600
+        _, should_alert = record_data_health_failure(conn, "TON", later)
+        assert should_alert is True
+
+    def test_success_resets_consecutive_failures(self):
+        conn = _in_memory_db()
+        now_ts = int(time.time())
+        record_data_health_failure(conn, "TON", now_ts)
+        record_data_health_failure(conn, "TON", now_ts + 1)
+
+        record_data_health_success(conn, "TON", now_ts + 2)
+
+        consecutive, should_alert = record_data_health_failure(conn, "TON", now_ts + 3)
+        assert consecutive == 1
+        assert should_alert is False

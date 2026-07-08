@@ -15,9 +15,11 @@ from backtester import (
     _build_result,
     breakdown_by,
     compute_metrics,
+    compute_verdict,
     score_bucket,
     simulate_outcome_with_costs,
 )
+import backtester
 from alert import SIDE_LONG, SIDE_SHORT
 
 
@@ -38,7 +40,8 @@ def _candles(highs, lows, closes=None):
 
 
 def _make_trade(outcome, pnl_r_net, pnl_r_gross=None, side=SIDE_LONG, symbol="BTC",
-                score=7.0, regime="BULL_STACK", fib="0.382-0.500", is_train=True):
+                score=7.0, regime="BULL_STACK", fib="0.382-0.500", is_train=True,
+                regime_detail="", stickiness_score=0.0):
     return TradeOutcome(
         symbol=symbol, side=side, candle_ts=1700000000,
         entry_price=30000.0, stop_loss=29000.0, tp1=32000.0, tp2=34000.0,
@@ -49,6 +52,9 @@ def _make_trade(outcome, pnl_r_net, pnl_r_gross=None, side=SIDE_LONG, symbol="BT
         pnl_r_net=pnl_r_net,
         pnl_r_gross=pnl_r_net if pnl_r_gross is None else pnl_r_gross,
         is_train=is_train,
+        regime_detail=regime_detail,
+        stickiness_score=stickiness_score,
+        stickiness_bucket=backtester.stickiness_bucket(stickiness_score),
     )
 
 
@@ -285,6 +291,56 @@ class TestComputeMetrics:
 
 # ── breakdown_by ──────────────────────────────────────────────────────────────
 
+class TestComputeVerdict:
+    """compute_verdict() debe evaluar sobre métricas out-of-sample (test_metrics),
+    no sobre el agregado in+out — un sistema con in-sample inflado y out-sample
+    apenas positivo no debe reportarse como "edge positivo neto"."""
+
+    def _metrics(self, n, expectancy, pf):
+        return {"total": n, "expectancy_r": expectancy, "profit_factor": pf}
+
+    def test_insufficient_out_of_sample_n(self):
+        metrics = self._metrics(backtester.MIN_VERDICT_N - 1, 0.50, 3.0)
+        assert "DATOS INSUFICIENTES" in compute_verdict(metrics)
+
+    def test_n_exactly_at_minimum_is_not_insufficient(self):
+        metrics = self._metrics(backtester.MIN_VERDICT_N, 0.20, 1.5)
+        assert "DATOS INSUFICIENTES" not in compute_verdict(metrics)
+
+    def test_positive_edge(self):
+        metrics = self._metrics(50, 0.20, 1.5)
+        assert "EDGE POSITIVO NETO" in compute_verdict(metrics)
+
+    def test_marginal_edge(self):
+        metrics = self._metrics(50, 0.08, 1.2)
+        assert "EDGE MARGINAL" in compute_verdict(metrics)
+
+    def test_breakeven(self):
+        metrics = self._metrics(50, 0.0, 1.0)
+        assert "BREAKEVEN" in compute_verdict(metrics)
+
+    def test_negative_edge(self):
+        metrics = self._metrics(50, -0.20, 0.6)
+        assert "EDGE NEGATIVO" in compute_verdict(metrics)
+
+    def test_high_expectancy_but_low_profit_factor_is_not_positive(self):
+        """Un expectancy alto con PF débil no debe calificar como edge positivo
+        neto — ambas condiciones son necesarias (ver umbral 0.15R Y 1.4 PF)."""
+        metrics = self._metrics(50, 0.20, 1.2)
+        assert "EDGE POSITIVO NETO" not in compute_verdict(metrics)
+
+    def test_uses_out_of_sample_not_aggregate(self):
+        """Caso real encontrado en producción: in-sample +0.59R / out-sample
+        +0.05R. El agregado (in+out) podía superar el umbral de 0.15R aunque
+        el out-of-sample fuera apenas marginal — el veredicto debe basarse
+        solo en out-of-sample."""
+        inflated_aggregate = self._metrics(400, 0.26, 1.76)  # in+out, por encima del umbral positivo
+        real_out_of_sample = self._metrics(267, 0.047, 1.11)  # lo que realmente importa (BREAKEVEN, no positivo)
+        assert "EDGE POSITIVO NETO" in compute_verdict(inflated_aggregate)
+        assert "EDGE POSITIVO NETO" not in compute_verdict(real_out_of_sample)
+        assert "BREAKEVEN" in compute_verdict(real_out_of_sample)
+
+
 class TestBreakdownBy:
     def test_breakdown_by_symbol(self):
         trades = [
@@ -319,3 +375,48 @@ class TestBreakdownBy:
     def test_empty_input(self):
         result = breakdown_by([], "symbol")
         assert result == {}
+
+
+class TestTradeOutcomeRegimeFields:
+    def test_defaults_do_not_break_existing_call_sites(self):
+        """_make_trade() sin pasar regime_detail/stickiness_score (como en todo
+        el resto de este archivo) debe seguir funcionando con los defaults."""
+        trade = _make_trade("TP1_HIT", 2.0)
+        assert trade.regime_detail == ""
+        assert trade.stickiness_score == 0.0
+        assert trade.regime_confidence == ""
+        assert trade.stickiness_bucket == "<0.50"
+
+    def test_stickiness_bucket_boundaries(self):
+        assert backtester.stickiness_bucket(0.0) == "<0.50"
+        assert backtester.stickiness_bucket(0.49) == "<0.50"
+        assert backtester.stickiness_bucket(0.5) == "0.50-0.70"
+        assert backtester.stickiness_bucket(0.69) == "0.50-0.70"
+        assert backtester.stickiness_bucket(0.7) == "0.70-0.85"
+        assert backtester.stickiness_bucket(0.84) == "0.70-0.85"
+        assert backtester.stickiness_bucket(0.85) == ">=0.85"
+        assert backtester.stickiness_bucket(1.0) == ">=0.85"
+
+
+class TestBreakdownBySplit:
+    def test_partitions_by_train_and_test(self):
+        trades = [
+            _make_trade("TP1_HIT", 2.0, regime_detail="BULL_DEEP", is_train=True),
+            _make_trade("SL_HIT", -1.0, regime_detail="BULL_DEEP", is_train=True),
+            _make_trade("TP1_HIT", 1.0, regime_detail="BULL_DEEP", is_train=False),
+            _make_trade("SL_HIT", -1.0, regime_detail="SIDEWAYS_CHOP", is_train=False),
+        ]
+        result = backtester.breakdown_by_split(trades, "regime_detail")
+
+        assert result["BULL_DEEP"]["train"]["total"] == 2
+        assert result["BULL_DEEP"]["test"]["total"] == 1
+        assert "train" not in result["SIDEWAYS_CHOP"] or result["SIDEWAYS_CHOP"].get("train", {}).get("total", 0) == 0
+        assert result["SIDEWAYS_CHOP"]["test"]["total"] == 1
+
+    def test_bucket_missing_from_one_split_is_absent_not_zeroed(self):
+        trades = [_make_trade("TP1_HIT", 2.0, regime_detail="BEAR_DEEP", is_train=True)]
+        result = backtester.breakdown_by_split(trades, "regime_detail")
+        assert "test" not in result["BEAR_DEEP"]
+
+    def test_empty_input(self):
+        assert backtester.breakdown_by_split([], "regime_detail") == {}

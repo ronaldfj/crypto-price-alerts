@@ -1,12 +1,12 @@
 """
-inspector.py — Crypto Sentinel Inspector
+Inspector.py — Crypto Sentinel Inspector
 Evalúa cualquier activo rastreado con el motor idéntico a alert.py
 (1D macro + 4H setup + 15m timing). Sin modificaciones al bot,
 sin envío a Telegram, sin escribir en alerts_state.db (solo lectura
 informativa de cooldown).
 
 Uso:
-    streamlit run inspector.py --server.port 8502
+    streamlit run Inspector.py --server.port 8502
 """
 from __future__ import annotations
 
@@ -39,6 +39,7 @@ from sentinel_shared import (
     inject_css,
     tip as _tip,
     render_market_snapshot,
+    render_page_header,
 )
 
 inject_css()
@@ -98,7 +99,7 @@ def _score_bar(label: str, value: float, vmin: float, vmax: float, color: str = 
     label_html = _tip(label, tip) if tip else label
     st.markdown(f"""
     <div style="margin-bottom:0.6rem;">
-      <div style="display:flex; justify-content:space-between; font-size:0.82rem; color:#555; margin-bottom:2px;">
+      <div style="display:flex; justify-content:space-between; font-size:0.82rem; color:var(--ss-text-muted); margin-bottom:2px;">
         <span>{label_html}</span><span><b>{value:.2f}</b></span>
       </div>
       <div class="bar-wrap">
@@ -257,8 +258,10 @@ with st.sidebar:
 
 # ── Header + Input ────────────────────────────────────────────────────────────
 
-st.markdown("## Crypto Sentinel Inspector")
-st.caption("Motor idéntico al bot (1D macro + 4H setup + 15m timing) · sin Telegram, sin escribir en la DB")
+render_page_header(
+    "Inspector",
+    "Motor idéntico al bot (1D macro + 4H setup + 15m timing) · sin Telegram, sin escribir en la DB",
+)
 
 # Si venimos de un clic en la tabla de pages/1_Resumen.py, preseleccionar ese
 # activo y saltar directo a la evaluación sin exigir un segundo clic en "Evaluar".
@@ -269,7 +272,7 @@ col_sym, col_btn = st.columns([5, 1])
 
 with col_sym:
     symbol: str = st.selectbox(
-        "",
+        "Activo",
         options=SYMBOLS,
         index=default_index,
         format_func=lambda s: f"{pair_label(s)}  —  {asset_group(s)}",
@@ -492,9 +495,9 @@ def render_side(side: str) -> None:
         )
         st.markdown(f"""
         <div class="card" style="border-left:4px solid {exec_color}; padding:0.8rem 1rem;">
-          <div style="font-size:0.8rem;color:#888;">{exec_tip}</div>
+          <div style="font-size:0.8rem;color:var(--ss-text-muted);">{exec_tip}</div>
           <div style="font-weight:700; color:{exec_color};">{exec_state} — {candidate.get('execution_decision','')}</div>
-          <div style="font-size:0.8rem; color:#555; margin-top:4px;">
+          <div style="font-size:0.8rem; color:var(--ss-text-muted); margin-top:4px;">
             Avance a TP1: {metrics.get('progress_to_tp1_pct', 0):.1f}% &nbsp;·&nbsp;
             R:R actual (TP2): {metrics.get('current_rr_tp2', 0):.2f}× &nbsp;·&nbsp;
             Drift desde señal: {metrics.get('price_drift_pct', 0):+.2f}%

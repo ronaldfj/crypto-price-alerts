@@ -1,6 +1,6 @@
 """
 sentinel_shared.py — Utilidades y caché compartidas entre las páginas de
-Crypto Sentinel Inspector (vista detalle en inspector.py + resumen en
+Crypto Sentinel Inspector (vista detalle en Inspector.py + resumen en
 pages/1_Resumen.py). Sin UI propia: solo fetchers cacheados y el pipeline
 de evaluación (idéntico al que usa alert.py en producción).
 """
@@ -38,68 +38,130 @@ SYMBOLS = sorted(CRYPTO_IDS.values())
 SYMBOL_TO_CGID = {sym: cg for cg, sym in CRYPTO_IDS.items()}
 
 # ── CSS + helpers de presentación compartidos ──────────────────────────────
-# Ambas páginas (inspector.py y pages/1_Resumen.py) son scripts Streamlit
+# Ambas páginas (Inspector.py y pages/1_Resumen.py) son scripts Streamlit
 # independientes: sin esto, cada una necesitaría reinyectar el mismo CSS y
 # reconstruir las mismas tarjetas a mano, y terminarían divergiendo visualmente.
 
 CUSTOM_CSS = """
 <style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;600&display=swap');
+:root {
+    --ss-text-muted: #77756e;
+    --ss-text-faint: #a3a099;
+    --ss-border: #e6e3dc;
+    --ss-card: #f8f9fa;
+    --ss-card-2: #ffffff;
+    --ss-accent: #2f6fed;
+    --ss-up: #16824f;
+    --ss-up-soft: #eef8f2;
+    --ss-up-border: #c3e6cb;
+    --ss-down: #c53a2b;
+    --ss-down-soft: #fdf1ef;
+    --ss-down-border: #f5c6cb;
+    --ss-warn: #b8600a;
+    --ss-warn-soft: #fff8f0;
+    --ss-warn-border: #ffe0b2;
+    --ss-neutral: #6c757d;
+    --ss-code-bg: #23241f;
+    --ss-code-text: #f8f8f2;
+    --ss-shadow: 0 1px 2px rgba(30,25,10,0.05), 0 1px 8px rgba(30,25,10,0.03);
+}
+@media (prefers-color-scheme: dark) {
+    :root {
+        --ss-text-muted: #9a99a3;
+        --ss-text-faint: #6d6c76;
+        --ss-border: #33333c;
+        --ss-card: #1c1c22;
+        --ss-card-2: #202027;
+        --ss-accent: #5b8bff;
+        --ss-up: #3ddc8f;
+        --ss-up-soft: rgba(61,220,143,0.10);
+        --ss-up-border: rgba(61,220,143,0.30);
+        --ss-down: #ff6b5c;
+        --ss-down-soft: rgba(255,107,92,0.10);
+        --ss-down-border: rgba(255,107,92,0.30);
+        --ss-warn: #f0b23d;
+        --ss-warn-soft: rgba(240,178,61,0.10);
+        --ss-warn-border: rgba(240,178,61,0.30);
+        --ss-neutral: #9a99a3;
+        --ss-code-bg: #17181c;
+        --ss-code-text: #eceae4;
+        --ss-shadow: 0 6px 20px -10px rgba(0,0,0,0.5);
+    }
+}
+
+.stButton > button {
+    border-radius: 999px !important;
+    font-weight: 600 !important;
+}
+
+.ss-kicker {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 0.72rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--ss-accent); margin-bottom: 2px;
+}
+.ss-kicker .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ss-accent); }
+.ss-page-title { font-size: 1.6rem; font-weight: 800; letter-spacing: -0.01em; margin: 0 0 2px; }
+.ss-page-sub { color: var(--ss-text-muted); font-size: 0.85rem; margin-bottom: 0.6rem; }
+
 .card {
-    background: #f8f9fa;
-    border-radius: 10px;
+    background: var(--ss-card);
+    border: 1px solid var(--ss-border);
+    border-radius: 12px;
     padding: 1.2rem 1.4rem;
     margin-bottom: 0.8rem;
+    box-shadow: var(--ss-shadow);
 }
-.card-alert  { border-left: 5px solid #28a745; background: #f0fff4; }
-.card-block  { border-left: 5px solid #dc3545; background: #fff5f5; }
-.card-warn   { border-left: 5px solid #fd7e14; background: #fff8f0; }
-.card-neutral{ border-left: 5px solid #6c757d; background: #f8f9fa; }
+.card-alert  { border-left: 5px solid var(--ss-up); background: var(--ss-up-soft); }
+.card-block  { border-left: 5px solid var(--ss-down); background: var(--ss-down-soft); }
+.card-warn   { border-left: 5px solid var(--ss-warn); background: var(--ss-warn-soft); }
+.card-neutral{ border-left: 5px solid var(--ss-neutral); background: var(--ss-card); }
 
-.score-big { font-size: 3rem; font-weight: 700; line-height: 1; margin: 0; }
-.score-label { font-size: 0.85rem; color: #666; margin-top: 2px; }
+.score-big { font-family: "JetBrains Mono", ui-monospace, monospace; font-variant-numeric: tabular-nums; font-size: 3rem; font-weight: 700; line-height: 1; margin: 0; }
+.score-label { font-size: 0.85rem; color: var(--ss-text-muted); margin-top: 2px; }
 
-.bar-wrap  { background: #e9ecef; border-radius: 6px; height: 14px; overflow: hidden; margin: 4px 0 2px; }
+.bar-wrap  { background: var(--ss-border); border-radius: 6px; height: 14px; overflow: hidden; margin: 4px 0 2px; }
 .bar-fill  { height: 100%; border-radius: 6px; transition: width 0.3s; }
-.bar-green  { background: linear-gradient(90deg, #28a745, #5cb85c); }
-.bar-orange { background: linear-gradient(90deg, #fd7e14, #ffc107); }
-.bar-red    { background: linear-gradient(90deg, #dc3545, #e06c75); }
-.bar-blue   { background: linear-gradient(90deg, #0066cc, #4dabf7); }
+.bar-green  { background: linear-gradient(90deg, #16824f, #3ddc8f); }
+.bar-orange { background: linear-gradient(90deg, #d9820a, #ffc107); }
+.bar-red    { background: linear-gradient(90deg, #c53a2b, #ff8a7a); }
+.bar-blue   { background: linear-gradient(90deg, var(--ss-accent), #6ea1ff); }
 
 .trade-row { display: flex; justify-content: space-between; gap: 0.5rem; margin: 0.5rem 0; }
-.trade-cell { flex: 1; background: #fff; border-radius: 8px; padding: 0.7rem; text-align: center; border: 1px solid #dee2e6; }
-.trade-cell .val { font-size: 1.2rem; font-weight: 700; }
-.trade-cell .lbl { font-size: 0.75rem; color: #888; }
-.trade-cell .stop-val { color: #dc3545; }
-.trade-cell .tp-val   { color: #28a745; }
+.trade-cell { flex: 1; background: var(--ss-card-2); border-radius: 10px; padding: 0.7rem; text-align: center; border: 1px solid var(--ss-border); }
+.trade-cell .val { font-family: "JetBrains Mono", ui-monospace, monospace; font-variant-numeric: tabular-nums; font-size: 1.15rem; font-weight: 700; }
+.trade-cell .lbl { font-size: 0.72rem; color: var(--ss-text-muted); text-transform: uppercase; letter-spacing: .03em; }
+.trade-cell .stop-val { color: var(--ss-down); }
+.trade-cell .tp-val   { color: var(--ss-up); }
 
 .tf-badge {
     display: inline-flex; align-items: center; gap: 0.35rem;
-    padding: 0.35rem 0.7rem; border-radius: 8px; margin-right: 0.5rem;
-    font-size: 0.85rem; font-weight: 600; border: 1px solid #dee2e6;
+    padding: 0.35rem 0.7rem; border-radius: 999px; margin-right: 0.5rem;
+    font-size: 0.85rem; font-weight: 600; border: 1px solid var(--ss-border);
 }
-.tf-on  { background: #f0fff4; border-color: #c3e6cb; color: #1e7e34; }
-.tf-off { background: #fff5f5; border-color: #f5c6cb; color: #a71d2a; }
+.tf-on  { background: var(--ss-up-soft); border-color: var(--ss-up-border); color: var(--ss-up); }
+.tf-off { background: var(--ss-down-soft); border-color: var(--ss-down-border); color: var(--ss-down); }
 
 .signal-item {
-    padding: 0.45rem 0.75rem;
-    border-radius: 6px;
+    padding: 0.5rem 0.8rem;
+    border-radius: 8px;
     margin-bottom: 0.4rem;
     font-size: 0.9rem;
     display: flex;
     align-items: flex-start;
     gap: 0.5rem;
 }
-.signal-ok   { background: #f0fff4; border: 1px solid #c3e6cb; }
-.signal-warn { background: #fff8f0; border: 1px solid #ffe0b2; }
-.signal-block{ background: #fff5f5; border: 1px solid #f5c6cb; }
+.signal-ok   { background: var(--ss-up-soft); border: 1px solid var(--ss-up-border); }
+.signal-warn { background: var(--ss-warn-soft); border: 1px solid var(--ss-warn-border); }
+.signal-block{ background: var(--ss-down-soft); border: 1px solid var(--ss-down-border); }
 
 .formula {
-    font-family: monospace;
-    font-size: 0.9rem;
-    background: #272822;
-    color: #f8f8f2;
-    padding: 0.6rem 1rem;
-    border-radius: 6px;
+    font-family: "JetBrains Mono", ui-monospace, monospace;
+    font-size: 0.88rem;
+    background: var(--ss-code-bg);
+    color: var(--ss-code-text);
+    padding: 0.7rem 1rem;
+    border-radius: 10px;
     margin: 0.5rem 0 1rem;
 }
 .formula .set  { color: #a9dc76; }
@@ -111,9 +173,9 @@ CUSTOM_CSS = """
     position: relative;
     display: inline-block;
     cursor: help;
-    border-bottom: 1px dotted #999;
+    border-bottom: 1px dotted var(--ss-text-faint);
 }
-.tooltip-icon { font-size: 0.72em; color: #888; margin-left: 2px; }
+.tooltip-icon { font-size: 0.72em; color: var(--ss-text-muted); margin-left: 2px; }
 .tooltip-wrap .tooltip-box {
     visibility: hidden;
     opacity: 0;
@@ -121,18 +183,18 @@ CUSTOM_CSS = """
     top: 135%;
     left: 50%;
     transform: translateX(-50%);
-    background: #272822;
-    color: #f8f8f2;
+    background: var(--ss-code-bg);
+    color: var(--ss-code-text);
     text-align: left;
     padding: 0.55rem 0.75rem;
-    border-radius: 6px;
+    border-radius: 8px;
     font-size: 0.78rem;
     font-weight: 400;
     line-height: 1.35;
     width: 240px;
     z-index: 999;
     transition: opacity 0.15s ease;
-    box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+    box-shadow: 0 4px 16px rgba(0,0,0,0.25);
 }
 .tooltip-wrap .tooltip-box::after {
     content: "";
@@ -142,7 +204,7 @@ CUSTOM_CSS = """
     margin-left: -5px;
     border-width: 5px;
     border-style: solid;
-    border-color: transparent transparent #272822 transparent;
+    border-color: transparent transparent var(--ss-code-bg) transparent;
 }
 .tooltip-wrap.tooltip-right .tooltip-box { left: auto; right: 0; transform: none; }
 .tooltip-wrap.tooltip-right .tooltip-box::after { left: auto; right: 10px; margin-left: 0; }
@@ -155,6 +217,17 @@ def inject_css() -> None:
     st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 
+def render_page_header(title: str, subtitle: str, kicker: str = "Crypto Sentinel") -> None:
+    """Encabezado compartido (kicker + título + subtítulo) para que Inspector.py
+    y pages/1_Resumen.py abran con la misma identidad visual en vez de un
+    st.markdown("## ...") suelto en cada script."""
+    st.markdown(f"""
+    <div class="ss-kicker"><span class="dot"></span>{kicker}</div>
+    <div class="ss-page-title">{title}</div>
+    <div class="ss-page-sub">{subtitle}</div>
+    """, unsafe_allow_html=True)
+
+
 def tip(label: str, explanation: str, align: str = "left") -> str:
     cls = "tooltip-wrap tooltip-right" if align == "right" else "tooltip-wrap"
     return (
@@ -165,7 +238,7 @@ def tip(label: str, explanation: str, align: str = "left") -> str:
 
 def render_market_snapshot(btc_dominance: Optional[float], market_context: Dict[str, Any]) -> None:
     """Tarjetas de BTC Dominance + Cautela global. Pensada para usarse dentro
-    de ``with st.sidebar:`` — misma pieza visual en inspector.py y en
+    de ``with st.sidebar:`` — misma pieza visual en Inspector.py y en
     pages/1_Resumen.py."""
     dom_str = f"{btc_dominance:.1f}%" if btc_dominance is not None else "N/D"
     if btc_dominance is None:
@@ -185,7 +258,7 @@ def render_market_snapshot(btc_dominance: Optional[float], market_context: Dict[
     )
     st.markdown(f"""
     <div class="card" style="border-left: 4px solid {dom_color}; padding: 0.8rem 1rem; margin-bottom:0.6rem;">
-      <div style="font-size:0.75rem;color:#888;">{dom_tip}</div>
+      <div style="font-size:0.75rem;color:var(--ss-text-muted);">{dom_tip}</div>
       <div style="font-size:1.8rem;font-weight:700;color:{dom_color};">{dom_str}</div>
       <div style="font-size:0.78rem;color:{dom_color};">{dom_label}</div>
     </div>
@@ -203,7 +276,7 @@ def render_market_snapshot(btc_dominance: Optional[float], market_context: Dict[
     )
     st.markdown(f"""
     <div class="card" style="border-left: 4px solid {caution_color}; padding: 0.8rem 1rem; margin-bottom:0.6rem;">
-      <div style="font-size:0.75rem;color:#888;">{caution_tip}</div>
+      <div style="font-size:0.75rem;color:var(--ss-text-muted);">{caution_tip}</div>
       <div style="font-size:1.4rem;font-weight:700;color:{caution_color};">{caution}</div>
     </div>
     """, unsafe_allow_html=True)
@@ -253,7 +326,7 @@ def evaluate_pair(
     symbol: str, market_context: Dict[str, Any], btc_dominance: Optional[float]
 ) -> Optional[Dict[str, Any]]:
     """Corre el pipeline de evaluación (macro 1D + setup 4H + timing 15m + candidate)
-    para ambos lados de `symbol`, igual que hace inspector.py para un solo activo.
+    para ambos lados de `symbol`, igual que hace Inspector.py para un solo activo.
 
     Devuelve None si Bybit/OKX no tienen velas suficientes en alguna de las 3
     capas (p. ej. TON, sin cobertura de par spot — ver CLAUDE.md).

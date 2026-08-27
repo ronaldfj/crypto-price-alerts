@@ -27,6 +27,7 @@ from sentinel_shared import (
     evaluate_pair,
     inject_css,
     render_market_snapshot,
+    render_page_header,
 )
 
 st.set_page_config(
@@ -57,10 +58,10 @@ with st.sidebar:
         "La tabla se recalcula sola cada 5 min; **Refrescar** fuerza una corrida nueva ahora."
     )
 
-st.markdown("## Crypto Sentinel — Resumen de pares")
-st.caption(
+render_page_header(
+    "Resumen de pares",
     "Un vistazo a los activos rastreados: score, R:R, ADX y régimen por timeframe, "
-    "para LONG y SHORT. Clic en una fila para ver el detalle completo en el Inspector."
+    "para LONG y SHORT. Clic en una fila para ver el detalle completo en el Inspector.",
 )
 
 
@@ -174,4 +175,4 @@ selected_rows = event.selection["rows"] if event.selection else []
 if selected_rows:
     selected_symbol: str = display_df.iloc[selected_rows[0]]["Symbol"]
     st.session_state["selected_symbol"] = selected_symbol
-    st.switch_page("inspector.py")
+    st.switch_page("Inspector.py")

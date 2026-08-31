@@ -340,7 +340,7 @@ function crossingEvent(prevPrice, currPrice, change24h) {
   const sorted = [...LEVELS].sort((a, b) => b.price - a.price);
   let above = null, below = null;
   for (const l of sorted) if (l.price >= currPrice) above = l;
-  for (let i = sorted.length - 1; i >= 0; i--) if (sorted[i].price <= currPrice) { below = sorted[i]; break; }
+  for (const l of sorted) if (l.price <= currPrice) { below = l; break; }
   const rango = (below && above) ? `entre ${below.label} (${fmt(below.price)}) y ${above.label} (${fmt(above.price)})`
               : !below ? `por debajo del mínimo marcado (${sorted[sorted.length-1].label})`
               : `por encima de la resistencia máxima (${sorted[0].label})`;
@@ -377,7 +377,7 @@ function computeStatus(currentPrice) {
   const sorted = [...LEVELS].sort((a, b) => b.price - a.price);
   let above = null, below = null;
   for (const l of sorted) if (l.price >= currentPrice) above = l;
-  for (let i = sorted.length - 1; i >= 0; i--) if (sorted[i].price <= currentPrice) { below = sorted[i]; break; }
+  for (const l of sorted) if (l.price <= currentPrice) { below = l; break; }
   let badgeClass = "neutral", text = "";
   if (below && below.type === "soporte" && above) {
     badgeClass = "accum";

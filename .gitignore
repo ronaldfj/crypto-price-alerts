@@ -28,6 +28,8 @@ alerts_state.db-wal
 .env
 .env.*
 *.key
+keyvps
+keyvps.pub
 
 # OS
 .DS_Store

@@ -1,0 +1,13 @@
+
+{
+  "framework": null,
+  "buildCommand": null,
+  "installCommand": null,
+  "outputDirectory": ".",
+  "rewrites": [
+    {
+      "source": "/",
+      "destination": "/btc_level_monitor.html"
+    }
+  ]
+}

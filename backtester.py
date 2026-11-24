@@ -101,6 +101,7 @@ class TradeOutcome:
     stickiness_score: float = 0.0
     regime_confidence: str = ""
     stickiness_bucket: str = ""
+    adx_bucket: str = ""
 
     outcome: str = "PENDING"           # TP1_HIT | TP2_HIT | SL_HIT | EXPIRED
     exit_price: float = 0.0
@@ -237,6 +238,16 @@ def score_bucket(score: float) -> str:
     if score < 9.0:
         return "8.0-9.0"
     return ">=9.0"
+
+
+def adx_bucket(adx: float) -> str:
+    if adx < 25.0:
+        return "<25"
+    if adx < 30.0:
+        return "25-30"
+    if adx < 35.0:
+        return "30-35"
+    return ">=35"
 
 
 def stickiness_bucket(score: float) -> str:
@@ -428,6 +439,7 @@ def backtest_symbol(
                 stickiness_score=float(candidate.get("stickiness_score", 0.0)),
                 regime_confidence=str(candidate.get("regime_confidence", "")),
                 stickiness_bucket=stickiness_bucket(float(candidate.get("stickiness_score", 0.0))),
+                adx_bucket=adx_bucket(float(candidate["adx"])),
                 outcome=str(outcome_dict["outcome"]),
                 exit_price=float(outcome_dict.get("exit_price", entry_price)),
                 bars_to_exit=int(outcome_dict.get("bars_to_exit", 0)),
@@ -688,6 +700,27 @@ def print_report(
             f"{n_test:>6} {test_m.get('expectancy_r', 0.0):>+8.3f}R{warn}"
         )
     print("  ↑ Si E[R]-out no sube con stickiness, REGIME_STICKY_MIN_SCORE no está justificado.")
+
+    # ── Por ADX bucket (train vs test) — valida si subir MIN_ADX generaliza ──
+    by_adx_split = breakdown_by_split(all_trades, "adx_bucket")
+    print(f"\n{sep}")
+    print("  POR ADX BUCKET (train vs test)")
+    print(f"  {'BUCKET':<8} {'N-in':>5} {'E[R]-in':>9} {'N-out':>6} {'E[R]-out':>9}")
+    for bucket in ["<25", "25-30", "30-35", ">=35"]:
+        splits = by_adx_split.get(bucket)
+        if not splits:
+            continue
+        train_m = splits.get("train", {"total": 0})
+        test_m = splits.get("test", {"total": 0})
+        n_train, n_test = train_m.get("total", 0), test_m.get("total", 0)
+        if n_train == 0 and n_test == 0:
+            continue
+        warn = " ⚠️" if n_test < MIN_VERDICT_N else ""
+        print(
+            f"  {bucket:<8} {n_train:>5} {train_m.get('expectancy_r', 0.0):>+8.3f}R "
+            f"{n_test:>6} {test_m.get('expectancy_r', 0.0):>+8.3f}R{warn}"
+        )
+    print("  ↑ Subir MIN_ADX solo si E[R]-out mejora en los buckets altos con N-out suficiente.")
 
     # ── Por score bucket — el más diagnóstico ──
     by_score = breakdown_by(all_trades, "score_bucket")

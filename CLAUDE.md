@@ -58,7 +58,7 @@ BTC, ETH, SOL, BNB, XRP, TRX, XLM, DOT, TON, LTC, LINK — todos vs USDT, en Byb
 ```
 MIN_SCORE=7.0          # Score mínimo para alerta
 MIN_RR=1.8             # R:R mínimo
-MIN_ADX=20.0           # ADX mínimo
+MIN_ADX=25.0           # ADX mínimo (20→25 nov 2026, ver calibración)
 COOLDOWN_HOURS=24      # Cooldown por símbolo+lado
 MAX_ALERTS_PER_RUN=2   # Máximo alertas por ejecución
 MAX_ALERTS_PER_GROUP=1 # Máximo por grupo de activos
@@ -191,7 +191,7 @@ De las primeras 3 semanas en producción: LINK y TRX tienen timing 15m inestable
 
 Backtest de 12m mostró edge marginal agregado que sube a +0.110R out-of-sample con 3 gates SHORT: perfil FULL (no TACTICAL), RSI en banda [35,50), fuera de zona Fibonacci — ver `ENABLE_TACTICAL_ALERTS`/`REQUIRE_RSI_BAND_SHORT`/`REQUIRE_FIB_OUTSIDE_SHORT` arriba. Momentum de volumen 4H SHORT se podó del score (no discriminaba out-of-sample); VWAP >3.5% se agregó como gate (`REQUIRE_VWAP_PROXIMITY_SHORT`) tras rendir negativo en ambas mitades del split.
 
-**Regla dura:** nunca fijar un threshold por el agregado global — subir `MIN_ADX` mejoraba el agregado pero empeoraba out-of-sample en cada corte (overfitting puro, no se tocó). Partir siempre in/out-sample antes de calibrar producción. BTC/BNB siguen negativos con los 3 gates aplicados — no excluidos, pendiente validar con datos frescos.
+**Regla dura:** nunca fijar un threshold por el agregado global — subir `MIN_ADX` en jul 2026 mejoraba el agregado pero empeoraba out-of-sample en cada corte (overfitting). En nov 2026, con más datos, 25 mejoró E[R] en ambas mitades (in +0.071→+0.099R, out +0.209→+0.301R, R total igual) y en vivo (<25 −0.07R vs ≥25 +0.13R) → aplicado; 30 rechazado (in-sample no monotónico). Partir siempre in/out-sample antes de calibrar producción. BTC/BNB siguen negativos con los 3 gates aplicados — no excluidos, pendiente validar con datos frescos.
 
 ## Auditoría de infraestructura y lógica (jul 2026)
 
